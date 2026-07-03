@@ -87,6 +87,14 @@ def _moe_mlp_impl(
 
     layer = get_layer_from_name(layer_name)
     layer_id = int(getattr(layer, "layer_id", -1))
+    if layer_id < 0:
+        import warnings
+        warnings.warn(
+            f"moe_mlp seam: layer {layer_name!r} has no layer_id attribute; "
+            "topk injection will target key=-1 and may collide with other "
+            "unidentified layers. Set layer.layer_id to suppress this warning.",
+            stacklevel=2,
+        )
 
     if os.environ.get("SEW_DECODE_PROBE"):
         _PROBE_CALLS["mlp"] += 1

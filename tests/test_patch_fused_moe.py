@@ -1,7 +1,98 @@
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 import vllm_moe_offload_ascend
+from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+    _moe_offload_kv_backstop_active,
+    _moe_offload_kv_backstop_hint,
+    _patch_kv_cache_capacity_backstop,
+)
+
+
+def test_kv_backstop_is_scoped_to_moe_offload_env(monkeypatch):
+    for name in (
+        "VLLM_ASCEND_MOE_OFFLOAD_ENABLED",
+        "VLLM_ASCEND_MOE_OFFLOAD_GB",
+        "VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _moe_offload_kv_backstop_active() is False
+
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "28")
+    assert _moe_offload_kv_backstop_active() is True
+
+
+def test_kv_backstop_hint_names_slot_reduction_action(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "28")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "62")
+
+    hint = _moe_offload_kv_backstop_hint(
+        max_model_len=4096,
+        max_concurrency=0.75,
+    )
+
+    assert "KV-capacity backstop" in hint
+    assert "reduce `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS`" in hint
+    assert "offload_gb=28" in hint
+    assert "num_slots=62" in hint
+    assert "max_model_len=4096" in hint
+    assert "max_concurrency=0.750x" in hint
+
+
+def test_kv_backstop_wraps_vllm_capacity_error(monkeypatch):
+    import vllm.v1.core.kv_cache_utils as kv_utils
+
+    def original_check(*_args, **_kwargs):
+        raise ValueError("base kv capacity error")
+
+    monkeypatch.setattr(kv_utils, "_check_enough_kv_cache_memory", original_check)
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "28")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "62")
+
+    _patch_kv_cache_capacity_backstop()
+
+    with pytest.raises(ValueError) as excinfo:
+        kv_utils._check_enough_kv_cache_memory(
+            0,
+            lambda: 0,
+            4096,
+            lambda _available_memory: 0,
+        )
+
+    message = str(excinfo.value)
+    assert "base kv capacity error" in message
+    assert "KV-capacity backstop" in message
+    assert "reduce `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS`" in message
+
+
+def test_kv_backstop_fails_after_resolved_blocks_if_one_request_cannot_fit(monkeypatch):
+    import vllm.v1.core.kv_cache_utils as kv_utils
+
+    called = False
+
+    def original_report(_vllm_config, _kv_cache_config):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(kv_utils, "_report_kv_cache_config", original_report)
+    monkeypatch.setattr(
+        kv_utils,
+        "get_max_concurrency_for_kv_cache_config",
+        lambda _vllm_config, _kv_cache_config: 0.75,
+    )
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "28")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "62")
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096))
+
+    _patch_kv_cache_capacity_backstop()
+
+    with pytest.raises(ValueError, match="max_concurrency=0.750x"):
+        kv_utils._report_kv_cache_config(config, SimpleNamespace())
+
+    assert called is False
 
 
 def test_b2_wave_profile_summary_reports_overlap_and_stage_breakdown():
@@ -424,3 +515,357 @@ def test_b2_does_not_treat_multi_request_decode_as_prefill(monkeypatch):
         fused_experts_input,
         before_dispatch_evt=None,
     ) is None
+
+
+def test_stage_op_defers_capacity_overflow_to_b2_without_phase_hint(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=True,
+            num_slots=2,
+            max_num_seqs_hint=1,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = 0
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def should_use_b2_wave_prefill(
+            self,
+            *,
+            layer_id,
+            active_expert_count,
+            is_prefill,
+        ):
+            return bool(is_prefill) and active_expert_count > self.config.num_slots
+
+        def cache_prefill_route_stats(self, **kwargs):
+            self.cached = kwargs
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls += 1
+            raise AssertionError("overflow must be handed to B2, not staged once")
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+    moe_offload_stage_op._moe_offload_stage_impl(
+        topk_ids,
+        layer_id=7,
+        num_logical_experts=64,
+        phase=moe_offload_stage_op.PHASE_UNKNOWN,
+    )
+
+    assert runtime.stage_calls == 0
+    assert runtime.cached is not None
+    assert runtime.cached["layer_id"] == 7
+    assert runtime.cached["token_counts_by_expert"] == {
+        0: 1,
+        1: 1,
+        2: 1,
+        3: 1,
+    }
+
+
+def test_stage_op_does_not_defer_decode_overflow_without_shape_hint(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=True,
+            num_slots=2,
+            max_num_seqs_hint=0,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = 0
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def should_use_b2_wave_prefill(
+            self,
+            *,
+            layer_id,
+            active_expert_count,
+            is_prefill,
+        ):
+            return bool(is_prefill) and active_expert_count > self.config.num_slots
+
+        def cache_prefill_route_stats(self, **kwargs):
+            self.cached = kwargs
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls += 1
+            raise RuntimeError("working set overflow")
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    topk_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="working set overflow"):
+        moe_offload_stage_op._moe_offload_stage_impl(
+            topk_ids,
+            layer_id=7,
+            num_logical_experts=64,
+            phase=moe_offload_stage_op.PHASE_UNKNOWN,
+        )
+
+    assert runtime.stage_calls == 1
+    assert runtime.cached is None
+
+
+def test_stage_op_confirmed_decode_overflow_fails_closed_even_with_b2(monkeypatch):
+    """H3 regression: a CONFIRMED decode whose active set exceeds num_slots must
+    NOT be deferred to B2 (the downstream B2 path bails on decode, which would
+    leave the previous step's log2phy stale and mis-route).  Even with a large
+    prefill-shaped token count, PHASE_DECODE must fail-close via the working-set
+    guard rather than silently cache-and-skip.
+    """
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=True,
+            num_slots=2,
+            # Large enough that the token heuristic alone would say "prefill".
+            max_num_seqs_hint=1,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = 0
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def should_use_b2_wave_prefill(self, *, layer_id, active_expert_count, is_prefill):
+            return bool(is_prefill) and active_expert_count > self.config.num_slots
+
+        def cache_prefill_route_stats(self, **kwargs):
+            self.cached = kwargs
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls += 1
+            raise RuntimeError("working set overflow")
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    # Many tokens (prefill-shaped) but phase is CONFIRMED decode.
+    topk_ids = torch.tensor([[0, 1, 2, 3]] * 8, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="working set overflow"):
+        moe_offload_stage_op._moe_offload_stage_impl(
+            topk_ids,
+            layer_id=7,
+            num_logical_experts=64,
+            phase=moe_offload_stage_op.PHASE_DECODE,
+        )
+
+    assert runtime.stage_calls == 1
+    assert runtime.cached is None
+
+
+def test_stage_op_confirmed_prefill_overflow_defers_to_b2(monkeypatch):
+    """Counterpart to the decode case: a CONFIRMED prefill that overflows slots
+    is the legitimate B2 wave handoff and must cache route-stats, not stage once.
+    """
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=True,
+            num_slots=2,
+            max_num_seqs_hint=0,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = 0
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def should_use_b2_wave_prefill(self, *, layer_id, active_expert_count, is_prefill):
+            return bool(is_prefill) and active_expert_count > self.config.num_slots
+
+        def cache_prefill_route_stats(self, **kwargs):
+            self.cached = kwargs
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls += 1
+            raise AssertionError("prefill overflow must hand off to B2, not stage once")
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    topk_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+    moe_offload_stage_op._moe_offload_stage_impl(
+        topk_ids,
+        layer_id=7,
+        num_logical_experts=64,
+        phase=moe_offload_stage_op.PHASE_PREFILL,
+    )
+
+    assert runtime.stage_calls == 0
+    assert runtime.cached is not None
+    assert runtime.cached["layer_id"] == 7
+
+
+# ---------------------------------------------------------------------------
+# M4: router fake/real dtype alignment
+# ---------------------------------------------------------------------------
+
+def test_moe_router_fake_returns_hidden_states_dtype_not_logits_dtype():
+    """M4: the router fake op must proxy topk_weights as hidden_states.dtype
+    (matching the real _native_select_experts cast), not router_logits.dtype.
+    For indirect-router models the gate output is float32 while hidden is bf16;
+    using logits.dtype would mis-specialize the compiled graph."""
+    import torch
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_router_op
+
+    hidden = torch.empty((4, 16), dtype=torch.bfloat16)
+    logits = torch.empty((4, 64), dtype=torch.float32)  # gate output, different dtype
+
+    topk_weights, topk_ids = moe_router_op._moe_router_fake(
+        hidden_states=hidden,
+        router_logits=logits,
+        top_k=2,
+        use_grouped_topk=False,
+        renormalize=True,
+        topk_group=None,
+        num_expert_group=None,
+        scoring_func="softmax",
+        routed_scaling_factor=1.0,
+        e_score_correction_bias=None,
+        num_experts=64,
+    )
+
+    # Must match hidden_states dtype, not router_logits dtype.
+    assert topk_weights.dtype == hidden.dtype
+    assert topk_ids.dtype == torch.int32
+    assert topk_weights.shape == (4, 2)
+    assert topk_ids.shape == (4, 2)
+
+
+# ---------------------------------------------------------------------------
+# L3: seam guard returns False when layer_id is missing
+# ---------------------------------------------------------------------------
+
+def test_seam_guard_returns_false_when_layer_has_no_layer_id(monkeypatch):
+    """L3: _resolve_seam_per_layer_guards must bail out (return False) when the
+    layer object does not have a layer_id attribute, preventing collision on
+    the shared -1 key in the injection/log2phy registries."""
+    import torch
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeRunner:
+        _ascend_moe_offload_seam_patch = False
+
+        def _select_forward(self):
+            raise AssertionError("should not be called")
+
+    fake_fused_moe = SimpleNamespace(AscendMoERunner=FakeRunner)
+    patch_fused_moe._patch_ascend_moe_runner(fake_fused_moe)
+
+    class LayerWithoutId:
+        """Simulates a layer where layer_id was never set."""
+        moe_config = SimpleNamespace(
+            num_experts=64,
+            dp_size=1, ep_size=1, tp_size=1, pcp_size=1,
+        )
+        top_k = 2
+        custom_routing_function = None
+        enable_npugraph_ex_static_kernel = False
+        zero_expert_num = 0
+        zero_expert_type = None
+        n_shared_experts = 0
+        global_redundant_expert_num = 0
+        _shared_experts = None
+        # Deliberately no layer_id attribute.
+
+    def fake_get_layer(name):
+        return LayerWithoutId()
+
+    def fake_get_num_experts(layer, num_experts, *, global_redundant_expert_num=0,
+                              num_shared_experts=0, **kw):
+        return num_experts
+
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14")
+    vllm_moe_offload_ascend.register()
+
+    runner = FakeRunner()
+    runner.layer_name = "model.layers.0.mlp.experts"
+    runner._seam_active = None
+
+    import vllm_ascend.moe_offload.runtime as runtime_mod
+    from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
+    from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
+    monkeypatch.setattr(
+        runtime_mod, "get_moe_offload_runtime",
+        lambda: MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=4,
+                                                    offload_stage_seam=True))
+    )
+
+    try:
+        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+        monkeypatch.setattr(mr, "get_layer_from_name", fake_get_layer)
+    except Exception:
+        pass
+    try:
+        from vllm_ascend.quantization.methods import base as qbase
+        monkeypatch.setattr(qbase, "get_moe_num_logical_experts", fake_get_num_experts)
+    except Exception:
+        pass
+
+    result = runner._resolve_seam_per_layer_guards()
+    assert result is False, (
+        "seam guard must return False for layers without layer_id to avoid "
+        "cross-layer collision on key=-1"
+    )

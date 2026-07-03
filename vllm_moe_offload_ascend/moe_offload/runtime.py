@@ -146,6 +146,12 @@ class MoePrefillRouteStats:
     pair_offsets_by_expert: dict[int, tuple[int, ...]] | None = None
 
 
+@dataclass(frozen=True)
+class SlotComputeHandle:
+    layer_id: int
+    slot_ids: tuple[int, ...]
+
+
 class MoeOffloadRuntime:
     def __init__(self, config: MoeOffloadConfig | None = None) -> None:
         self.config = config if config is not None else MoeOffloadConfig.from_env()
@@ -170,6 +176,8 @@ class MoeOffloadRuntime:
         self._compute_bucket_classifier: ComputeBucketClassifier | None = None
         self._compute_bucket_classifier_loaded = False
         self._prefill_route_stats_by_layer: dict[int, MoePrefillRouteStats] = {}
+        self._active_slot_ids_by_layer: dict[int, tuple[int, ...]] = {}
+        self._slot_compute_done_events: dict[tuple[int, int], object] = {}
 
     def trace_routing(
         self,
@@ -544,13 +552,131 @@ class MoeOffloadRuntime:
         try:
             return slot_bank.allocate_for(key, step_id=step_id)
         except RuntimeError:
-            if not any(slot.state == SlotState.LOADING for slot in slot_bank.slots):
+            if not any(
+                slot.state in (SlotState.LOADING, SlotState.COMPUTING)
+                for slot in slot_bank.slots
+            ):
                 raise
+            self._drain_slot_bank_inflight_work(slot_bank)
+            return slot_bank.allocate_for(key, step_id=step_id)
+
+    def _drain_slot_bank_inflight_work(self, slot_bank: ExpertSlotBank) -> None:
+        if any(slot.state == SlotState.LOADING for slot in slot_bank.slots):
             self._transfer_engine.synchronize()
             for slot in slot_bank.slots:
                 if slot.state == SlotState.LOADING:
                     slot.state = SlotState.READY
-            return slot_bank.allocate_for(key, step_id=step_id)
+
+        computing_slots = [
+            slot for slot in slot_bank.slots if slot.state == SlotState.COMPUTING
+        ]
+        events_to_sync: list[object] = []
+        seen_events: set[int] = set()
+        for slot in computing_slots:
+            key = slot.expert_key
+            if key is None:
+                slot.state = SlotState.EMPTY
+                continue
+            event_key = (int(key.layer_id), int(slot.slot_id))
+            event = self._slot_compute_done_events.pop(event_key, None)
+            if event is not None and id(event) not in seen_events:
+                seen_events.add(id(event))
+                events_to_sync.append(event)
+        for event in events_to_sync:
+            self._synchronize_event(event)
+        for slot in computing_slots:
+            if slot.state == SlotState.COMPUTING:
+                slot.state = SlotState.READY
+
+    def _synchronize_event(self, event: object) -> None:
+        synchronize = getattr(event, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+            return
+        wait = getattr(event, "wait", None)
+        if callable(wait):
+            wait()
+            return
+        try:
+            import torch
+
+            torch.npu.current_stream().wait_event(event)
+        except Exception:
+            return
+
+    def _release_allocated_loads(
+        self,
+        slot_bank: ExpertSlotBank,
+        loads: list[tuple[object, object]],
+    ) -> None:
+        for _, slot in loads:
+            if getattr(slot, "state", None) == SlotState.LOADING:
+                slot_bank.clear_slot(int(slot.slot_id))
+
+    def begin_slot_compute(
+        self,
+        prepared: PreparedSlotWeights,
+    ) -> SlotComputeHandle | None:
+        """Protect main-bank slots while the compute stream reads them."""
+        layer_id = int(prepared.mapping.layer_id)
+        slot_bank = self._slot_banks.get(layer_id)
+        if slot_bank is None:
+            return None
+        if prepared.w1.data_ptr() != slot_bank.w13_slots.data_ptr():
+            return None
+        slot_ids = tuple(
+            sorted({int(slot_id) for slot_id in prepared.mapping.active_slot_ids})
+        )
+        if not slot_ids:
+            slot_ids = tuple(
+                int(slot_id)
+                for slot_id in self._active_slot_ids_by_layer.get(layer_id, ())
+            )
+        if not slot_ids:
+            return None
+        for slot_id in slot_ids:
+            slot = slot_bank.slots[int(slot_id)]
+            if slot.state == SlotState.READY:
+                slot_bank.mark_computing(int(slot_id))
+        return SlotComputeHandle(layer_id=layer_id, slot_ids=slot_ids)
+
+    def end_slot_compute(self, handle: SlotComputeHandle | None) -> None:
+        if handle is None:
+            return
+        slot_bank = self._slot_banks.get(int(handle.layer_id))
+        if slot_bank is None:
+            return
+        event = self._record_current_stream_event_or_none()
+        for slot_id in handle.slot_ids:
+            slot = slot_bank.slots[int(slot_id)]
+            if slot.state != SlotState.COMPUTING:
+                continue
+            if event is None:
+                slot.state = SlotState.READY
+            else:
+                self._slot_compute_done_events[
+                    (int(handle.layer_id), int(slot_id))
+                ] = event
+
+    def _record_current_stream_event_or_none(self):
+        try:
+            import torch
+
+            npu = getattr(torch, "npu", None)
+            if npu is None or not hasattr(npu, "current_stream"):
+                return None
+            stream = npu.current_stream()
+            record_event = getattr(stream, "record_event", None)
+            if callable(record_event):
+                return record_event()
+            event_cls = getattr(npu, "Event", None)
+            if event_cls is None:
+                return None
+            event = event_cls()
+            event.record(stream)
+            return event
+        except Exception:
+            return None
 
     def is_resident_layer(self, layer_id: int) -> bool:
         return self.config.tiered_residency.is_resident_layer(int(layer_id))
@@ -829,6 +955,9 @@ class MoeOffloadRuntime:
         for expert_id in unique_active_experts:
             key = ExpertKey(layer_id, int(expert_id))
             slot = slot_bank.lookup(key)
+            if slot is not None and slot.state != SlotState.READY:
+                self._drain_slot_bank_inflight_work(slot_bank)
+                slot = slot_bank.lookup(key)
             if slot is not None and slot.state == SlotState.READY:
                 slot.last_used_step = int(step_id)
                 _n_hits += 1
@@ -862,10 +991,14 @@ class MoeOffloadRuntime:
 
         if sync_loads:
             load_start = perf_counter() if collect_profile else 0.0
-            self._transfer_engine.load_many_sync(
-                sync_loads,
-                validate_layout=True,
-            )
+            try:
+                self._transfer_engine.load_many_sync(
+                    sync_loads,
+                    validate_layout=True,
+                )
+            except Exception:
+                self._release_allocated_loads(slot_bank, sync_loads)
+                raise
             if collect_profile:
                 load_sync_ms += (perf_counter() - load_start) * 1000.0
 
@@ -981,6 +1114,9 @@ class MoeOffloadRuntime:
         for expert_id in unique_active_experts:
             key = ExpertKey(layer_id, int(expert_id))
             slot = slot_bank.lookup(key)
+            if slot is not None and slot.state != SlotState.READY:
+                self._drain_slot_bank_inflight_work(slot_bank)
+                slot = slot_bank.lookup(key)
             if slot is not None and slot.state == SlotState.READY:
                 slot.last_used_step = int(step_id)
                 _n_hits += 1
@@ -1017,37 +1153,43 @@ class MoeOffloadRuntime:
 
         if sync_loads:
             load_start = perf_counter() if collect_profile else 0.0
-            self._transfer_engine.load_many_sync(
-                sync_loads,
-                validate_layout=True,
-            )
+            try:
+                self._transfer_engine.load_many_sync(
+                    sync_loads,
+                    validate_layout=True,
+                )
+            except Exception:
+                self._release_allocated_loads(slot_bank, sync_loads)
+                raise
             if collect_profile:
                 load_sync_ms += (perf_counter() - load_start) * 1000.0
 
         if async_loads:
             load_start = perf_counter() if collect_profile else 0.0
-            ready_event = self._transfer_engine.load_many_async(
-                async_loads,
-                record_event=True,
-                validate_layout=True,
-            )
+            try:
+                ready_event = self._transfer_engine.load_many_async(
+                    async_loads,
+                    record_event=True,
+                    validate_layout=True,
+                )
+            except Exception:
+                self._release_allocated_loads(slot_bank, async_loads)
+                raise
             if collect_profile:
                 load_enqueue_ms = (perf_counter() - load_start) * 1000.0
 
         mapping_start = perf_counter() if collect_profile else 0.0
-        log2phy.fill_(-1)
         for expert_id, slot_id in zip(unique_active_experts, active_slot_ids, strict=True):
             log2phy[int(expert_id)] = int(slot_id)
-        for slot in slot_bank.slots:
-            if slot.expert_key is not None:
-                slot_to_expert[int(slot.slot_id)] = int(slot.expert_key.expert_id)
+            slot_to_expert[int(slot_id)] = int(expert_id)
         mapping = ExpertSlotMapping(
             layer_id=layer_id,
             active_experts=unique_active_experts,
             logical_to_physical=log2phy,
             slot_to_expert=tuple(slot_to_expert),
             active_slot_ids=tuple(active_slot_ids),
-        )
+        )  # log2phy updated in-place above; always valid on this path
+        self._active_slot_ids_by_layer[layer_id] = tuple(active_slot_ids)
         mapping_ms = (perf_counter() - mapping_start) * 1000.0 if collect_profile else 0.0
         if ready_event is not None:
             wait_start = perf_counter() if collect_profile else 0.0
@@ -1180,6 +1322,7 @@ class MoeOffloadRuntime:
                 ),
                 slot_to_expert=tuple(slot_to_expert),
                 active_slot_ids=tuple(active_slot_ids),
+                log2phy_valid=False,
             )
         return PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
 
@@ -1304,21 +1447,29 @@ class MoeOffloadRuntime:
 
         if not async_load and sync_loads:
             timer = perf_counter() if collect_profile else 0.0
-            self._transfer_engine.load_many_sync(
-                sync_loads,
-                validate_layout=False,
-            )
+            try:
+                self._transfer_engine.load_many_sync(
+                    sync_loads,
+                    validate_layout=False,
+                )
+            except Exception:
+                self._release_allocated_loads(stage_bank, sync_loads)
+                raise
             _mark("load_enqueue", timer)
 
         ready_event = None
         if async_load and async_loads:
             timer = perf_counter() if collect_profile else 0.0
-            ready_event = self._transfer_engine.load_many_async(
-                async_loads,
-                wait_event=wait_event,
-                record_event=True,
-                validate_layout=False,
-            )
+            try:
+                ready_event = self._transfer_engine.load_many_async(
+                    async_loads,
+                    wait_event=wait_event,
+                    record_event=True,
+                    validate_layout=False,
+                )
+            except Exception:
+                self._release_allocated_loads(stage_bank, async_loads)
+                raise
             _mark("load_enqueue", timer)
 
         timer = perf_counter() if collect_profile else 0.0
@@ -1341,6 +1492,7 @@ class MoeOffloadRuntime:
             logical_to_physical=log2phy,
             slot_to_expert=tuple(slot_to_expert),
             active_slot_ids=tuple(active_slot_ids),
+            log2phy_valid=build_log2phy,
         )
         prepared = PreparedSlotWeights.from_slot_bank(
             slot_bank=stage_bank,

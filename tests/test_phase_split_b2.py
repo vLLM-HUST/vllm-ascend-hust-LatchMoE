@@ -48,15 +48,15 @@ def test_plan_balanced_b2_waves_prefers_hits_and_balances_hot_experts():
     )
 
     assert all(len(wave) <= 2 for wave in plan.waves)
-    assert plan.waves[0][0] == 3
+    assert (3,) in plan.waves
     loads = [plan.wave_tokens(wave) for wave in plan.waves]
     assert max(loads) - min(loads) <= 8
 
 
-def test_plan_balanced_b2_waves_keeps_hit_and_miss_pools_separate():
-    readiness = {1: True, 2: True, 3: True, 4: True, 5: True}
+def test_plan_balanced_b2_waves_folds_partial_hit_tail_into_miss_waves():
+    readiness = {1: True}
     plan = plan_balanced_b2_waves(
-        {1: 10, 2: 9, 3: 8, 4: 7, 5: 6, 6: 5, 7: 4, 8: 3, 9: 2},
+        {1: 10, 2: 9, 3: 8, 4: 7},
         num_slots=4,
         slot_readiness=readiness,
     )
@@ -74,10 +74,77 @@ def test_plan_balanced_b2_waves_keeps_hit_and_miss_pools_separate():
         else:
             miss_waves.append(wave)
 
-    assert hit_waves
-    assert miss_waves
-    assert not mixed_waves
+    assert not hit_waves
+    assert not miss_waves
+    assert mixed_waves
     assert all(len(wave) <= 4 for wave in plan.waves)
+    assert len(plan.waves) == 1
+
+
+def test_mixed_wave_microbatch_uses_positional_slots_not_main_bank_ids():
+    """A folded mixed wave (hits + misses) is staged into a temporary stage bank
+    at positional slots 0..k-1.  build_b2_wave_microbatch_plans must therefore NOT
+    apply the hit experts' main-bank slot ids to that wave, or two distinct experts
+    collide on the same physical slot and read each other's weights (silent
+    corruption).  Pure-hit waves keep using main-bank ids (zero-copy fast path).
+    """
+    active = {1: 10, 2: 9, 3: 8, 4: 7}
+    readiness = {1: True, 2: False, 3: False, 4: False}
+    plan = plan_balanced_b2_waves(active, num_slots=4, slot_readiness=readiness)
+    # The folding produces a single mixed wave.
+    assert len(plan.waves) == 1
+    wave = plan.waves[0]
+    assert any(readiness[e] for e in wave) and any(not readiness[e] for e in wave)
+
+    topk_ids = torch.tensor([[1, 2], [2, 3], [3, 4], [4, 1]], dtype=torch.int64)
+    topk_weights = torch.ones(4, 2, dtype=torch.float32)
+    pair_index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    # Expert 1 is resident in MAIN-BANK slot 0, but its position in the wave is not 0.
+    ready_slot_ids = {1: 0}
+    plans = build_b2_wave_microbatch_plans(
+        pair_index, plan.waves, physical_slot_by_expert=ready_slot_ids
+    )
+    p = plans[0]
+
+    # Every physical slot id must equal the expert's POSITIONAL index in the wave
+    # (stage-bank layout), never the main-bank slot id.
+    pos = {int(e): idx for idx, e in enumerate(wave)}
+    logical = p.logical_expert_ids.tolist()
+    physical = p.physical_slot_ids.tolist()
+    expected = [pos[int(e)] for e in logical]
+    assert physical == expected
+
+    # And no two distinct experts may share a physical slot.
+    slot_to_experts = {}
+    for logical_id, slot in zip(logical, physical):
+        slot_to_experts.setdefault(slot, set()).add(logical_id)
+    assert all(len(experts) == 1 for experts in slot_to_experts.values())
+
+
+def test_pure_hit_wave_microbatch_still_uses_main_bank_slot_ids():
+    """Regression guard for the L4 fix: pure-hit waves must keep the zero-copy
+    main-bank mapping (they execute against the main slot bank, not a stage bank).
+    """
+    active = {1: 5, 2: 5}
+    readiness = {1: True, 2: True}
+    plan = plan_balanced_b2_waves(active, num_slots=4, slot_readiness=readiness)
+    wave = plan.waves[0]
+    assert all(readiness[e] for e in wave)
+
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int64)
+    topk_weights = torch.ones(2, 2, dtype=torch.float32)
+    pair_index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    # Resident at non-positional main-bank slots.
+    ready_slot_ids = {1: 5, 2: 7}
+    plans = build_b2_wave_microbatch_plans(
+        pair_index, plan.waves, physical_slot_by_expert=ready_slot_ids
+    )
+    p = plans[0]
+    mapping = dict(zip(p.logical_expert_ids.tolist(), p.physical_slot_ids.tolist()))
+    assert mapping[1] == 5
+    assert mapping[2] == 7
 
 
 def test_plan_b2_prefill_async_schedule_primes_miss_waves_without_changing_compute_order():
@@ -759,3 +826,66 @@ def test_build_b2_pair_microbatch_rejects_unstaged_wave_expert_when_validating(m
             log2phy,
             wave_experts=(1, 2),
         )
+
+
+# ---------------------------------------------------------------------------
+# L1: slice_positions — sparse non-identity active expert set
+# ---------------------------------------------------------------------------
+
+def test_plan_hit_miss_phases_sets_slice_positions_for_sparse_active_set():
+    """L1: expert_indices holds logical ids; slice_positions must hold compact
+    positions so _compute_wave indexes group_list/weights correctly even when
+    active experts are not the dense identity (0,1,2,...)."""
+    from vllm_moe_offload_ascend.moe_offload.phase_split import plan_hit_miss_phases
+
+    # Active experts: sparse logical ids 3, 7, 12 at compact positions 0,1,2.
+    active_expert_ids = (3, 7, 12)
+    expert_slices = [(0, 5), (5, 9), (9, 11)]
+    readiness = {3: True, 7: False, 12: False}
+
+    plan = plan_hit_miss_phases(
+        expert_slices=expert_slices,
+        active_expert_ids=active_expert_ids,
+        slot_readiness=readiness,
+        max_phases=2,
+    )
+
+    hit_phase = next(p for p in plan.phases if p.is_hit)
+    miss_phase = next(p for p in plan.phases if not p.is_hit)
+
+    # Logical ids must remain logical.
+    assert hit_phase.expert_indices == (3,)
+    assert set(miss_phase.expert_indices) == {7, 12}
+
+    # slice_positions must be compact positions (0-based into active set).
+    assert hit_phase.slice_positions == (0,)        # expert 3 is at position 0
+    assert set(miss_phase.slice_positions) == {1, 2}  # experts 7,12 at positions 1,2
+
+    # resolved_slice_positions must equal slice_positions when set.
+    assert hit_phase.resolved_slice_positions() == hit_phase.slice_positions
+    assert miss_phase.resolved_slice_positions() == miss_phase.slice_positions
+
+
+def test_plan_capacity_bounded_phases_sets_slice_positions():
+    """L1: capacity-bounded planner must also set slice_positions correctly."""
+    from vllm_moe_offload_ascend.moe_offload.phase_split import plan_capacity_bounded_phases
+
+    active_expert_ids = (5, 10, 15, 20)
+    expert_slices = [(0, 3), (3, 7), (7, 9), (9, 13)]
+
+    plan = plan_capacity_bounded_phases(
+        expert_slices=expert_slices,
+        active_expert_ids=active_expert_ids,
+        num_slots=2,
+    )
+
+    assert len(plan.phases) == 2
+    wave0, wave1 = plan.phases[0], plan.phases[1]
+
+    # Wave 0 covers positions 0,1; wave 1 covers positions 2,3.
+    assert wave0.slice_positions == (0, 1)
+    assert wave1.slice_positions == (2, 3)
+
+    # Logical ids must be the actual expert ids.
+    assert wave0.expert_indices == (5, 10)
+    assert wave1.expert_indices == (15, 20)

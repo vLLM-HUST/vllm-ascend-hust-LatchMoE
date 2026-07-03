@@ -129,6 +129,7 @@ def _apply_env_defaults_from_gb() -> None:
         get_moe_offload_gb,
         _DEFAULT_ENV_VARS,
         _FANOUT_THRESHOLD_ENV,
+        _NUM_SLOTS_BOOTSTRAP_ENV,
         _PREFILL_RESIDENCY_PROFILE_ENV,
         _NUM_SLOTS_ENV,
         _RESIDENT_LAYER_IDS_ENV,
@@ -166,6 +167,7 @@ def _apply_env_defaults_from_gb() -> None:
         slot_defaults = derive_num_slots_defaults(gb, None, plan, None)
         if not explicit_num_slots:
             os.environ[_NUM_SLOTS_ENV] = str(slot_defaults["num_slots"])
+            os.environ[_NUM_SLOTS_BOOTSTRAP_ENV] = "1"
         if not explicit_fanout_threshold:
             os.environ[_FANOUT_THRESHOLD_ENV] = os.environ.get(
                 _NUM_SLOTS_ENV,
@@ -262,6 +264,128 @@ def _infer_forward_is_prefill_from_tokens(num_tokens: int | None) -> bool | None
         return None
 
 
+def _infer_forward_phase_int(num_tokens: int | None) -> int:
+    """Map the tri-state prefill inference to the moe_offload_stage phase int.
+
+    Threads the full tri-state through to the staging op instead of collapsing
+    ``None`` (phase unknown, e.g. profile/dummy run) down to ``False`` (decode).
+    The previous ``bool(...)`` collapse made the op unable to distinguish a real
+    decode from an unknown phase, so its overflow-deferral path matched genuine
+    decode batches and left stale log2phy in place.  Returns one of the
+    moe_offload_stage_op.PHASE_* constants.
+    """
+    from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+        PHASE_DECODE,
+        PHASE_PREFILL,
+        PHASE_UNKNOWN,
+    )
+
+    phase = _infer_forward_is_prefill_from_tokens(num_tokens)
+    if phase is True:
+        return PHASE_PREFILL
+    if phase is False:
+        return PHASE_DECODE
+    return PHASE_UNKNOWN
+
+
+def _moe_offload_kv_backstop_active() -> bool:
+    """Return true when KV-capacity errors should mention MoE offload slots."""
+
+    try:
+        return (
+            _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_ENABLED", "0")
+            or float(os.getenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "0") or "0") > 0
+            or int(os.getenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "0") or "0") > 0
+        )
+    except (TypeError, ValueError):
+        return _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_ENABLED", "0")
+
+
+def _moe_offload_kv_backstop_hint(
+    *,
+    max_model_len: int | None = None,
+    max_concurrency: float | None = None,
+) -> str:
+    parts = [
+        "MoE offload KV-capacity backstop: the resolved KV cache cannot hold one full request.",
+        "For vllm-moe-offload-ascend, reduce `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` or `VLLM_ASCEND_MOE_OFFLOAD_GB`,",
+        "or reduce `max_model_len`/`max_num_seqs`; then rerun AutoConfig.",
+    ]
+    details: list[str] = []
+    gb = os.getenv("VLLM_ASCEND_MOE_OFFLOAD_GB")
+    slots = os.getenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS")
+    if gb:
+        details.append(f"offload_gb={gb}")
+    if slots:
+        details.append(f"num_slots={slots}")
+    if max_model_len is not None:
+        details.append(f"max_model_len={int(max_model_len)}")
+    if max_concurrency is not None:
+        details.append(f"max_concurrency={float(max_concurrency):.3f}x")
+    if details:
+        parts.append("(" + ", ".join(details) + ".)")
+    return " ".join(parts)
+
+
+def _patch_kv_cache_capacity_backstop() -> None:
+    """Add MoE-slot-aware fail-fast errors around vLLM's KV planning path."""
+
+    try:
+        import vllm.v1.core.kv_cache_utils as _kv_utils
+    except Exception:
+        return
+
+    patch_tag = "vllm_moe_offload_ascend.kv_capacity_backstop"
+
+    current_check = getattr(_kv_utils, "_check_enough_kv_cache_memory", None)
+    if callable(current_check) and getattr(current_check, "_ascend_moe_offload_patch_tag", None) != patch_tag:
+        original_check = current_check
+
+        def _check_enough_kv_cache_memory(*args, **kwargs):
+            try:
+                return original_check(*args, **kwargs)
+            except ValueError as exc:
+                if not _moe_offload_kv_backstop_active():
+                    raise
+                max_model_len = kwargs.get("max_model_len")
+                if max_model_len is None and len(args) >= 3:
+                    max_model_len = args[2]
+                hint = _moe_offload_kv_backstop_hint(max_model_len=max_model_len)
+                raise ValueError(f"{exc}\n{hint}") from exc
+
+        _check_enough_kv_cache_memory._ascend_moe_offload_patch_tag = patch_tag
+        _check_enough_kv_cache_memory.__wrapped__ = original_check
+        _kv_utils._check_enough_kv_cache_memory = _check_enough_kv_cache_memory
+
+    current_report = getattr(_kv_utils, "_report_kv_cache_config", None)
+    if callable(current_report) and getattr(current_report, "_ascend_moe_offload_patch_tag", None) != patch_tag:
+        original_report = current_report
+
+        def _report_kv_cache_config(vllm_config, kv_cache_config):
+            if _moe_offload_kv_backstop_active():
+                try:
+                    max_model_len = int(vllm_config.model_config.max_model_len)
+                    max_concurrency = float(
+                        _kv_utils.get_max_concurrency_for_kv_cache_config(
+                            vllm_config, kv_cache_config
+                        )
+                    )
+                except Exception:
+                    max_model_len = None
+                    max_concurrency = None
+                if max_concurrency is not None and max_concurrency < 1.0:
+                    hint = _moe_offload_kv_backstop_hint(
+                        max_model_len=max_model_len,
+                        max_concurrency=max_concurrency,
+                    )
+                    raise ValueError(hint)
+            return original_report(vllm_config, kv_cache_config)
+
+        _report_kv_cache_config._ascend_moe_offload_patch_tag = patch_tag
+        _report_kv_cache_config.__wrapped__ = original_report
+        _kv_utils._report_kv_cache_config = _report_kv_cache_config
+
+
 def apply_patches() -> None:
     # 0. Eagerly write env defaults so spawned worker processes see them.
     _apply_env_defaults_from_gb()
@@ -282,6 +406,7 @@ def apply_patches() -> None:
     _patch_platform_autoconfig()
     _patch_platform_splitting_ops()
     _patch_engine_args_autoconfig()
+    _patch_kv_cache_capacity_backstop()
 
 
 def _patch_adapt_patch_reinstall() -> None:
@@ -305,6 +430,7 @@ def _patch_adapt_patch_reinstall() -> None:
         result = current(*args, **kwargs)
         try:
             _install_runtime_module_patches()
+            _patch_kv_cache_capacity_backstop()
         except Exception as exc:
             if _to_bool_env("SEW_PATCH_PROBE", "0"):
                 print(f"SEW_PATCH adapt_reinstall_failed: {exc!r}", flush=True)
@@ -347,6 +473,8 @@ def _install_runtime_module_patches() -> None:
     except Exception as exc:
         if _to_bool_env("SEW_PATCH_PROBE", "0"):
             print(f"SEW_PATCH token_dispatcher_hook_failed: {exc!r}", flush=True)
+
+    _patch_kv_cache_capacity_backstop()
 
 
 def _to_bool_env(name: str, default: str) -> bool:
@@ -633,6 +761,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         cls._ascend_moe_offload_original_maybe_apply = original_maybe_apply
 
     def _with_prepared_slot_weights(self, fused_experts_input, prepared_weights):
+        compute_handle = get_moe_offload_runtime().begin_slot_compute(
+            prepared_weights
+        )
+        setattr(self, "_ascend_moe_offload_slot_compute_handle", compute_handle)
         return MoEFusedExpertsInput(
             hidden_states=fused_experts_input.hidden_states,
             topk_weights=fused_experts_input.topk_weights,
@@ -1025,8 +1157,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         async_load=True,
                         wait_event=buffer_release_events.get(buffer_index),
                         build_log2phy=False,
-                        known_miss=True,
-                )
+                        known_miss=not bool(hit_experts),
+                    )
                 stage_issue_ms = (perf_counter() - stage_start) * 1000.0
                 stage_issue_sequence += 1
                 issue_end_time = perf_counter()
@@ -1741,6 +1873,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         build_input_ms = (perf_counter() - build_input_start) * 1000.0
 
         old_top_k = getattr(self.token_dispatcher, "top_k", None)
+        runtime = get_moe_offload_runtime()
+        compute_handle = runtime.begin_slot_compute(prepared)
         self.token_dispatcher.top_k = 1
         try:
             dispatch_start = perf_counter()
@@ -1795,6 +1929,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 combine_mode = "token_combine"
                 scatter_mode = "layer_batch"
         finally:
+            runtime.end_slot_compute(compute_handle)
             if old_top_k is None:
                 try:
                     delattr(self.token_dispatcher, "top_k")
@@ -1832,6 +1967,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
     def _run_b2_single_wave(self, *, fused_experts_input, prepared):
         from vllm_ascend.moe_offload.phase_split import build_b2_wave_routing
 
+        runtime = get_moe_offload_runtime()
         physical_topk_ids = prepared.log2phy[fused_experts_input.topk_ids]
         safe_ids, masked_weights = build_b2_wave_routing(
             physical_topk_ids,
@@ -1874,22 +2010,26 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             offload=fused_experts_input.offload,
         )
 
-        token_dispatch_output = self.token_dispatcher.token_dispatch(
-            token_dispatch_input=build_token_dispatch_input(
-                fused_experts_input=wave_input
+        compute_handle = runtime.begin_slot_compute(prepared)
+        try:
+            token_dispatch_output = self.token_dispatcher.token_dispatch(
+                token_dispatch_input=build_token_dispatch_input(
+                    fused_experts_input=wave_input
+                )
             )
-        )
-        mlp_compute_input = build_mlp_compute_input(
-            fused_experts_input=wave_input,
-            token_dispatch_output=token_dispatch_output,
-            use_fusion_ops=self.use_fusion_ops,
-        )
-        mlp_output = self._apply_mlp(mlp_compute_input)
-        before_combine_evt = torch.npu.current_stream().record_event()
-        routed_out = self.token_dispatcher.token_combine(
-            hidden_states=mlp_output,
-            combine_metadata=token_dispatch_output.combine_metadata,
-        )
+            mlp_compute_input = build_mlp_compute_input(
+                fused_experts_input=wave_input,
+                token_dispatch_output=token_dispatch_output,
+                use_fusion_ops=self.use_fusion_ops,
+            )
+            mlp_output = self._apply_mlp(mlp_compute_input)
+            before_combine_evt = torch.npu.current_stream().record_event()
+            routed_out = self.token_dispatcher.token_combine(
+                hidden_states=mlp_output,
+                combine_metadata=token_dispatch_output.combine_metadata,
+            )
+        finally:
+            runtime.end_slot_compute(compute_handle)
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_combine_evt,
@@ -1944,7 +2084,17 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         )
         if b2_out is not None:
             return b2_out
-        return original_fused_experts(self, fused_experts_input)
+        try:
+            return original_fused_experts(self, fused_experts_input)
+        finally:
+            compute_handle = getattr(
+                self,
+                "_ascend_moe_offload_slot_compute_handle",
+                None,
+            )
+            if hasattr(self, "_ascend_moe_offload_slot_compute_handle"):
+                delattr(self, "_ascend_moe_offload_slot_compute_handle")
+            runtime.end_slot_compute(compute_handle)
 
     _maybe_apply_moe_offload_plan._ascend_moe_offload_patch_tag = patch_tag
     fused_experts._ascend_moe_offload_patch_tag = patch_tag
@@ -2097,11 +2247,7 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                     topk_ids,
                     int(layer_id),
                     num_logical_experts,
-                    bool(
-                        _infer_forward_is_prefill_from_tokens(
-                            int(topk_ids.shape[0])
-                        )
-                    ),
+                    _infer_forward_phase_int(int(topk_ids.shape[0])),
                 )
         return topk_weights, topk_ids
 
@@ -2117,6 +2263,8 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
             return None
         result = original_process_weights(self, layer)
         layer_id = int(getattr(layer, "layer_id", -1))
+        if layer_id < 0:
+            return result  # no layer_id → cannot identify slot bank; skip staging
         if (
             runtime.should_use_fixed_slot_plan_for_layer(layer_id)
             and runtime.is_layer_registered(layer_id)
@@ -2135,7 +2283,11 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
             layer = args[0]
         old_layer_id = getattr(layer_context, "layer_id", None)
         if layer is not None:
-            layer_context.layer_id = int(getattr(layer, "layer_id", -1))
+            lid = int(getattr(layer, "layer_id", -1))
+            if lid >= 0:
+                layer_context.layer_id = lid
+            # lid == -1: layer has no id; skip context so the seam does not
+            # collide with other unidentified layers sharing key -1.
         try:
             return original_apply(self, *args, **kwargs)
         finally:
@@ -2237,9 +2389,14 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
 
         from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
         runtime = get_moe_offload_runtime()
-        is_prefill = bool(
-            _infer_forward_is_prefill_from_tokens(int(hidden_states.shape[0]))
+        phase_int = _infer_forward_phase_int(int(hidden_states.shape[0]))
+        from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+            PHASE_PREFILL,
         )
+        # Resident-layer native fast path only fires on a CONFIRMED prefill; an
+        # unknown phase must not take the resident-native branch (preserves the
+        # prior None->False behaviour for this guard).
+        is_prefill = phase_int == PHASE_PREFILL
         if is_prefill and runtime.is_resident_layer(int(self._seam_layer_id)):
             is_compiling = _is_torch_compile_tracing()
             if _os.environ.get("SEW_SEAM_PROBE") and not is_compiling:
@@ -2286,7 +2443,7 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             topk_ids,
             self._seam_layer_id,
             self._seam_num_logical_experts,
-            is_prefill,
+            phase_int,
         )
         return torch.ops.vllm.moe_mlp(
             hidden_states,
@@ -2325,6 +2482,10 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
 
         num_shared_experts = getattr(layer, "n_shared_experts", 0) or 0
         self._seam_layer_id = int(getattr(layer, "layer_id", -1))
+        if self._seam_layer_id < 0:
+            # Layer lacks a layer_id attribute; the seam cannot safely key its
+            # injection/log2phy registry by -1 (all such layers would collide).
+            return False
         self._seam_num_logical_experts = get_moe_num_logical_experts(
             layer,
             layer.moe_config.num_experts,

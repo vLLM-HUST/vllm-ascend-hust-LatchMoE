@@ -135,12 +135,15 @@ def _moe_router_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Trace-time shape/dtype proxy. The apply-path call passes mix_placement=False
     # and num_shared_experts=0, so both outputs are (num_tokens, top_k).
-    #   - topk_weights: float (downstream apply does topk_weights.to(x.dtype));
-    #     we proxy with router_logits.dtype, matching the native select path.
+    #   - topk_weights: real _native_select_experts casts to hidden_states.dtype
+    #     (experts_selector.py line ~322: `topk_weights = topk_weights.to(x.dtype)`).
+    #     Using router_logits.dtype was wrong for indirect-router models where the
+    #     gate output is float32 but hidden_states is bf16, causing torch.compile
+    #     to specialize on the wrong dtype and potentially mis-codegen downstream.
     #   - topk_ids: int32 selected logical-expert ids.
     num_tokens = hidden_states.shape[0]
     topk_weights = torch.empty(
-        (num_tokens, top_k), dtype=router_logits.dtype, device=hidden_states.device
+        (num_tokens, top_k), dtype=hidden_states.dtype, device=hidden_states.device
     )
     topk_ids = torch.empty(
         (num_tokens, top_k), dtype=torch.int32, device=hidden_states.device

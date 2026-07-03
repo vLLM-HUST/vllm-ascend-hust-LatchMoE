@@ -17,6 +17,8 @@
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
@@ -43,6 +45,14 @@ class ExpertSlotMapping:
     logical_to_physical: torch.Tensor
     slot_to_expert: tuple[int | None, ...]
     active_slot_ids: tuple[int, ...]
+    # Whether ``logical_to_physical`` is a complete, current logical->physical
+    # table that may be used to remap topk_ids.  Set False when the producer
+    # deliberately skipped rebuilding the buffer (e.g. ``build_log2phy=False`` on
+    # the B2 wave fast path, which reuses a persistent per-buffer-index tensor
+    # and routes via precomputed wave-plan physical ids instead).  Consumers that
+    # actually index ``logical_to_physical`` must check this flag — the buffer
+    # otherwise holds a STALE mapping from a previous wave.
+    log2phy_valid: bool = True
 
     @classmethod
     def from_slot_bank(
@@ -95,9 +105,29 @@ class ExpertSlotMapping:
         )
 
     def remap_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        if not self.log2phy_valid:
+            raise RuntimeError(
+                "remap_topk_ids called on a mapping whose logical_to_physical was "
+                "not rebuilt (log2phy_valid=False); use the wave-plan physical ids "
+                "for this path instead of this stale buffer"
+            )
         remapped = self.logical_to_physical[topk_ids]
-        if remapped.device.type == "cpu" and bool((remapped < 0).any().item()):
-            raise RuntimeError("topk_ids contain experts without ready slots")
+        # Fail-closed when any active expert lacks a ready slot (log2phy == -1).
+        # On CPU we can check cheaply.  On NPU the .item() sync is too costly for
+        # the per-step hot path, so it stays opt-in via SEW_LOG2PHY_VALIDATE; when
+        # disabled, an unstaged expert silently indexes slot[-1] (wrong weights /
+        # MTE out-of-range), so the caller MUST stage the complete active set.
+        if remapped.device.type == "cpu":
+            if bool((remapped < 0).any().item()):
+                raise RuntimeError("topk_ids contain experts without ready slots")
+        elif os.environ.get("SEW_LOG2PHY_VALIDATE"):
+            if bool((remapped < 0).any().item()):
+                missing = (
+                    topk_ids[remapped < 0].detach().cpu().unique().tolist()
+                )
+                raise RuntimeError(
+                    f"topk_ids contain experts without ready slots: {missing}"
+                )
         return remapped
 
 

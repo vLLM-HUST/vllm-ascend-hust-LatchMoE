@@ -60,7 +60,8 @@ class MoEPhase:
 
     phase_index: int
     # Logical expert ids covered by this phase (order as they appear in the
-    # original sorted-hidden-states layout).
+    # original sorted-hidden-states layout).  Used for STAGING (which logical
+    # experts to load into slots), NOT for indexing group_list / weights.
     expert_indices: tuple[int, ...]
     # Start / end (exclusive) offsets in the *original* sorted hidden states
     # that this phase will extract.  Because experts may be interleaved with
@@ -70,6 +71,27 @@ class MoEPhase:
     token_slices: tuple[tuple[int, int], ...]
     # True when all experts in this phase are resident / slot-ready (hit).
     is_hit: bool
+    # Compact POSITION index of each expert within the layer's active-expert
+    # order (i.e. the row index into the compact ``group_list`` / ``weights``
+    # tensors), aligned 1:1 with ``expert_indices`` / ``token_slices``.  This is
+    # distinct from ``expert_indices`` (logical ids): the two coincide only when
+    # the active set is the dense identity ``(0,1,2,...)``.  ``_compute_wave``
+    # must index group_list/weights with ``slice_positions``, never with the
+    # logical ``expert_indices`` (doing so silently selects the wrong experts'
+    # counts/weights, or raises IndexError, whenever the active set is sparse).
+    # Defaults to ``()`` for backward-compatible construction; callers that omit
+    # it implicitly assert a dense-identity active set.
+    slice_positions: tuple[int, ...] = ()
+
+    def resolved_slice_positions(self) -> tuple[int, ...]:
+        """Positions to index compact group_list/weights for this phase.
+
+        Falls back to ``expert_indices`` when ``slice_positions`` was not set,
+        preserving the legacy dense-identity behaviour.
+        """
+        if self.slice_positions:
+            return self.slice_positions
+        return self.expert_indices
 
     @property
     def total_tokens(self) -> int:
@@ -309,6 +331,7 @@ def _build_single_phase_plan(
         expert_indices=active_expert_ids,
         token_slices=tuple(expert_slices),
         is_hit=True,
+        slice_positions=tuple(range(len(expert_slices))),
     )
     return MoEPhasePlan(
         phases=(phase,),
@@ -370,6 +393,7 @@ def plan_hit_miss_phases(
             expert_indices=tuple(eid for eid, _ in pairs),
             token_slices=tuple(expert_slices[si] for _, si in pairs),
             is_hit=is_hit,
+            slice_positions=tuple(int(si) for _, si in pairs),
         )
 
     hit_phase = _make_phase(0, hit_pairs, True)
@@ -505,10 +529,49 @@ def plan_balanced_b2_waves(
         if not readiness.get(int(expert_id), False)
     ]
 
-    # Keep hit and miss experts in separate wave pools. Mixing one hit into many
-    # miss waves destroys the chance to run hit-only waves from the main slot
-    # cache later, and today it causes needless NPU->NPU copies into temp banks.
-    waves = tuple(tuple(wave) for wave in (_pack(hit_experts) + _pack(miss_experts)))
+    hit_bins = _pack(hit_experts)
+    miss_bins = _pack(miss_experts)
+
+    # Preserve full hit-only waves: these can compute directly from the main slot
+    # cache and are useful cover for async miss-wave staging. Partial hit waves are
+    # different: keeping a tiny hit tail separate increases wave count and repeats
+    # dispatch/GMM/scatter overhead. Fold that tail into miss waves when there is
+    # spare capacity; the staged path will copy those hit experts device-to-device.
+    full_hit_bins: list[list[int]] = []
+    partial_hit_experts: list[int] = []
+    for wave in hit_bins:
+        if len(wave) >= num_slots:
+            full_hit_bins.append(wave)
+        else:
+            partial_hit_experts.extend(int(expert_id) for expert_id in wave)
+
+    if miss_bins and partial_hit_experts:
+        miss_loads = [sum(active[int(expert_id)] for expert_id in wave) for wave in miss_bins]
+        remaining_hit_experts = sorted(
+            partial_hit_experts,
+            key=lambda expert_id: (-active[int(expert_id)], int(expert_id)),
+        )
+        unplaced_hit_experts: list[int] = []
+        for expert_id in remaining_hit_experts:
+            best_idx = None
+            best_load = None
+            for idx, wave in enumerate(miss_bins):
+                if len(wave) >= num_slots:
+                    continue
+                load = miss_loads[idx]
+                if best_load is None or load < best_load:
+                    best_idx = idx
+                    best_load = load
+            if best_idx is None:
+                unplaced_hit_experts.append(int(expert_id))
+                continue
+            miss_bins[best_idx].append(int(expert_id))
+            miss_loads[best_idx] += active[int(expert_id)]
+        partial_hit_bins = _pack(unplaced_hit_experts)
+    else:
+        partial_hit_bins = _pack(partial_hit_experts)
+
+    waves = tuple(tuple(wave) for wave in (full_hit_bins + miss_bins + partial_hit_bins))
     return B2WavePlan(waves=waves, token_counts_by_expert=active)
 
 
@@ -976,13 +1039,22 @@ def build_b2_wave_microbatch_plans(
     all_slot_ids: list[int] = []
     for wave in normalized_waves:
         wave_pairs: list[tuple[int, int, int]] = []
+        # Main-bank physical ids are valid ONLY when the whole wave is a pure-hit
+        # wave executed against the main slot bank (zero-copy path).  A mixed wave
+        # (any miss) is staged into a temporary stage bank at positional slots
+        # 0..k-1; applying a main-bank slot id to a hit expert in that wave indexes
+        # the wrong position in the stage bank and produces silent weight corruption.
+        wave_is_pure_hit = bool(physical_slots) and all(
+            int(e) in physical_slots for e in wave
+        )
         for slot_id, expert_id in enumerate(wave):
+            physical_id = (
+                int(physical_slots[int(expert_id)])
+                if wave_is_pure_hit
+                else int(slot_id)
+            )
             wave_pairs.extend(
-                (
-                    int(offset),
-                    int(physical_slots.get(int(expert_id), int(slot_id))),
-                    int(expert_id),
-                )
+                (int(offset), physical_id, int(expert_id))
                 for offset in pair_index.pair_offsets_by_expert.get(
                     int(expert_id),
                     (),
@@ -1449,6 +1521,7 @@ def plan_capacity_bounded_phases(
                 expert_indices=tuple(int(e) for e in chunk_ids),
                 token_slices=chunk_slices,
                 is_hit=False,
+                slice_positions=tuple(range(start, start + len(chunk_ids))),
             )
         )
 
@@ -1710,9 +1783,13 @@ def execute_phased_mlp(
     waves = [p for p in phase_plan.phases if p.total_tokens > 0]
 
     def _compute_wave(phase) -> None:
+        # group_list / weights are COMPACT (one row per active expert, in the
+        # layer's active-expert order), so they must be indexed by the compact
+        # position, not by the logical expert id.  See MoEPhase.slice_positions.
+        slice_positions = phase.resolved_slice_positions()
         phase_hidden = _extract_phase_tokens(hidden_states, phase.token_slices)
-        phase_group_list = _build_phase_group_list(group_list, group_list_type, phase.expert_indices)
-        phase_weights = _slice_expert_weights(mlp_compute_input.weights, phase.expert_indices)
+        phase_group_list = _build_phase_group_list(group_list, group_list_type, slice_positions)
+        phase_weights = _slice_expert_weights(mlp_compute_input.weights, slice_positions)
         phase_input = _MoEMlpComputeInput(
             hidden_states=phase_hidden,
             group_list=phase_group_list,

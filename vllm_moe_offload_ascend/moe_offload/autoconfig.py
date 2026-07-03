@@ -36,13 +36,27 @@ _MIN_TARGET_B2_WAVES = 2
 _MIN_NET_SAVING_GB_ENV = "VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_GB"
 _MIN_NET_SAVING_RATIO_ENV = "VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_RATIO"
 _SLOT_HBM_BUDGET_GB_ENV = "VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_BUDGET_GB"
+_SLOT_HBM_FRACTION_ENV = "VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_FRACTION"
+_NUM_SLOTS_BOOTSTRAP_ENV = "VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS_AUTOCONFIG_BOOTSTRAP"
+_KV_RESERVE_SEQS_ENV = "VLLM_ASCEND_MOE_OFFLOAD_KV_RESERVE_SEQS"
+_KV_RESERVE_CTX_ENV = "VLLM_ASCEND_MOE_OFFLOAD_KV_RESERVE_CTX"
+_SYSTEM_RESERVE_GB_ENV = "VLLM_ASCEND_MOE_OFFLOAD_SYSTEM_RESERVE_GB"
+_ACTIVATION_RESERVE_GB_ENV = "VLLM_ASCEND_MOE_OFFLOAD_ACTIVATION_RESERVE_GB"
 _DEFAULT_MIN_NET_SAVING_RATIO = 0.25
+_DEFAULT_KV_RESERVE_SEQS = 4
+_DEFAULT_SYSTEM_RESERVE_GB = 2.0
+_DEFAULT_ACTIVATION_RESERVE_GB = 1.0
+_DEFAULT_SLOT_HBM_FRACTION = 0.12
 _DEFAULT_QWEN3_30B_A3B_CONFIG = {
     "hidden_size": 2048,
     "moe_intermediate_size": 768,
     "num_experts": 128,
     "num_experts_per_tok": 8,
     "num_hidden_layers": 48,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "max_position_embeddings": 40960,
     "torch_dtype": "bfloat16",
 }
 
@@ -270,6 +284,19 @@ def _get_optional_env_float(name: str) -> float | None:
     return value
 
 
+def _get_optional_env_int(name: str) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value is None or str(raw_value).strip() == "":
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw_value!r}.") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {raw_value!r}.")
+    return value
+
+
 def _target_b2_waves_for_offload(target_offload_gb: float) -> int:
     """Scale Prefill B2 wave target with the user's offload budget.
 
@@ -288,6 +315,72 @@ def _target_b2_waves_for_offload(target_offload_gb: float) -> int:
         / float(target_offload_gb)
     )
     return max(_MIN_TARGET_B2_WAVES, int(scaled))
+
+
+def _slot_reserve_breakdown(
+    *,
+    advisor: Any,
+    serving: Any,
+    num_offloaded_layers: int,
+    max_model_len: int,
+) -> dict[str, Any]:
+    from vllm_moe_offload_ascend.moe_offload.autoconfig_advisor import (
+        ServingConfig,
+    )
+
+    kv_reserve_seqs = _get_optional_env_int(_KV_RESERVE_SEQS_ENV)
+    if kv_reserve_seqs is None:
+        kv_reserve_seqs = _DEFAULT_KV_RESERVE_SEQS
+    kv_reserve_ctx = _get_optional_env_int(_KV_RESERVE_CTX_ENV)
+    if kv_reserve_ctx is None:
+        kv_reserve_ctx = min(int(max_model_len), 8192)
+    kv_reserve_serving = ServingConfig(
+        max_batch_size=max(1, int(kv_reserve_seqs)),
+        max_seq_len=max(1, int(kv_reserve_ctx)),
+        top_k=int(serving.top_k),
+        target_b2_waves=int(serving.target_b2_waves),
+    )
+    kv_reserve_gib = advisor.estimate_kv_cache_gib(kv_reserve_serving)
+
+    activation_estimate_gib = advisor.estimate_activation_gib(serving)
+    activation_floor_gib = _get_optional_env_float(_ACTIVATION_RESERVE_GB_ENV)
+    if activation_floor_gib is None:
+        activation_floor_gib = _DEFAULT_ACTIVATION_RESERVE_GB
+    activation_reserve_gib = max(
+        float(activation_estimate_gib),
+        float(activation_floor_gib),
+    )
+
+    system_reserve_gib = _get_optional_env_float(_SYSTEM_RESERVE_GB_ENV)
+    if system_reserve_gib is None:
+        system_reserve_gib = _DEFAULT_SYSTEM_RESERVE_GB
+
+    prefill_buffer_count = _get_optional_env_int(
+        "VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT"
+    )
+    if prefill_buffer_count is None:
+        prefill_buffer_count = int(_SEW_DATAPLANE_ENV_VARS[
+            "VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT"
+        ])
+    prefill_buffer_count = max(0, int(prefill_buffer_count))
+
+    non_slot_reserve_gib = (
+        float(kv_reserve_gib)
+        + float(activation_reserve_gib)
+        + float(system_reserve_gib)
+    )
+    return {
+        "kv_reserve_seqs": int(kv_reserve_seqs),
+        "kv_reserve_ctx": int(kv_reserve_ctx),
+        "kv_reserve_gib": float(kv_reserve_gib),
+        "activation_estimate_gib": float(activation_estimate_gib),
+        "activation_reserve_gib": float(activation_reserve_gib),
+        "system_reserve_gib": float(system_reserve_gib),
+        "non_slot_reserve_gib": float(non_slot_reserve_gib),
+        "prefill_buffer_count": int(prefill_buffer_count),
+        "affordability_layer_equivalent_count": int(num_offloaded_layers)
+        + int(prefill_buffer_count),
+    }
 
 
 def _read_npu_hbm_budget_gib(engine_args: Any | None) -> tuple[float | None, dict[str, Any]]:
@@ -323,6 +416,28 @@ def _read_npu_hbm_budget_gib(engine_args: Any | None) -> tuple[float | None, dic
         "used_gib": used_gib,
         "gpu_memory_utilization": gpu_memory_utilization,
         "slot_hbm_budget_gib": usable_gib,
+    }
+
+
+def _physical_slot_fraction_budget_gib(real_hbm_info: dict[str, Any]) -> tuple[float | None, dict[str, Any] | None]:
+    if real_hbm_info.get("source") != "torch.npu.mem_get_info":
+        return None, None
+    total_gib = real_hbm_info.get("total_gib")
+    if total_gib is None:
+        return None, None
+    fraction = _get_optional_env_float(_SLOT_HBM_FRACTION_ENV)
+    if fraction is None:
+        fraction = _DEFAULT_SLOT_HBM_FRACTION
+    fraction = min(1.0, max(0.0, float(fraction)))
+    budget_gib = max(0.0, float(total_gib) * fraction)
+    return budget_gib, {
+        "source": (
+            "fraction_default"
+            if _SLOT_HBM_FRACTION_ENV not in os.environ
+            else "fraction_env"
+        ),
+        "slot_hbm_fraction": fraction,
+        "slot_fraction_budget_gib": budget_gib,
     }
 
 
@@ -395,24 +510,55 @@ def derive_num_slots_defaults(
         estimated_offloaded_gb - min_net_saving_gib,
     )
     real_hbm_budget_gib, real_hbm_info = _read_npu_hbm_budget_gib(engine_args)
-    slot_budget_gib = net_saving_slot_budget_gib
+    reserve_info = _slot_reserve_breakdown(
+        advisor=advisor,
+        serving=serving,
+        num_offloaded_layers=num_offloaded_layers,
+        max_model_len=int(serving.max_seq_len),
+    )
+    non_slot_reserve_gib = float(reserve_info["non_slot_reserve_gib"])
+    net_saving_slot_budget_after_reserve_gib = max(
+        0.0,
+        net_saving_slot_budget_gib - non_slot_reserve_gib,
+    )
+    slot_budget_gib = net_saving_slot_budget_after_reserve_gib
     if real_hbm_budget_gib is not None:
-        slot_budget_gib = min(slot_budget_gib, real_hbm_budget_gib)
+        slot_budget_gib = min(
+            slot_budget_gib,
+            max(0.0, real_hbm_budget_gib - non_slot_reserve_gib),
+        )
+    physical_slot_budget_gib, physical_slot_budget_info = (
+        _physical_slot_fraction_budget_gib(real_hbm_info)
+    )
+    if physical_slot_budget_gib is not None:
+        slot_budget_gib = min(slot_budget_gib, physical_slot_budget_gib)
+    affordability_layer_count = int(
+        reserve_info["affordability_layer_equivalent_count"]
+    )
     num_slots = advisor.suggest_num_slots(
         serving,
-        num_offloaded_layers,
+        affordability_layer_count,
         slot_budget_gib,
     )
     slot_bank_gib = advisor.slot_bank_gib(int(num_slots), num_offloaded_layers)
+    b2_stage_bank_gib = advisor.single_expert_gib() * int(num_slots) * int(
+        reserve_info["prefill_buffer_count"]
+    )
     return {
         "num_slots": int(num_slots),
         "fanout_threshold": int(num_slots),
         "slot_budget_gib": float(slot_budget_gib),
         "slot_budget_constraints": {
             "net_saving_slot_budget_gib": float(net_saving_slot_budget_gib),
+            "net_saving_slot_budget_after_reserve_gib": float(
+                net_saving_slot_budget_after_reserve_gib
+            ),
             "real_hbm_slot_budget_gib": real_hbm_budget_gib,
+            "effective_slot_budget_gib": float(slot_budget_gib),
             "minimum_net_saving": min_saving_info,
             "real_hbm": real_hbm_info,
+            "physical_slot_fraction": physical_slot_budget_info,
+            "reserve": reserve_info,
         },
         "target_b2_waves": int(serving.target_b2_waves),
         "decode_working_set": min(
@@ -421,6 +567,8 @@ def derive_num_slots_defaults(
         ),
         "estimated_b2_waves": math.ceil(advisor.num_experts / max(1, int(num_slots))),
         "slot_bank_gib": slot_bank_gib,
+        "b2_stage_bank_gib": b2_stage_bank_gib,
+        "slot_plus_b2_stage_gib": slot_bank_gib + b2_stage_bank_gib,
         "net_hbm_saving_gib": max(0.0, estimated_offloaded_gb - slot_bank_gib),
     }
 
@@ -575,7 +723,10 @@ def apply_moe_offload_defaults(engine_args: Any) -> bool:
 
     _raise_on_uva_conflict(engine_args)
     sew_dataplane = _sew_dataplane_selected()
-    explicit_num_slots = _NUM_SLOTS_ENV in os.environ
+    explicit_num_slots = (
+        _NUM_SLOTS_ENV in os.environ
+        and os.getenv(_NUM_SLOTS_BOOTSTRAP_ENV) != "1"
+    )
     explicit_fanout_threshold = _FANOUT_THRESHOLD_ENV in os.environ
     for env_name, value in _DEFAULT_ENV_VARS.items():
         if sew_dataplane and env_name in _SEW_DATAPLANE_ENV_VARS:
@@ -605,6 +756,7 @@ def apply_moe_offload_defaults(engine_args: Any) -> bool:
     )
     if not explicit_num_slots:
         os.environ[_NUM_SLOTS_ENV] = str(slot_defaults["num_slots"])
+        os.environ[_NUM_SLOTS_BOOTSTRAP_ENV] = "0"
     if not explicit_fanout_threshold:
         os.environ[_FANOUT_THRESHOLD_ENV] = os.environ.get(
             _NUM_SLOTS_ENV,

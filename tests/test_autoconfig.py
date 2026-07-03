@@ -50,6 +50,12 @@ AUTOCONFIG_ENV_VARS = (
     "VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_GB",
     "VLLM_ASCEND_MOE_OFFLOAD_MIN_NET_SAVING_RATIO",
     "VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_BUDGET_GB",
+    "VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_FRACTION",
+    "VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS_AUTOCONFIG_BOOTSTRAP",
+    "VLLM_ASCEND_MOE_OFFLOAD_KV_RESERVE_SEQS",
+    "VLLM_ASCEND_MOE_OFFLOAD_KV_RESERVE_CTX",
+    "VLLM_ASCEND_MOE_OFFLOAD_SYSTEM_RESERVE_GB",
+    "VLLM_ASCEND_MOE_OFFLOAD_ACTIVATION_RESERVE_GB",
 )
 
 
@@ -147,6 +153,8 @@ def test_num_slots_scales_with_larger_offload_budget():
     assert slots_28["num_slots"] == 64
     assert slots_28["target_b2_waves"] == 2
     assert slots_28["estimated_b2_waves"] == 2
+    assert slots_28["slot_budget_constraints"]["reserve"]["prefill_buffer_count"] == 2
+    assert slots_28["slot_plus_b2_stage_gib"] > slots_28["slot_bank_gib"]
 
 
 def test_num_slots_respects_real_hbm_budget_override():
@@ -160,8 +168,9 @@ def test_num_slots_respects_real_hbm_budget_override():
 
     assert prefetch["estimated_offloaded_layers"] == 48
     assert slots["target_b2_waves"] == 2
-    assert slots["num_slots"] == 47
+    assert slots["num_slots"] == 38
     assert slots["slot_bank_gib"] <= 20
+    assert slots["slot_plus_b2_stage_gib"] <= 20
     assert slots["slot_budget_constraints"]["real_hbm_slot_budget_gib"] == 20
 
 
@@ -175,8 +184,145 @@ def test_num_slots_respects_minimum_net_hbm_saving():
         prefetch,
     )
 
-    assert slots["num_slots"] == 32
+    assert slots["num_slots"] == 23
     assert slots["net_hbm_saving_gib"] >= prefetch["estimated_offloaded_gb"] * 0.75
+
+
+def test_num_slots_reserves_kv_activation_and_b2_buffers_for_real_qwen_shape():
+    config = {
+        "hidden_size": 2048,
+        "moe_intermediate_size": 768,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "max_position_embeddings": 32768,
+        "torch_dtype": "bfloat16",
+    }
+    os.environ["VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_BUDGET_GB"] = "80"
+    prefetch_14 = derive_prefetch_defaults(14, config)
+    slots_14 = derive_num_slots_defaults(14, config, prefetch_14)
+    prefetch_28 = derive_prefetch_defaults(28, config)
+    slots_28 = derive_num_slots_defaults(28, config, prefetch_28)
+
+    assert slots_14["num_slots"] == 32
+    assert slots_28["num_slots"] < 64
+    reserve = slots_28["slot_budget_constraints"]["reserve"]
+    assert reserve["kv_reserve_seqs"] == 4
+    assert reserve["kv_reserve_ctx"] == 8192
+    assert reserve["kv_reserve_gib"] > 0
+    assert reserve["affordability_layer_equivalent_count"] == (
+        prefetch_28["estimated_offloaded_layers"] + reserve["prefill_buffer_count"]
+    )
+
+
+def test_num_slots_uses_physical_slot_fraction_cap_for_64gb_npu(monkeypatch):
+    import vllm_moe_offload_ascend.moe_offload.autoconfig as autoconfig
+
+    config = {
+        "hidden_size": 2048,
+        "moe_intermediate_size": 768,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "max_position_embeddings": 40960,
+        "torch_dtype": "bfloat16",
+    }
+    engine_args = type(
+        "EngineArgsStub",
+        (),
+        {
+            "max_num_seqs": 1,
+            "max_model_len": 4096,
+            "gpu_memory_utilization": 0.9,
+        },
+    )()
+    monkeypatch.setattr(
+        autoconfig,
+        "_read_npu_hbm_budget_gib",
+        lambda _engine_args: (
+            54.86,
+            {
+                "source": "torch.npu.mem_get_info",
+                "free_gib": 60.62,
+                "total_gib": 60.96,
+                "used_gib": 0.34,
+                "gpu_memory_utilization": 0.9,
+                "slot_hbm_budget_gib": 54.86,
+            },
+        ),
+    )
+
+    prefetch = derive_prefetch_defaults(28, config)
+    slots = derive_num_slots_defaults(28, config, prefetch, engine_args)
+
+    assert slots["num_slots"] == 32
+    physical = slots["slot_budget_constraints"]["physical_slot_fraction"]
+    assert physical["slot_hbm_fraction"] == 0.12
+    assert slots["slot_plus_b2_stage_gib"] <= physical["slot_fraction_budget_gib"]
+
+
+def test_apply_defaults_overwrites_bootstrap_num_slots_with_real_model_config(monkeypatch):
+    import vllm_moe_offload_ascend.moe_offload.autoconfig as autoconfig
+
+    monkeypatch.setenv(MOE_OFFLOAD_GB_ENV, "28")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "64")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS_AUTOCONFIG_BOOTSTRAP", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_FRACTION", "0.12")
+    monkeypatch.setattr(
+        autoconfig,
+        "_read_npu_hbm_budget_gib",
+        lambda _engine_args: (
+            54.86,
+            {
+                "source": "torch.npu.mem_get_info",
+                "free_gib": 60.62,
+                "total_gib": 60.96,
+                "used_gib": 0.34,
+                "gpu_memory_utilization": 0.9,
+                "slot_hbm_budget_gib": 54.86,
+            },
+        ),
+    )
+    engine_args = type(
+        "EngineArgsStub",
+        (),
+        {
+            "_ascend_moe_offload_model_config": {
+                "hidden_size": 2048,
+                "moe_intermediate_size": 768,
+                "num_experts": 128,
+                "num_experts_per_tok": 8,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "max_position_embeddings": 40960,
+                "torch_dtype": "bfloat16",
+            },
+            "max_num_seqs": 1,
+            "max_model_len": 4096,
+            "gpu_memory_utilization": 0.9,
+            "offload_backend": "auto",
+            "offload_group_size": 0,
+            "offload_num_in_group": 1,
+            "offload_prefetch_step": 1,
+            "offload_params": set(),
+            "cpu_offload_gb": 0,
+            "cpu_offload_params": set(),
+        },
+    )()
+
+    assert apply_moe_offload_defaults(engine_args) is True
+
+    assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS"] == "32"
+    assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS_AUTOCONFIG_BOOTSTRAP"] == "0"
 
 
 @pytest.mark.parametrize(

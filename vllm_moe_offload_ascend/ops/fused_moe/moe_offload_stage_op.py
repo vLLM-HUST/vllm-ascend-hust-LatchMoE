@@ -50,6 +50,31 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+# ---------------------------------------------------------------------------
+# Tri-state phase constants for the moe_offload_stage custom op.
+#
+# The forward context provides authoritative phase information via
+# attn_metadata.num_prefills / num_decodes.  When that context is unavailable
+# (e.g. vLLM's profile_run / dummy batch), we cannot reliably distinguish a
+# true decode from a short prefill using token counts alone — so we fall back
+# to PHASE_UNKNOWN.  The stage op and its downstream consumer
+# (_maybe_run_b2_wave_prefill) must agree on the meaning of each value:
+#
+#   PHASE_DECODE  (0) — confirmed decode forward.  NEVER defer to the B2 wave
+#                       loop; a decode active set that exceeds num_slots is a
+#                       configuration error, not a recoverable overflow.
+#   PHASE_PREFILL (1) — confirmed prefill forward.  The B2 wave loop may claim
+#                       this call when active_count > num_slots.
+#   PHASE_UNKNOWN (-1)— no reliable metadata (profile/dummy run).  Use only the
+#                       narrow overflow handshake (cache route-stats, let the
+#                       downstream B2 path decide) — do NOT treat as a confirmed
+#                       decode, which is what previously corrupted log2phy.
+# ---------------------------------------------------------------------------
+PHASE_DECODE: int = 0
+PHASE_PREFILL: int = 1
+PHASE_UNKNOWN: int = -1
+
+
 # Env-gated diagnostics (SEW_SEAM_PROBE): count how many times the seam op runs,
 # and in which mode (capturing vs eager). The decisive R3 question is whether the
 # op runs EAGER at replay (=> staging reaches the persistent buffer) or got
@@ -76,7 +101,7 @@ def _moe_offload_stage_impl(
     topk_ids: torch.Tensor,
     layer_id: int,
     num_logical_experts: int,
-    is_prefill: bool,
+    phase: int,
 ) -> None:
     """Eager staging seam. Side-effect-only: stages miss experts into fixed slots
     and writes the persistent log2phy buffer in place.
@@ -182,24 +207,32 @@ def _moe_offload_stage_impl(
     # fused_experts B2 early-branch re-stages each wave and consumes the router's
     # topk_ids directly (its own per-wave log2phy), never reading this buffer.
     #
-    # Prefer the authoritative is_prefill flag injected by the forward context.
-    # If vLLM profile/dummy runs do not expose prefill metadata, still defer only
-    # when the current working set cannot fit in slots. The downstream B2 path
-    # consumes this exact route-stats record before it is allowed to run, so this
-    # fallback is a narrow overflow handshake rather than a token-count phase
-    # guess.
-    is_prefill = bool(is_prefill)
+    # Phase semantics (see PHASE_* constants at the top of this module):
+    #   PHASE_PREFILL → B2 phase match when active_count > num_slots.
+    #   PHASE_DECODE  → NEVER defer.  An offloaded layer has no NPU full-weight
+    #                   copy, so a decode active set that exceeds num_slots cannot
+    #                   be wave-streamed (the downstream B2 path bails on confirmed
+    #                   decode).  Let stage_fixed_slot_plan raise its clear
+    #                   working-set guard error instead of silently leaving the
+    #                   previous step's log2phy in place (the corruption this fixes).
+    #   PHASE_UNKNOWN → narrow overflow handshake only: profile/dummy runs do not
+    #                   expose phase metadata, so defer only when the working set
+    #                   cannot fit AND the batch is too large to be a one-token-per-
+    #                   seq decode (token_count_hint > max_num_seqs_hint), i.e. we
+    #                   cannot rule out prefill.  The downstream B2 path consumes
+    #                   this exact route-stats record before it is allowed to run.
+    phase = int(phase)
     active_count = len(set(active_experts))
     b2_phase_match = runtime.should_use_b2_wave_prefill(
         layer_id=layer_id,
         active_expert_count=active_count,
-        is_prefill=is_prefill,
+        is_prefill=(phase == PHASE_PREFILL),
     )
     max_num_seqs_hint = int(getattr(runtime.config, "max_num_seqs_hint", 0) or 0)
     token_count_hint = int(topk_ids.shape[0]) if topk_ids.ndim > 0 else 0
     b2_overflow_fallback = (
         runtime.config.b2_wave_prefill
-        and not is_prefill
+        and phase == PHASE_UNKNOWN
         and max_num_seqs_hint > 0
         and token_count_hint > max_num_seqs_hint
         and runtime.should_use_fixed_slot_plan_for_layer(layer_id)
@@ -296,7 +329,7 @@ def _moe_offload_stage_fake(
     topk_ids: torch.Tensor,
     layer_id: int,
     num_logical_experts: int,
-    is_prefill: bool,
+    phase: int,
 ) -> None:
     # Side-effect-only op: no return value (mutates the persistent log2phy buffer
     # + slots in place; topk_ids is threaded through unchanged for address
