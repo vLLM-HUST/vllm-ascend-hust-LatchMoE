@@ -1,0 +1,50 @@
+{
+  "status": "ok",
+  "dashboard_label": "sew_14gb_slots32_manual",
+  "model": "qwen3-30b-a3b",
+  "base_url": "http://127.0.0.1:8026",
+  "dataset": "/data/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json",
+  "n_prompts": 1,
+  "successful_requests": 1,
+  "failed_requests": 0,
+  "concurrency": 1,
+  "max_tokens": 8,
+  "max_prompt_chars": 512,
+  "seed": 42,
+  "tokenizer": "/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B",
+  "tokenizer_used": true,
+  "wall_s": 1.2263099099509418,
+  "total_output_tokens": 8,
+  "output_throughput": 6.523636427532448,
+  "output_throughput_tok_s": 6.523636427532448,
+  "request_throughput": 0.815454553441556,
+  "median_ttft_ms": 744.1589410882443,
+  "median_tpot_ms": 58.09544713702053,
+  "ttft_ms": {
+    "mean": 744.1589410882443,
+    "p50": 744.1589410882443,
+    "p90": 744.1589410882443,
+    "p99": 744.1589410882443
+  },
+  "tpot_ms": {
+    "mean": 58.09544713702053,
+    "p50": 58.09544713702053,
+    "p90": 58.09544713702053,
+    "p99": 58.09544713702053
+  },
+  "e2el_s": {
+    "mean": 1.2089225181844085
+  },
+  "per_request": [
+    {
+      "idx": 0,
+      "status": 200,
+      "error": "",
+      "ttft_s": 0.7441589410882443,
+      "output_tokens": 8,
+      "total_s": 1.2089225181844085,
+      "chunks": 8,
+      "output_chars": 31
+    }
+  ]
+}

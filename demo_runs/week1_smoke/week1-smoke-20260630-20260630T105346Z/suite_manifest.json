@@ -1,0 +1,128 @@
+{
+  "argv": [
+    "tools/run_annual_demo_suite.py",
+    "--config",
+    "demo/week1_smoke_config.json",
+    "--output-root",
+    "demo_runs/week1_smoke",
+    "--case",
+    "native_prefetch_14gb",
+    "--python",
+    "/root/miniconda3/envs/vllm-hust-dev/bin/python"
+  ],
+  "config": {
+    "bench": {
+      "concurrency": 1,
+      "max_prompt_chars": 512,
+      "max_tokens": 8,
+      "n_prompts": 1,
+      "request_timeout_s": 600,
+      "seed": 42
+    },
+    "cases": [
+      {
+        "description": "No-offload capacity probe. Success is useful but failure/OOM is also an expected feasibility signal under a single-card HBM budget.",
+        "env": {
+          "ASCEND_RT_VISIBLE_DEVICES": "4",
+          "VLLM_ASCEND_MOE_OFFLOAD_ENABLED": "",
+          "VLLM_ASCEND_MOE_OFFLOAD_GB": "",
+          "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": ""
+        },
+        "name": "no_offload_capacity_probe",
+        "role": "baseline"
+      },
+      {
+        "description": "Native vLLM/vLLM-Ascend prefetch offload baseline with a 14 GiB expert offload setting. This case must not mix with SEW dataplane env.",
+        "env": {
+          "ASCEND_RT_VISIBLE_DEVICES": "4",
+          "VLLM_ASCEND_MOE_OFFLOAD_ENABLED": "",
+          "VLLM_ASCEND_MOE_OFFLOAD_GB": "",
+          "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "0"
+        },
+        "name": "native_prefetch_14gb",
+        "role": "baseline",
+        "server_args": [
+          "--offload-backend",
+          "prefetch",
+          "--cpu-offload-gb",
+          "14",
+          "--offload-params",
+          "experts",
+          "--offload-group-size",
+          "4",
+          "--offload-num-in-group",
+          "1",
+          "--offload-prefetch-step",
+          "1"
+        ]
+      },
+      {
+        "description": "Plugin AutoConfig legacy/layered path: enables the offload GB policy without selecting the graph-compatible SEW dataplane.",
+        "env": {
+          "ASCEND_RT_VISIBLE_DEVICES": "4",
+          "VLLM_ASCEND_MOE_OFFLOAD_GB": "14",
+          "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1",
+          "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "0"
+        },
+        "name": "legacy_layered_14gb",
+        "role": "baseline"
+      },
+      {
+        "description": "SEW fixed-slot dataplane with a 14 GiB target offload budget. AutoConfig is expected to select roughly 32 slots for Qwen3-30B-A3B.",
+        "env": {
+          "ASCEND_RT_VISIBLE_DEVICES": "4",
+          "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": "1",
+          "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD": "1",
+          "VLLM_ASCEND_MOE_OFFLOAD_GB": "14",
+          "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1",
+          "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
+          "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE": "1"
+        },
+        "name": "sew_14gb_slots32",
+        "role": "main"
+      }
+    ],
+    "dataset": "/data/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json",
+    "description": "Week-1 reproducibility smoke suite for the SEW-Offload CCF-A systems paper plan. This suite is intentionally tiny and is not a paper-result benchmark.",
+    "host": "127.0.0.1",
+    "model": "/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B",
+    "port": 8026,
+    "served_model_name": "qwen3-30b-a3b",
+    "server": {
+      "command": "vllm",
+      "common_args": [
+        "serve",
+        "{model}",
+        "--served-model-name",
+        "{served_model_name}",
+        "--trust-remote-code",
+        "--dtype",
+        "bfloat16",
+        "--tensor-parallel-size",
+        "1",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+        "--max-num-seqs",
+        "1",
+        "--max-model-len",
+        "1024",
+        "--max-num-batched-tokens",
+        "1024",
+        "--gpu-memory-utilization",
+        "0.90"
+      ],
+      "shutdown_timeout_s": 30,
+      "startup_timeout_s": 1200
+    },
+    "suite": "week1-smoke-20260630",
+    "tokenizer": "/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B"
+  },
+  "created_at": "20260630T105346Z",
+  "git": {
+    "branch": "main",
+    "commit": "7c8a4fa5ba01ca98c23a4c472320aae957f682ac",
+    "status_short": "M README.md\n M tests/test_patch_fused_moe.py\n M tests/test_phase_split_b2.py\n M tests/test_prefill_stage_runtime.py\n M vllm_moe_offload_ascend/moe_offload/phase_split.py\n M vllm_moe_offload_ascend/moe_offload/runtime.py\n M vllm_moe_offload_ascend/moe_offload/slot_mapping.py\n M vllm_moe_offload_ascend/ops/fused_moe/moe_mlp_op.py\n M vllm_moe_offload_ascend/ops/fused_moe/moe_offload_stage_op.py\n M vllm_moe_offload_ascend/ops/fused_moe/moe_router_op.py\n M vllm_moe_offload_ascend/patches/patch_fused_moe.py\n?? bench_results/\n?? demo/\n?? demo_runs/\n?? docs/\n?? tools/run_annual_demo_suite.py"
+  }
+}

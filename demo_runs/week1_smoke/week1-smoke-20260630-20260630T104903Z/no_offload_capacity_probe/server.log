@@ -1,0 +1,373 @@
+INFO 06-30 10:49:12 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-30 10:49:12 [__init__.py:46] - moe_offload_ascend -> vllm_moe_offload_ascend:register
+INFO 06-30 10:49:12 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-30 10:49:12 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-30 10:49:12 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-30 10:49:12 [__init__.py:46] - moe_offload_ascend -> vllm_moe_offload_ascend:register
+INFO 06-30 10:49:12 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-30 10:49:12 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-30 10:49:12 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-30 10:49:12 [__init__.py:46] - moe_offload_ascend -> vllm_moe_offload_ascend:register
+INFO 06-30 10:49:12 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-30 10:49:12 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-30 10:49:12 [__init__.py:229] Platform plugin ascend is activated
+INFO 06-30 10:49:12 [__init__.py:229] Platform plugin ascend is activated
+INFO 06-30 10:49:12 [__init__.py:229] Platform plugin ascend is activated
+WARNING 06-30 10:49:15 [config.py:70] Support for Transformers v4 is deprecated. The Transformers v4 codepath will become unmaintained in vLLM v0.22.0 and will be removed in vLLM v0.24.0. Please upgrade to Transformers v5: pip install --upgrade transformers
+INFO 06-30 10:49:19 [utils.py:289] Running Ascend torch_npu preflight before vLLM engine startup
+INFO 06-30 10:49:37 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+WARNING 06-30 10:49:37 [nixl_utils.py:34] NIXL is not available
+WARNING 06-30 10:49:37 [nixl_utils.py:44] NIXL agent config is not available
+INFO 06-30 10:49:37 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 06-30 10:49:37 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:418] 
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:418]        █     █     █▄   ▄█
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:418]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.20.1.post1.dev363+gec4847981
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:418]   █▄█▀ █     █     █     █  model   /data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:418]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:418] 
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:352] non-default args: {'model_tag': '/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B', 'host': '127.0.0.1', 'port': 8026, 'model': '/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B', 'trust_remote_code': True, 'dtype': 'bfloat16', 'max_model_len': 1024, 'served_model_name': ['qwen3-30b-a3b'], 'gpu_memory_utilization': 0.9, 'max_num_batched_tokens': 1024, 'max_num_seqs': 1}
+(APIServer pid=1216487) WARNING 06-30 10:49:37 [envs.py:1842] Unknown vLLM environment variable detected: VLLM_ASCEND_MOE_GMM_PROFILE_PATH
+(APIServer pid=1216487) WARNING 06-30 10:49:37 [envs.py:1842] Unknown vLLM environment variable detected: VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
+(APIServer pid=1216487) INFO 06-30 10:49:37 [model.py:563] Resolved architecture: Qwen3MoeForCausalLM
+(APIServer pid=1216487) INFO 06-30 10:49:37 [model.py:1692] Using max model len 1024
+(APIServer pid=1216487) INFO 06-30 10:49:37 [scheduler.py:239] Chunked prefill is enabled with max_num_batched_tokens=1024.
+(APIServer pid=1216487) INFO 06-30 10:49:37 [vllm.py:840] Asynchronous scheduling is enabled.
+(APIServer pid=1216487) INFO 06-30 10:49:37 [kernel.py:208] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+(APIServer pid=1216487) WARNING 06-30 10:49:37 [platform.py:813] Parameter '--disable-cascade-attn' is a GPU-specific feature. Resetting to False for Ascend.
+(APIServer pid=1216487) INFO 06-30 10:49:37 [ascend_config.py:639] Dynamic EPLB is False
+(APIServer pid=1216487) INFO 06-30 10:49:37 [ascend_config.py:640] The number of redundant experts is 0
+(APIServer pid=1216487) INFO 06-30 10:49:37 [platform.py:424] PIECEWISE compilation enabled on NPU. use_inductor not supported - using only ACL Graph mode
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:594] Calculated maximum supported batch sizes for ACL graph: 36
+(APIServer pid=1216487) WARNING 06-30 10:49:37 [utils.py:595] Currently, communication is performed using FFTS+ method, which reduces the number of available streams and, as a result, limits the range of runtime shapes that can be handled. To both improve communication performance and increase the number of supported shapes, set HCCL_OP_EXPANSION_MODE=AIV.
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:627] No adjustment needed for ACL graph batch sizes: Qwen3MoeForCausalLM model (layers: 48) with 1 sizes
+(APIServer pid=1216487) INFO 06-30 10:49:37 [utils.py:1270] Block size is set to 128 if prefix cache or chunked prefill is enabled.
+(APIServer pid=1216487) INFO 06-30 10:49:37 [platform.py:572] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+(APIServer pid=1216487) INFO 06-30 10:49:37 [compilation.py:303] Enabled custom fusions: norm_quant, act_quant
+WARNING 06-30 10:49:50 [config.py:70] Support for Transformers v4 is deprecated. The Transformers v4 codepath will become unmaintained in vLLM v0.22.0 and will be removed in vLLM v0.24.0. Please upgrade to Transformers v5: pip install --upgrade transformers
+INFO 06-30 10:49:50 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-30 10:49:50 [__init__.py:46] - moe_offload_ascend -> vllm_moe_offload_ascend:register
+INFO 06-30 10:49:50 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-30 10:49:50 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-30 10:49:50 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-30 10:49:50 [__init__.py:46] - moe_offload_ascend -> vllm_moe_offload_ascend:register
+INFO 06-30 10:49:50 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-30 10:49:50 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-30 10:49:51 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-30 10:49:51 [__init__.py:46] - moe_offload_ascend -> vllm_moe_offload_ascend:register
+INFO 06-30 10:49:51 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-30 10:49:51 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-30 10:49:51 [__init__.py:229] Platform plugin ascend is activated
+INFO 06-30 10:49:51 [__init__.py:229] Platform plugin ascend is activated
+INFO 06-30 10:49:52 [__init__.py:229] Platform plugin ascend is activated
+(EngineCore pid=1216717) WARNING 06-30 10:49:53 [nixl_utils.py:34] NIXL is not available
+(EngineCore pid=1216717) WARNING 06-30 10:49:53 [nixl_utils.py:44] NIXL agent config is not available
+(EngineCore pid=1216717) INFO 06-30 10:49:53 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+(EngineCore pid=1216717) INFO 06-30 10:49:54 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+(EngineCore pid=1216717) INFO 06-30 10:49:54 [core.py:109] Initializing a V1 LLM engine (v0.20.1.post1.dev363+gec4847981) with config: model='/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B', speculative_config=None, tokenizer='/data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=1024, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=True, quantization=None, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=qwen3-30b-a3b, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'vllm_ascend.compilation.compiler_interface.AscendCompiler', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update', 'vllm::mla_forward'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [1024], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.PIECEWISE: 1>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 1, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, moe_backend='auto')
+(EngineCore pid=1216717) INFO 06-30 10:49:57 [ascend_config.py:639] Dynamic EPLB is False
+(EngineCore pid=1216717) INFO 06-30 10:49:57 [ascend_config.py:640] The number of redundant experts is 0
+(EngineCore pid=1216717) INFO 06-30 10:49:59 [parallel_state.py:1514] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.0.6:34123 backend=hccl
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+(EngineCore pid=1216717) INFO 06-30 10:50:00 [parallel_state.py:1827] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+(EngineCore pid=1216717) INFO 06-30 10:50:00 [model_runner_v1.py:3031] Starting to load model /data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B...
+(EngineCore pid=1216717) INFO 06-30 10:50:01 [compilation.py:1050] Using OOT custom backend for compilation.
+(EngineCore pid=1216717) INFO 06-30 10:50:04 [backends.py:871] Post-grad pass configuration time: 2.45 s
+(EngineCore pid=1216717) INFO 06-30 10:50:04 [weight_utils.py:904] Filesystem type for checkpoints: EXT4. Checkpoint size: 56.87 GiB. Available RAM: 1946.71 GiB.
+(EngineCore pid=1216717) INFO 06-30 10:50:04 [weight_utils.py:927] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:   0% Completed | 0/16 [00:00<?, ?it/s]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:   6% Completed | 1/16 [00:08<02:10,  8.71s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  12% Completed | 2/16 [00:15<01:45,  7.52s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  19% Completed | 3/16 [00:22<01:37,  7.47s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  25% Completed | 4/16 [00:32<01:39,  8.26s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  31% Completed | 5/16 [00:38<01:23,  7.58s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  38% Completed | 6/16 [00:47<01:20,  8.04s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  44% Completed | 7/16 [00:55<01:11,  7.91s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  50% Completed | 8/16 [01:04<01:07,  8.38s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  56% Completed | 9/16 [01:11<00:54,  7.78s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  62% Completed | 10/16 [01:18<00:46,  7.69s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  69% Completed | 11/16 [01:26<00:38,  7.65s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  75% Completed | 12/16 [01:33<00:30,  7.64s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  81% Completed | 13/16 [01:39<00:21,  7.21s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  88% Completed | 14/16 [01:44<00:12,  6.47s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards:  94% Completed | 15/16 [01:51<00:06,  6.49s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards: 100% Completed | 16/16 [01:53<00:00,  5.22s/it]
+(EngineCore pid=1216717) Loading safetensors checkpoint shards: 100% Completed | 16/16 [01:53<00:00,  7.10s/it]
+(EngineCore pid=1216717) 
+(EngineCore pid=1216717) INFO 06-30 10:51:58 [default_loader.py:391] Loading weights took 113.62 seconds
+(EngineCore pid=1216717) INFO 06-30 10:52:03 [model_runner_v1.py:3068] Loading model weights took 56.9001 GB
+(EngineCore pid=1216717) INFO 06-30 10:52:03 [interface.py:492] Setting kv cache block size to 128 for CUSTOM backend.
+(EngineCore pid=1216717) INFO 06-30 10:52:16 [backends.py:1099] Using cache directory: /root/.cache/vllm/torch_compile_cache/adfd29abdd/rank_0_0/backbone for vLLM's torch.compile
+(EngineCore pid=1216717) INFO 06-30 10:52:16 [backends.py:1158] Dynamo bytecode transform time: 11.87 s
+(EngineCore pid=1216717) INFO 06-30 10:52:16 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:17 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:17 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:18 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:19 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:20 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:20 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:21 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:21 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:22 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:23 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:23 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:24 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:24 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:25 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:26 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:26 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:27 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:27 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:28 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:29 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:29 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:30 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:30 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:31 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:31 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:32 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:33 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:33 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:34 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:34 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:35 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:36 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:36 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:37 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:37 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:38 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:39 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:39 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:40 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:40 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:41 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:42 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:42 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:43 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:44 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:45 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:45 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:46 [compiler_interface.py:162] enable_npugraph_ex is enabled, which will bring graph compilation optimization.
+(EngineCore pid=1216717) /root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/torch_npu/dynamo/torchair/configs/compiler_config.py:106: UserWarning: The following torchair config or properties may not take effect or report error in reduce-overhead mode: config.experimental_config.enable_view_optimize:True, set_dim_gears, dynamo_export, scope, npu_print
+(EngineCore pid=1216717)   warnings.warn(
+(EngineCore pid=1216717) INFO 06-30 10:52:46 [backends.py:393] Compiling a graph for compile range (1, 1024) takes 29.78 s
+(EngineCore pid=1216717) INFO 06-30 10:52:51 [monitor.py:53] torch.compile and initial profiling/warmup run together took 47.64 s in total
+(EngineCore pid=1216717) INFO 06-30 10:52:53 [worker.py:629] Available KV cache memory: -2.19 GiB
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141] EngineCore failed to start.
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141] Traceback (most recent call last):
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/v1/engine/core.py", line 1115, in run_engine_core
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     return func(*args, **kwargs)
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/v1/engine/core.py", line 881, in __init__
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     super().__init__(
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/v1/engine/core.py", line 128, in __init__
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     return func(*args, **kwargs)
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/v1/engine/core.py", line 266, in _initialize_kv_caches
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     kv_cache_configs = get_kv_cache_configs(
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]                        ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/v1/core/kv_cache_utils.py", line 2015, in get_kv_cache_configs
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     _check_enough_kv_cache_memory(
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]   File "/root/vllm-hust/vllm/v1/core/kv_cache_utils.py", line 696, in _check_enough_kv_cache_memory
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141]     raise ValueError(
+(EngineCore pid=1216717) ERROR 06-30 10:52:53 [core.py:1141] ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+(EngineCore pid=1216717) Process EngineCore:
+(EngineCore pid=1216717) Traceback (most recent call last):
+(EngineCore pid=1216717)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=1216717)     self.run()
+(EngineCore pid=1216717)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/multiprocessing/process.py", line 108, in run
+(EngineCore pid=1216717)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/engine/core.py", line 1145, in run_engine_core
+(EngineCore pid=1216717)     raise e
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/engine/core.py", line 1115, in run_engine_core
+(EngineCore pid=1216717)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=1216717)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1216717)     return func(*args, **kwargs)
+(EngineCore pid=1216717)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/engine/core.py", line 881, in __init__
+(EngineCore pid=1216717)     super().__init__(
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/engine/core.py", line 128, in __init__
+(EngineCore pid=1216717)     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=1216717)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1216717)     return func(*args, **kwargs)
+(EngineCore pid=1216717)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/engine/core.py", line 266, in _initialize_kv_caches
+(EngineCore pid=1216717)     kv_cache_configs = get_kv_cache_configs(
+(EngineCore pid=1216717)                        ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/core/kv_cache_utils.py", line 2015, in get_kv_cache_configs
+(EngineCore pid=1216717)     _check_enough_kv_cache_memory(
+(EngineCore pid=1216717)   File "/root/vllm-hust/vllm/v1/core/kv_cache_utils.py", line 696, in _check_enough_kv_cache_memory
+(EngineCore pid=1216717)     raise ValueError(
+(EngineCore pid=1216717) ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+(APIServer pid=1216487) Traceback (most recent call last):
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/bin/vllm", line 6, in <module>
+(APIServer pid=1216487)     sys.exit(main())
+(APIServer pid=1216487)              ^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/entrypoints/cli/main.py", line 96, in main
+(APIServer pid=1216487)     args.dispatch_function(args)
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/entrypoints/cli/serve.py", line 122, in cmd
+(APIServer pid=1216487)     uvloop.run(run_server(args))
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/uvloop/__init__.py", line 92, in run
+(APIServer pid=1216487)     return runner.run(wrapper())
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/asyncio/runners.py", line 118, in run
+(APIServer pid=1216487)     return self._loop.run_until_complete(task)
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/site-packages/uvloop/__init__.py", line 48, in wrapper
+(APIServer pid=1216487)     return await main
+(APIServer pid=1216487)            ^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/entrypoints/openai/api_server.py", line 678, in run_server
+(APIServer pid=1216487)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/entrypoints/openai/api_server.py", line 692, in run_server_worker
+(APIServer pid=1216487)     async with build_async_engine_client(
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/contextlib.py", line 210, in __aenter__
+(APIServer pid=1216487)     return await anext(self.gen)
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/entrypoints/openai/api_server.py", line 100, in build_async_engine_client
+(APIServer pid=1216487)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/contextlib.py", line 210, in __aenter__
+(APIServer pid=1216487)     return await anext(self.gen)
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/entrypoints/openai/api_server.py", line 136, in build_async_engine_client_from_engine_args
+(APIServer pid=1216487)     async_llm = AsyncLLM.from_vllm_config(
+(APIServer pid=1216487)                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/async_llm.py", line 218, in from_vllm_config
+(APIServer pid=1216487)     return cls(
+(APIServer pid=1216487)            ^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/async_llm.py", line 147, in __init__
+(APIServer pid=1216487)     self.engine_core = EngineCoreClient.make_async_mp_client(
+(APIServer pid=1216487)                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=1216487)     return func(*args, **kwargs)
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/core_client.py", line 130, in make_async_mp_client
+(APIServer pid=1216487)     return AsyncMPClient(*client_args)
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=1216487)     return func(*args, **kwargs)
+(APIServer pid=1216487)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/core_client.py", line 893, in __init__
+(APIServer pid=1216487)     super().__init__(
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/core_client.py", line 535, in __init__
+(APIServer pid=1216487)     with launch_core_engines(
+(APIServer pid=1216487)   File "/root/miniconda3/envs/vllm-hust-dev/lib/python3.11/contextlib.py", line 144, in __exit__
+(APIServer pid=1216487)     next(self.gen)
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/utils.py", line 1119, in launch_core_engines
+(APIServer pid=1216487)     wait_for_engine_startup(
+(APIServer pid=1216487)   File "/root/vllm-hust/vllm/v1/engine/utils.py", line 1178, in wait_for_engine_startup
+(APIServer pid=1216487)     raise RuntimeError(
+(APIServer pid=1216487) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+(APIServer pid=1216487) [ERROR] 2026-06-30-10:52:59 (PID:1216487, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+(APIServer pid=1216487) sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
