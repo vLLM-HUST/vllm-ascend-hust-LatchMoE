@@ -39,7 +39,7 @@ import yaml
 from vllm import LLM, SamplingParams
 
 
-DEFAULT_CONFIG = "docs/sew-offload/benchmark_config.yaml"
+DEFAULT_CONFIG = "benchmark/configs/sew_offload_v1.yaml"
 DEFAULT_MODEL = "/data/shared-models/Qwen3-30B-A3B"
 DEFAULT_PROMPT = "请用中文回答：什么是大语言模型？"
 DEFAULT_TEMPERATURE = 0.0

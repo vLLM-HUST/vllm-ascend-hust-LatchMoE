@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Minimal SEW-Offload benchmark runner.
 
-The runner follows docs/sew-offload/benchmark_config.yaml and reports only the
+The runner follows benchmark/configs/sew_offload_v1.yaml and reports only the
 current-stage metrics: throughput, TTFT, and TPOT.
 """
 
@@ -27,7 +27,7 @@ from tools.sharegpt_manifest import (
 )
 
 
-DEFAULT_CONFIG = "docs/sew-offload/benchmark_config.yaml"
+DEFAULT_CONFIG = "benchmark/configs/sew_offload_v1.yaml"
 
 
 def parse_args() -> argparse.Namespace:

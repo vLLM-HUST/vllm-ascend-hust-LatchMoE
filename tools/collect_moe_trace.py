@@ -24,7 +24,7 @@ from tools.sharegpt_manifest import (
 from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime, reset_moe_offload_runtime
 
 
-DEFAULT_CONFIG = "docs/sew-offload/benchmark_config.yaml"
+DEFAULT_CONFIG = "benchmark/configs/sew_offload_v1.yaml"
 
 
 def parse_args() -> argparse.Namespace:

@@ -29,7 +29,7 @@ from tools.sharegpt_manifest import assert_no_random_dataset
 from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime, reset_moe_offload_runtime
 
 
-DEFAULT_CONFIG = "docs/sew-offload/benchmark_config.yaml"
+DEFAULT_CONFIG = "benchmark/configs/sew_offload_v1.yaml"
 SEW_OFFLOAD_ENV_VARS = (
     "VLLM_ASCEND_MOE_OFFLOAD_ENABLED",
     "VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY",

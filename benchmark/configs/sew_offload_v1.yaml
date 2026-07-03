@@ -1,0 +1,572 @@
+benchmark:
+  id: sew_offload_ascend_v1
+  config_version: 1
+  suite: sew-offload-ascend-v1
+  description: Standard benchmark matrix for SEW MoE expert offloading on Ascend.
+  upstream_reference:
+    repo: https://github.com/vLLM-HUST/vllm-hust-benchmark
+    borrowed_patterns:
+      - scenario_registry
+      - command_rendering
+      - raw_artifact_preservation
+      - baseline_specs
+
+model:
+  name: qwen3-30b-a3b
+  served_model_name: qwen3-30b-a3b
+  path: /data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B
+  tokenizer: /data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B
+  dtype: bfloat16
+  tensor_parallel_size: 1
+  trust_remote_code: true
+
+hardware:
+  vendor: Huawei
+  chip_model: 910B-class
+  chip_count: 1
+  target_device: single_npu
+
+dataset:
+  source: sharegpt
+  local_path: /data/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+  manifest_path: benchmark/artifacts/workloads/sharegpt_qwen3_30b_a3b_v1.jsonl
+  seed: 42
+  random_dataset_allowed: false
+  synthetic_smoke_allowed: false
+
+server:
+  command: vllm
+  host: 127.0.0.1
+  port: 8026
+  startup_timeout_s: 1200
+  shutdown_timeout_s: 30
+  common_args:
+    - serve
+    - "{model_path}"
+    - --served-model-name
+    - "{served_model_name}"
+    - --trust-remote-code
+    - --dtype
+    - "{dtype}"
+    - --tensor-parallel-size
+    - "{tensor_parallel_size}"
+    - --host
+    - "{host}"
+    - --port
+    - "{port}"
+    - --max-num-seqs
+    - "{max_num_seqs}"
+    - --max-model-len
+    - "{max_model_len}"
+    - --max-num-batched-tokens
+    - "{max_num_batched_tokens}"
+    - --gpu-memory-utilization
+    - "{gpu_memory_utilization}"
+
+client:
+  endpoint: /v1/chat/completions
+  request_timeout_s: 900
+  concurrency: 1
+  tokenizer_count_output_tokens: true
+
+serving_shape:
+  max_num_seqs: 1
+  max_model_len: 4096
+  max_num_batched_tokens: 4096
+  gpu_memory_utilization: 0.90
+
+concurrency:
+  max_num_seqs: 1
+  max_concurrency: 1
+  request_rate: inf
+
+offload_budget:
+  primary_gb:
+    - 14
+    - 28
+  expected_autoslots:
+    "14": 32
+    "28": 32
+  slot_sensitivity:
+    "14":
+      - 8
+      - 16
+      - 32
+    "28":
+      - 32
+      - 64
+
+workload_buckets:
+  - name: smoke
+    title: Smoke ShareGPT check
+    default_enabled: false
+    prompt_tokens:
+      - 64
+      - 512
+    output_tokens: 8
+    num_requests: 1
+    tags:
+      - smoke
+      - sharegpt
+  - name: mixed_chat
+    title: Mixed ShareGPT chat
+    default_enabled: true
+    prompt_tokens: mixed
+    output_tokens: 128
+    num_requests: 200
+    tags:
+      - main
+      - sharegpt
+      - mixed
+  - name: decode_heavy
+    title: Decode-heavy ShareGPT bucket
+    default_enabled: true
+    prompt_tokens:
+      - 64
+      - 256
+    output_tokens: 256
+    num_requests: 128
+    tags:
+      - decode
+      - tpot
+  - name: prefill_heavy
+    title: Prefill-heavy ShareGPT bucket
+    default_enabled: true
+    prompt_tokens:
+      - 1024
+      - 2048
+    output_tokens: 32
+    num_requests: 64
+    tags:
+      - prefill
+      - ttft
+      - b2
+  - name: long_context_prefill
+    title: Long-context prefill stress
+    default_enabled: false
+    prompt_tokens:
+      - 2048
+      - 4096
+    output_tokens: 16
+    num_requests: 32
+    tags:
+      - prefill
+      - long_context
+      - stress
+
+cases:
+  - name: no_offload_capacity_probe
+    title: No-offload capacity probe
+    role: baseline
+    default_enabled: true
+    expected_status: success_or_capacity_failure
+    experiment_groups:
+      - e0_smoke
+      - e1_end_to_end
+      - e2_memory_graph
+    description: Full model load without expert offload. OOM or KV-cache capacity failure is valid evidence.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+  - name: native_prefetch_14gb
+    title: Native vLLM prefetch offload, 14 GiB
+    role: baseline
+    default_enabled: true
+    expected_status: success_or_graph_failure
+    experiment_groups:
+      - e0_smoke
+      - e1_end_to_end
+      - e2_memory_graph
+    description: Native vLLM/vLLM-Ascend expert prefetch baseline. Must run separately from SEW.
+    server_args:
+      - --offload-backend
+      - prefetch
+      - --cpu-offload-gb
+      - "14"
+      - --offload-params
+      - experts
+      - --offload-group-size
+      - "4"
+      - --offload-num-in-group
+      - "1"
+      - --offload-prefetch-step
+      - "1"
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+  - name: native_prefetch_14gb_eager
+    title: Native vLLM prefetch offload, 14 GiB, eager
+    role: baseline
+    default_enabled: false
+    expected_status: success_or_runtime_failure
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+    description: Eager-mode native prefetch baseline for fair performance comparison when graph capture is disabled.
+    server_args:
+      - --enforce-eager
+      - --offload-backend
+      - prefetch
+      - --cpu-offload-gb
+      - "14"
+      - --offload-params
+      - experts
+      - --offload-group-size
+      - "4"
+      - --offload-num-in-group
+      - "1"
+      - --offload-prefetch-step
+      - "1"
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+  - name: legacy_layered_14gb
+    title: Legacy layered plugin path, 14 GiB
+    role: baseline
+    default_enabled: true
+    expected_status: success_or_graph_failure
+    experiment_groups:
+      - e0_smoke
+      - e1_end_to_end
+      - e2_memory_graph
+    description: Plugin AutoConfig without SEW dataplane, useful for showing why fixed slots matter.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+  - name: legacy_layered_14gb_eager
+    title: Legacy layered plugin path, 14 GiB, eager
+    role: baseline
+    default_enabled: false
+    expected_status: success_or_runtime_failure
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+    description: Eager-mode legacy/layered plugin baseline for fair comparison against SEW capture-on.
+    server_args:
+      - --enforce-eager
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+  - name: sew_14gb_autoslots
+    title: SEW-Offload, 14 GiB AutoConfig
+    role: main
+    default_enabled: true
+    expected_status: success
+    experiment_groups:
+      - e0_smoke
+      - e1_end_to_end
+      - e2_memory_graph
+      - e3_b2_prefill
+      - e4_ablation
+    description: Main SEW fixed-slot dataplane with 14 GiB target budget and AutoConfig slots.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_28gb_autoslots
+    title: SEW-Offload, 28 GiB AutoConfig
+    role: main
+    default_enabled: false
+    expected_status: success_or_kv_failure
+    experiment_groups:
+      - e2_memory_graph
+      - e5_slot_sensitivity
+    description: KV-aware 28 GiB AutoConfig point. On 64 GiB 910B-class cards the physical slot-bank cap should keep this near the validated 32-slot point; historical Week-2 smoke showed the old 64-slot AutoConfig could overrun the KV-cache budget at max_model_len=4096.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "28"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_14gb_capture_disabled
+    title: SEW-Offload, 14 GiB AutoConfig, capture disabled
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+      - e4_ablation
+    description: Internal eager ablation isolating the benefit of ACLGraph replay for the same SEW fixed-slot path.
+    server_args:
+      - --enforce-eager
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_14gb_no_b2
+    title: SEW-Offload, 14 GiB, B2 disabled
+    role: ablation
+    default_enabled: false
+    expected_status: success_or_prefill_failure
+    experiment_groups:
+      - e3_b2_prefill
+      - e4_ablation
+    description: Ablation for B2 wave prefill.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_14gb_no_transfer_aware
+    title: SEW-Offload, 14 GiB, transfer-aware schedule disabled
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e3_b2_prefill
+      - e4_ablation
+    description: Ablation for transfer-aware B2 wave scheduling.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_14gb_no_cpu_first
+    title: SEW-Offload, 14 GiB, CPU-first loading disabled
+    role: ablation
+    default_enabled: false
+    expected_status: success_or_startup_memory_failure
+    experiment_groups:
+      - e4_ablation
+    description: Ablation for CPU-first expert loading.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "0"
+  - name: sew_14gb_slots8
+    title: SEW-Offload, 14 GiB, 8 slots
+    role: sensitivity
+    default_enabled: false
+    expected_status: success_or_slow
+    experiment_groups:
+      - e5_slot_sensitivity
+    description: Slot-count sensitivity below the expected 14 GiB AutoConfig point.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "8"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_14gb_slots16
+    title: SEW-Offload, 14 GiB, 16 slots
+    role: sensitivity
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e5_slot_sensitivity
+    description: Slot-count sensitivity below the expected 14 GiB AutoConfig point.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "16"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_14gb_slots32
+    title: SEW-Offload, 14 GiB, 32 slots
+    role: sensitivity
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e5_slot_sensitivity
+    description: Explicit slot setting at the expected 14 GiB AutoConfig point.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "32"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_28gb_slots32
+    title: SEW-Offload, 28 GiB, 32 slots
+    role: main
+    default_enabled: true
+    expected_status: success
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+      - e5_slot_sensitivity
+    description: Validated 28 GiB SEW comparison point at max_model_len=4096; rerun autoslots after the KV-aware cap before replacing this case.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "28"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "32"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_28gb_slots32_capture_disabled
+    title: SEW-Offload, 28 GiB, 32 slots, capture disabled
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+      - e4_ablation
+    description: Eager ablation for the viable 28 GiB SEW point, used to isolate graph replay benefit.
+    server_args:
+      - --enforce-eager
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "28"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "32"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+  - name: sew_28gb_slots64
+    title: SEW-Offload, 28 GiB, 64 slots
+    role: sensitivity
+    default_enabled: false
+    expected_status: success_or_kv_failure
+    experiment_groups:
+      - e5_slot_sensitivity
+    description: Diagnostic high-slot sensitivity point; may fail KV capacity under max_model_len=4096.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "28"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "64"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+
+experiments:
+  e0_smoke:
+    title: Harness and feasibility smoke
+    workloads:
+      - smoke
+    cases:
+      - no_offload_capacity_probe
+      - native_prefetch_14gb
+      - legacy_layered_14gb
+      - sew_14gb_autoslots
+  e1_end_to_end:
+    title: End-to-end serving under memory budgets
+    workloads:
+      - mixed_chat
+      - decode_heavy
+      - prefill_heavy
+    cases:
+      - no_offload_capacity_probe
+      - native_prefetch_14gb
+      - native_prefetch_14gb_eager
+      - legacy_layered_14gb
+      - legacy_layered_14gb_eager
+      - sew_14gb_capture_disabled
+      - sew_14gb_autoslots
+      - sew_28gb_slots32_capture_disabled
+      - sew_28gb_slots32
+  e2_memory_graph:
+    title: Memory feasibility and ACLGraph compatibility evidence
+    workloads:
+      - mixed_chat
+      - prefill_heavy
+    cases:
+      - no_offload_capacity_probe
+      - native_prefetch_14gb
+      - native_prefetch_14gb_eager
+      - legacy_layered_14gb
+      - legacy_layered_14gb_eager
+      - sew_14gb_capture_disabled
+      - sew_14gb_autoslots
+      - sew_28gb_slots32_capture_disabled
+      - sew_28gb_slots32
+  e3_b2_prefill:
+    title: B2 prefill overflow behavior
+    workloads:
+      - prefill_heavy
+      - long_context_prefill
+    cases:
+      - sew_14gb_no_b2
+      - sew_14gb_no_transfer_aware
+      - sew_14gb_autoslots
+  e4_ablation:
+    title: Mechanism ablations
+    workloads:
+      - mixed_chat
+      - prefill_heavy
+    cases:
+      - sew_14gb_autoslots
+      - sew_14gb_capture_disabled
+      - sew_14gb_no_b2
+      - sew_14gb_no_transfer_aware
+      - sew_14gb_no_cpu_first
+      - sew_28gb_slots32_capture_disabled
+  e5_slot_sensitivity:
+    title: Slot-count and offload-budget sensitivity
+    workloads:
+      - mixed_chat
+      - decode_heavy
+      - prefill_heavy
+    cases:
+      - sew_14gb_slots8
+      - sew_14gb_slots16
+      - sew_14gb_slots32
+      - sew_28gb_slots32
+      - sew_28gb_slots64
+
+metrics:
+  serving:
+    - successful_requests
+    - failed_requests
+    - request_throughput
+    - output_throughput
+    - ttft_ms.mean
+    - ttft_ms.p50
+    - ttft_ms.p90
+    - ttft_ms.p99
+    - tpot_ms.mean
+    - tpot_ms.p50
+    - tpot_ms.p90
+    - tpot_ms.p99
+  offload:
+    - h2d_bytes
+    - staging_time_ms
+    - slot_cache_hit_rate
+    - slot_cache_misses
+    - active_expert_count
+    - b2_wave_count
+    - prefill_stage_time_ms
+  evidence:
+    - server_reached_ready
+    - graph_capture_completed
+    - moe_offload_stage_seen
+    - failure_reason
+
+artifact_contract:
+  unit_manifest: unit_manifest.json
+  server_log: server.log
+  client_log: client.log
+  benchmark_json: benchmark.json
+  unit_result: unit_result.json
+  profile_jsonl: moe_profile.jsonl
+  trace_jsonl: moe_trace.jsonl
+  suite_manifest: suite_manifest.json
+  suite_results: suite_results.json
+  summary_markdown: summary.md

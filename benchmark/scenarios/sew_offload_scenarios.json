@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "description": "Workload registry for SEW-Offload Ascend benchmarks.",
+  "scenarios": [
+    {
+      "name": "smoke",
+      "title": "Smoke ShareGPT serving check",
+      "benchmark_type": "serve",
+      "description": "Minimal real-prompt run used to verify server startup, client transport, and artifact writing.",
+      "tags": ["smoke", "sharegpt", "online"],
+      "defaults": {
+        "bucket": "smoke",
+        "num_prompts": 1,
+        "max_output_tokens": 8,
+        "max_concurrency": 1
+      },
+      "leaderboard": {
+        "workload_name": "sew-smoke",
+        "representative_business_scenario": "online-chat",
+        "default_config_type": "single_npu"
+      }
+    },
+    {
+      "name": "mixed_chat",
+      "title": "Mixed ShareGPT serving benchmark",
+      "benchmark_type": "serve",
+      "description": "Main end-to-end serving workload with mixed prompt lengths sampled from ShareGPT.",
+      "tags": ["official", "sharegpt", "online", "mixed"],
+      "defaults": {
+        "bucket": "mixed_chat",
+        "num_prompts": 200,
+        "max_output_tokens": 128,
+        "max_concurrency": 1
+      },
+      "leaderboard": {
+        "workload_name": "sew-mixed-chat",
+        "representative_business_scenario": "online-chat",
+        "default_config_type": "single_npu"
+      }
+    },
+    {
+      "name": "decode_heavy",
+      "title": "Decode-heavy ShareGPT serving benchmark",
+      "benchmark_type": "serve",
+      "description": "Short-prompt, longer-output workload for TPOT, slot hits, and graph replay behavior.",
+      "tags": ["official", "sharegpt", "online", "decode", "tpot"],
+      "defaults": {
+        "bucket": "decode_heavy",
+        "num_prompts": 128,
+        "max_output_tokens": 256,
+        "max_concurrency": 1
+      },
+      "leaderboard": {
+        "workload_name": "sew-decode-heavy",
+        "representative_business_scenario": "online-chat",
+        "default_config_type": "single_npu"
+      }
+    },
+    {
+      "name": "prefill_heavy",
+      "title": "Prefill-heavy ShareGPT serving benchmark",
+      "benchmark_type": "serve",
+      "description": "Long-prompt, short-output workload for TTFT, B2 prefill waves, and active expert overflow.",
+      "tags": ["official", "sharegpt", "online", "prefill", "b2"],
+      "defaults": {
+        "bucket": "prefill_heavy",
+        "num_prompts": 64,
+        "max_output_tokens": 32,
+        "max_concurrency": 1
+      },
+      "leaderboard": {
+        "workload_name": "sew-prefill-heavy",
+        "representative_business_scenario": "long-context-chat",
+        "default_config_type": "single_npu"
+      }
+    },
+    {
+      "name": "long_context_prefill",
+      "title": "Long-context prefill stress benchmark",
+      "benchmark_type": "serve",
+      "description": "Optional stress workload for wave count, H2D movement, and memory-edge behavior.",
+      "tags": ["optional", "sharegpt", "online", "prefill", "long-context", "stress"],
+      "defaults": {
+        "bucket": "long_context_prefill",
+        "num_prompts": 32,
+        "max_output_tokens": 16,
+        "max_concurrency": 1
+      },
+      "leaderboard": {
+        "workload_name": "sew-long-context-prefill",
+        "representative_business_scenario": "long-context-chat",
+        "default_config_type": "single_npu"
+      }
+    }
+  ]
+}

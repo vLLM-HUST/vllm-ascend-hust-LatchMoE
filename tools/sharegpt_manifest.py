@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build SEW-Offload benchmark manifests from the ShareGPT dataset.
 
-Per docs/sew-offload/benchmark_config.yaml, every benchmark run (including smoke
+Per benchmark/configs/sew_offload_v1.yaml, every benchmark run (including smoke
 and debugging) must draw prompts from the real ShareGPT dataset. Random,
 synthetic, or seed-text-repeated prompts are not allowed for any run.
 """

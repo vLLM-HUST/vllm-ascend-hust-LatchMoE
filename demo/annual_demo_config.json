@@ -1,0 +1,97 @@
+{
+  "suite": "annual-demo-2026",
+  "description": "Single-card Ascend 910B Qwen3-30B-A3B demo suite for SEW MoE offload.",
+  "model": "/data/shared-models/Qwen3-30B-A3B",
+  "served_model_name": "qwen3-30b-a3b",
+  "host": "127.0.0.1",
+  "port": 8016,
+  "dataset": "/data/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json",
+  "tokenizer": "/data/shared-models/Qwen3-30B-A3B",
+  "bench": {
+    "n_prompts": 50,
+    "max_tokens": 100,
+    "max_prompt_chars": 800,
+    "concurrency": 1,
+    "seed": 42,
+    "request_timeout_s": 600
+  },
+  "server": {
+    "command": "vllm",
+    "common_args": [
+      "serve",
+      "{model}",
+      "--served-model-name",
+      "{served_model_name}",
+      "--trust-remote-code",
+      "--dtype",
+      "bfloat16",
+      "--tensor-parallel-size",
+      "1",
+      "--host",
+      "{host}",
+      "--port",
+      "{port}",
+      "--max-num-seqs",
+      "1",
+      "--max-model-len",
+      "4096",
+      "--max-num-batched-tokens",
+      "4096",
+      "--gpu-memory-utilization",
+      "0.90"
+    ],
+    "startup_timeout_s": 900,
+    "shutdown_timeout_s": 30
+  },
+  "cases": [
+    {
+      "name": "sew_14gb_slots32",
+      "role": "main",
+      "description": "SEW fixed-slot dataplane, 14 GiB target offload budget, AutoConfig expected around 32 slots.",
+      "env": {
+        "VLLM_ASCEND_MOE_OFFLOAD_GB": "14",
+        "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD": "1"
+      }
+    },
+    {
+      "name": "sew_28gb_slots64",
+      "role": "main",
+      "description": "SEW fixed-slot dataplane, 28 GiB target offload budget, AutoConfig expected around 64 slots.",
+      "env": {
+        "VLLM_ASCEND_MOE_OFFLOAD_GB": "28",
+        "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE": "1",
+        "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD": "1"
+      }
+    },
+    {
+      "name": "native_prefetch_baseline",
+      "role": "baseline",
+      "description": "vLLM native prefetch offload baseline. Do not mix with SEW dataplane env.",
+      "server_args": [
+        "--offload-backend",
+        "prefetch",
+        "--cpu-offload-gb",
+        "14",
+        "--offload-params",
+        "experts",
+        "--offload-group-size",
+        "4",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "env": {
+        "VLLM_ASCEND_MOE_OFFLOAD_GB": "",
+        "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "0"
+      }
+    }
+  ]
+}
