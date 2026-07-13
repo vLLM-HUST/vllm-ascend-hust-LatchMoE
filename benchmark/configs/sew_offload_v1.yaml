@@ -14,8 +14,8 @@ benchmark:
 model:
   name: qwen3-30b-a3b
   served_model_name: qwen3-30b-a3b
-  path: /data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B
-  tokenizer: /data/shared_models/modelscope_cache/Qwen/Qwen3-30B-A3B
+  path: /root/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B
+  tokenizer: /root/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B
   dtype: bfloat16
   tensor_parallel_size: 1
   trust_remote_code: true
@@ -96,6 +96,127 @@ offload_budget:
       - 32
       - 64
 
+uva_like_feasibility:
+  description: Pre-serving feasibility probes for a CUDA-UVA-like Ascend expert access baseline.
+  target_device_id: 4
+  offload_budget_gb: 14
+  probe_size_mib: 14336
+  artifact_dir: benchmark/artifacts/reports/ascend_uva_feasibility
+  status: runtime_register_passed_simple_graph_passed_host_matmul_failed
+  expected_verdict: not_viable_as_sew_baseline
+  expected_nonzero_commands:
+    - tensor_access_matrix
+    - matmul_probe_2mib
+    - matmul_probe_32mib
+  commands:
+    small_runtime_probe:
+      - python3
+      - benchmark/scripts/ascend_uva_probe.py
+      - --device-id
+      - "4"
+      - --size-mib
+      - "1"
+      - --out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/probe_device4_1mib_v2.json
+    budget_register_probe:
+      - python3
+      - benchmark/scripts/ascend_uva_probe.py
+      - --device-id
+      - "4"
+      - --size-mib
+      - "14336"
+      - --skip-malloc-host
+      - --skip-managed
+      - --out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/probe_device4_14gb_register_only.json
+    tensor_access_matrix:
+      - /root/miniconda3/bin/conda
+      - run
+      - -n
+      - vllm-hust-dev
+      - python
+      - benchmark/scripts/ascend_uva_tensor_matrix.py
+      - --device-id
+      - "4"
+      - --size-mib
+      - "1"
+      - --out-dir
+      - benchmark/artifacts/reports/ascend_uva_feasibility
+    npugraph_replay_probe:
+      - /root/miniconda3/bin/conda
+      - run
+      - -n
+      - vllm-hust-dev
+      - python
+      - benchmark/scripts/ascend_uva_graph_probe.py
+      - --device-id
+      - "4"
+      - --size-mib
+      - "1"
+      - --elements
+      - "1024"
+      - --replay-values
+      - "2,4"
+      - --out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/probe_device4_npugraph_replay_1mib_1024.json
+    matmul_probe_2mib:
+      - /root/miniconda3/bin/conda
+      - run
+      - -n
+      - vllm-hust-dev
+      - python
+      - benchmark/scripts/ascend_uva_matmul_probe.py
+      - --device-id
+      - "4"
+      - --m
+      - "16"
+      - --k
+      - "1024"
+      - --n
+      - "1024"
+      - --warmup
+      - "1"
+      - --repeat
+      - "5"
+      - --verify-output
+      - --out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/probe_device4_matmul_m16_k1024_n1024.json
+    matmul_probe_32mib:
+      - /root/miniconda3/bin/conda
+      - run
+      - -n
+      - vllm-hust-dev
+      - python
+      - benchmark/scripts/ascend_uva_matmul_probe.py
+      - --device-id
+      - "4"
+      - --m
+      - "16"
+      - --k
+      - "4096"
+      - --n
+      - "4096"
+      - --warmup
+      - "1"
+      - --repeat
+      - "3"
+      - --verify-output
+      - --out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/probe_device4_matmul_m16_k4096_n4096.json
+    collect_summary:
+      - python3
+      - benchmark/scripts/collect_uva_feasibility.py
+      - --out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/e0_ascend_uva_like_summary.csv
+      - --verdict-out
+      - benchmark/artifacts/reports/ascend_uva_feasibility/e0_ascend_uva_like_verdict.json
+  gates:
+    - U0 runtime host registration
+    - U1 AI Core readability
+    - U2 ACLGraph replay
+    - U3 MoE-shaped bandwidth vs SEW H2D staging
+    - U4 vLLM-Ascend integration
+
 workload_buckets:
   - name: smoke
     title: Smoke ShareGPT check
@@ -165,6 +286,41 @@ cases:
       - e1_end_to_end
       - e2_memory_graph
     description: Full model load without expert offload. OOM or KV-cache capacity failure is valid evidence.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+  - name: no_offload_kv512m_aclgraph
+    title: No-offload full-resident, 512 MiB KV, ACLGraph
+    role: baseline
+    default_enabled: false
+    expected_status: success_or_memory_failure
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+      - e4_ablation
+    description: Full-resident single-NPU baseline with explicit KV capacity, used to isolate ACLGraph vs eager efficiency without MoE offload.
+    server_args:
+      - --kv-cache-memory-bytes
+      - "536870912"
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+  - name: no_offload_kv512m_eager
+    title: No-offload full-resident, 512 MiB KV, eager
+    role: baseline
+    default_enabled: false
+    expected_status: success_or_memory_failure
+    experiment_groups:
+      - e1_end_to_end
+      - e2_memory_graph
+      - e4_ablation
+    description: Eager counterpart to the full-resident single-NPU ACLGraph baseline with the same explicit KV capacity.
+    server_args:
+      - --enforce-eager
+      - --kv-cache-memory-bytes
+      - "536870912"
     env:
       VLLM_ASCEND_MOE_OFFLOAD_GB:
       VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE:
@@ -245,13 +401,14 @@ cases:
     experiment_groups:
       - e1_end_to_end
       - e2_memory_graph
-    description: Eager-mode legacy/layered plugin baseline for fair comparison against SEW capture-on.
+    description: Eager-mode legacy/layered plugin baseline for fair comparison against SEW capture-on. On-demand per-layer staging (no fixed slots) moves offloaded experts to device just before the grouped MLP and evicts after, so the plain matmul runs on-device instead of failing with a CPU-weight device mismatch.
     server_args:
       - --enforce-eager
     env:
       VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
       VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
       VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_ONDEMAND_STAGE: "1"
   - name: sew_14gb_autoslots
     title: SEW-Offload, 14 GiB AutoConfig
     role: main

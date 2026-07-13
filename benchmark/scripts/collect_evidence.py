@@ -124,9 +124,10 @@ def _profile_summary(path: str | Path) -> dict[str, Any]:
             if name == "decode_fixed_slot_stage":
                 summary["decode_stage_events"] += 1
 
-            h2d_bytes_total += int(payload.get("h2d_bytes") or 0)
+            sample_rate = int(payload.get("profile_sample_rate") or 1)
+            h2d_bytes_total += int(payload.get("h2d_bytes") or 0) * sample_rate
             if "stage_ms" in payload:
-                stage_ms_total += float(payload.get("stage_ms") or 0.0)
+                stage_ms_total += float(payload.get("stage_ms") or 0.0) * sample_rate
             wave_summary = payload.get("wave_summary") or {}
             h2d_bytes_total += int(wave_summary.get("h2d_bytes") or 0)
             if "stage_ms" in wave_summary:

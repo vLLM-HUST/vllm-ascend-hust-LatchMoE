@@ -46,6 +46,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-start-server", action="store_true")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--startup-timeout-s", type=float)
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=0,
+        help="Override workload num_requests without resampling the manifest.",
+    )
+    parser.add_argument(
+        "--client-concurrency",
+        type=int,
+        default=0,
+        help="Override client concurrency for this suite run.",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help="Override the vLLM serving max_num_seqs for this suite run.",
+    )
     return parser.parse_args()
 
 
@@ -97,6 +115,9 @@ def _unit_env(case: dict[str, Any], unit_dir: Path) -> dict[str, str]:
     env.setdefault("VLLM_ASCEND_MOE_GMM_PROFILE_PATH", str(profile_path))
     env.setdefault("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH", str(profile_path))
     env.setdefault("VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH", str(trace_path))
+    env.setdefault("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "0")
+    env.setdefault("VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE", "8")
+    env.setdefault("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", "0")
     for key, value in (case.get("env") or {}).items():
         if value is None or value == "":
             env.pop(str(key), None)
@@ -288,6 +309,10 @@ def _write_suite_summary(suite_dir: Path, results: list[dict[str, Any]]) -> None
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
+    if int(args.client_concurrency) > 0:
+        config["client"]["concurrency"] = int(args.client_concurrency)
+    if int(args.max_num_seqs) > 0:
+        config["serving_shape"]["max_num_seqs"] = int(args.max_num_seqs)
     issues = validate_config(config)
     if issues:
         for issue in issues:
@@ -296,6 +321,11 @@ def main() -> int:
 
     cases = select_cases(config, args.case or None)
     workloads = select_workloads(config, args.workload or None)
+    if int(args.max_requests) > 0:
+        workloads = [
+            {**workload, "num_requests": int(args.max_requests)}
+            for workload in workloads
+        ]
     suite_dir = repo_relative(args.output_root) / f"{config['benchmark']['suite']}-{utc_stamp()}"
     suite_dir.mkdir(parents=True, exist_ok=True)
 
