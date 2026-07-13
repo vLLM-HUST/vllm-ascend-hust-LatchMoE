@@ -5,7 +5,7 @@ import vllm_moe_offload_ascend.moe_offload.host_store as host_store
 from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
 from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
-from vllm_moe_offload_ascend.moe_offload.slot_bank import SlotState
+from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
 
 
 class TinyLayer(torch.nn.Module):
@@ -18,6 +18,102 @@ class TinyLayer(torch.nn.Module):
         self.w2_weight = torch.nn.Parameter(
             torch.arange(4 * 3 * 2, dtype=torch.float32).reshape(4, 3, 2)
         )
+
+
+def test_slot_bank_lookup_expert_id_tracks_resident_index():
+    bank = ExpertSlotBank(
+        2,
+        (1, 1),
+        (1, 1),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    first = bank.allocate_for(ExpertKey(7, 3), step_id=1)
+    bank.mark_ready(first.slot_id)
+    second = bank.assign_slot(1, ExpertKey(7, 5), step_id=2)
+    bank.mark_ready(second.slot_id)
+
+    assert bank.lookup_expert_id(3) is first
+    assert bank.lookup_expert_id(5) is second
+    assert bank.lookup(ExpertKey(7, 3)) is first
+
+    bank.clear_slot(first.slot_id)
+    assert bank.lookup_expert_id(3) is None
+    assert bank.lookup(ExpertKey(7, 3)) is None
+
+    bank.assign_transient_slot(second.slot_id, ExpertKey(7, 9), step_id=3)
+    assert bank.lookup_expert_id(5) is None
+    assert bank.lookup_expert_id(9) is None
+
+
+def test_memory_ledger_is_cached_and_invalidated_on_structural_changes():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            release_original_expert_weights=True,
+        )
+    )
+    empty = runtime.memory_ledger()
+    assert runtime.memory_ledger() is empty
+
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    after_register = runtime.memory_ledger()
+    assert after_register is runtime.memory_ledger()
+    assert after_register.registered_layers == 1
+    assert after_register.original_expert_weight_bytes > 0
+    assert after_register.prefill_stage_bank_bytes == 0
+
+    runtime.prepare_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0, 1),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+    assert runtime.memory_ledger() is after_register
+
+    plan = runtime.release_original_expert_weights_if_ready(layer)
+
+    assert plan.ready
+    after_release = runtime.memory_ledger()
+    assert after_release is runtime.memory_ledger()
+    assert after_release is not after_register
+    assert after_release.original_expert_weight_bytes == 0
+
+
+def test_memory_ledger_counts_prefill_stage_banks_and_mapping_buffers():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    before = runtime.memory_ledger()
+
+    runtime.prepare_prefill_stage_plan(
+        layer_id=7,
+        active_experts=(0, 1),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+        buffer_index=0,
+        async_load=False,
+    )
+    after = runtime.memory_ledger()
+
+    stage_bank = runtime._prefill_stage_banks[7][0]
+    stage_mapping = runtime._prefill_stage_log2phy_buffers[7][0]
+    assert after is not before
+    assert after.prefill_stage_bank_count == 1
+    assert after.prefill_stage_bank_bytes == stage_bank.total_bytes
+    assert after.prefill_stage_mapping_bytes == (
+        stage_mapping.numel() * stage_mapping.element_size()
+    )
+    assert after.total_managed_bytes == (
+        after.original_expert_weight_bytes
+        + after.host_store_bytes
+        + after.slot_bank_bytes
+        + after.prefill_stage_bank_bytes
+        + after.prefill_stage_mapping_bytes
+    )
 
 
 def test_prefill_stage_plan_uses_dedicated_buffer_and_log2phy_mapping():
@@ -81,6 +177,67 @@ def test_prefill_stage_plan_double_buffers_do_not_share_storage():
     assert first.w2.data_ptr() != second.w2.data_ptr()
     assert first_log2phy == [0, 1, -1, -1]
     assert second.log2phy.tolist() == [-1, -1, 0, 1]
+
+
+def test_prefill_stage_pool_is_shared_across_equal_layout_layers():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    first_layer = TinyLayer()
+    second_layer = TinyLayer()
+    second_layer.layer_id = 9
+    runtime.register_layer_for_fixed_slots(
+        first_layer,
+        slot_device=torch.device("cpu"),
+    )
+    runtime.register_layer_for_fixed_slots(
+        second_layer,
+        slot_device=torch.device("cpu"),
+    )
+
+    first, _, _ = runtime.prepare_prefill_stage_plan(
+        layer_id=7,
+        active_experts=(0, 1),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+        buffer_index=0,
+        async_load=False,
+    )
+    second, _, _ = runtime.prepare_prefill_stage_plan(
+        layer_id=9,
+        active_experts=(2, 3),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+        buffer_index=0,
+        async_load=False,
+    )
+
+    assert first.w1.data_ptr() == second.w1.data_ptr()
+    assert first.w2.data_ptr() == second.w2.data_ptr()
+    assert runtime._prefill_stage_banks[7] is runtime._prefill_stage_banks[9]
+    assert runtime.memory_ledger().prefill_stage_bank_count == 1
+    assert runtime.memory_ledger().prefill_stage_bank_bytes == (
+        runtime._prefill_stage_banks[7][0].total_bytes
+    )
+
+
+def test_shared_prefill_stage_pool_remembers_cross_layer_release_event():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    first_layer = TinyLayer()
+    second_layer = TinyLayer()
+    second_layer.layer_id = 9
+    runtime.register_layer_for_fixed_slots(first_layer, slot_device=torch.device("cpu"))
+    runtime.register_layer_for_fixed_slots(second_layer, slot_device=torch.device("cpu"))
+    event = object()
+
+    runtime.remember_prefill_stage_buffer_release(
+        layer_id=7,
+        buffer_index=1,
+        event=event,
+    )
+
+    assert runtime.prefill_stage_buffer_release_event(
+        layer_id=9,
+        buffer_index=1,
+    ) is event
 
 
 def test_prefill_stage_plan_reuses_fixed_log2phy_per_buffer():
@@ -297,6 +454,12 @@ def test_prepare_ready_slot_plan_can_skip_log2phy_for_wave_plan_remap(monkeypatc
         layer_id=7,
         expert_ids=(3, 1, 2),
     ) == {3: 0, 1: 1}
+    readiness, ready_slot_ids = runtime.slot_readiness_and_ready_slot_ids_for_experts(
+        layer_id=7,
+        expert_ids=(3, 1, 2),
+    )
+    assert readiness == {3: True, 1: True, 2: False}
+    assert ready_slot_ids == {3: 0, 1: 1}
     assert runtime._prefill_stage_banks == {}
 
 
@@ -350,12 +513,14 @@ def test_prepare_fixed_slot_plan_records_decode_hit_miss_profile(monkeypatch):
         device=torch.device("cpu"),
     )
     load_calls = []
+    validate_layout_values = []
     original_load_many_sync = runtime._transfer_engine.load_many_sync
 
     def counted_load_many_sync(loads, **kwargs):
         load_calls.extend(
             (int(bundle.expert_id), int(slot.slot_id)) for bundle, slot in loads
         )
+        validate_layout_values.append(bool(kwargs.get("validate_layout", True)))
         original_load_many_sync(loads, **kwargs)
 
     monkeypatch.setattr(runtime._transfer_engine, "load_many_sync", counted_load_many_sync)
@@ -369,6 +534,7 @@ def test_prepare_fixed_slot_plan_records_decode_hit_miss_profile(monkeypatch):
     )
 
     assert load_calls == [(1, 1)]
+    assert validate_layout_values == [False]
     event = runtime.profiling_summary()["events"][-1]
     assert event["name"] == "decode_fixed_slot_stage"
     assert event["layer_id"] == 7
@@ -378,6 +544,138 @@ def test_prepare_fixed_slot_plan_records_decode_hit_miss_profile(monkeypatch):
     assert event["payload"]["n_hits"] == 1
     assert event["payload"]["n_misses"] == 1
     assert event["payload"]["h2d_bytes"] > 0
+
+
+def test_decode_stage_profile_can_omit_expert_lists(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "0")
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+            gmm_profile_path="/tmp/test-decode-summary-profile.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(3,),
+        num_logical_experts=4,
+    )
+
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(3, 1),
+        num_logical_experts=4,
+    )
+
+    event = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ][-1]
+    payload = event["payload"]
+    assert payload["n_active"] == 2
+    assert payload["n_hits"] == 1
+    assert payload["n_misses"] == 1
+    assert payload["expert_lists"] == "omitted"
+    assert "active_experts" not in payload
+    assert "hit_experts" not in payload
+    assert "miss_experts" not in payload
+    assert payload["h2d_bytes"] > 0
+    assert payload["mapping_mode"] == "persistent_log2phy"
+
+
+def test_decode_stage_profile_can_be_sampled(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE", "2")
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+            gmm_profile_path="/tmp/test-decode-sampled-profile.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0,),
+        num_logical_experts=4,
+    )
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(1,),
+        num_logical_experts=4,
+    )
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0,),
+        num_logical_experts=4,
+    )
+
+    events = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ]
+    assert [event["payload"]["step_id"] for event in events] == [0, 2]
+    assert all(event["payload"]["profile_sample_rate"] == 2 for event in events)
+
+
+def test_prepare_fixed_slot_plan_profile_uses_cached_expert_bytes(monkeypatch):
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            gmm_profile_path="/tmp/test-decode-profile-cached-bytes.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    monkeypatch.setattr(
+        runtime,
+        "estimate_expert_weight_bytes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("profile hot path must use cached expert bytes")
+        ),
+    )
+
+    runtime.prepare_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0, 1),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+        record_stage_profile=True,
+    )
+
+    event = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ][-1]
+    assert event["payload"]["n_misses"] == 2
+    assert event["payload"]["h2d_bytes"] == (
+        runtime._expert_weight_bytes_by_layer[7] * 2
+    )
+
+
+def test_cached_layer_expert_weight_bytes_returns_registered_expert_size():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    assert runtime.cached_layer_expert_weight_bytes(layer_id=7) == (
+        runtime._expert_weight_bytes_by_layer[7]
+    )
+    assert runtime.cached_layer_expert_weight_bytes(layer_id=99) == 0
 
 
 def test_slot_allocation_waits_for_loading_slots_before_eviction(monkeypatch):
@@ -722,7 +1020,7 @@ def test_stage_fixed_slot_plan_batches_decode_misses_async(monkeypatch):
         num_logical_experts=4,
     )
 
-    assert calls == [([(1, 1), (2, 2)], None, True, True)]
+    assert calls == [([(1, 1), (2, 2)], None, True, False)]
     assert waits == ["decode-ready"]
     assert prepared.log2phy.tolist() == [-1, 1, 2, 0]
     assert runtime.log2phy_buffer(7).tolist() == [-1, 1, 2, 0]
@@ -737,6 +1035,43 @@ def test_stage_fixed_slot_plan_batches_decode_misses_async(monkeypatch):
     assert event["payload"]["mapping_mode"] == "persistent_log2phy"
     assert "load_enqueue_ms" in event["payload"]
     assert "ready_wait_ms" in event["payload"]
+
+
+def test_stage_fixed_slot_plan_profile_uses_cached_expert_bytes(monkeypatch):
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+            async_load=True,
+            gmm_profile_path="/tmp/test-stage-profile-cached-bytes.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    monkeypatch.setattr(
+        runtime,
+        "estimate_expert_weight_bytes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stage profile hot path must use cached expert bytes")
+        ),
+    )
+
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0, 1),
+        num_logical_experts=4,
+    )
+
+    event = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ][-1]
+    assert event["payload"]["n_misses"] == 2
+    assert event["payload"]["h2d_bytes"] == (
+        runtime._expert_weight_bytes_by_layer[7] * 2
+    )
 
 
 def test_stage_fixed_slot_plan_async_hit_only_skips_loader(monkeypatch):
@@ -795,6 +1130,112 @@ def test_stage_fixed_slot_plan_async_hit_only_skips_loader(monkeypatch):
     assert event["payload"]["n_hits"] == 2
     assert event["payload"]["n_misses"] == 0
     assert event["payload"]["stage_mode"] == "main_slot_hit"
+    assert event["payload"]["log2phy_update_count"] == 2
+
+
+def test_stage_fixed_slot_plan_skips_redundant_hit_only_log2phy_update(monkeypatch):
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
+
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+            async_load=True,
+            gmm_profile_path="/tmp/test-decode-log2phy-hit-skip.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(3, 1),
+        num_logical_experts=4,
+    )
+
+    def forbidden_update(*args, **kwargs):
+        raise AssertionError("unchanged hit-only decode must not rewrite log2phy")
+
+    monkeypatch.setattr(runtime_mod, "_update_log2phy_entries", forbidden_update)
+    prepared = runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(3, 1),
+        num_logical_experts=4,
+    )
+
+    assert prepared.log2phy.tolist() == [-1, 1, -1, 0]
+    event = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ][-1]
+    assert event["payload"]["n_hits"] == 2
+    assert event["payload"]["n_misses"] == 0
+    assert event["payload"]["stage_mode"] == "main_slot_hit"
+    assert event["payload"]["log2phy_update_count"] == 0
+
+
+def test_stage_fixed_slot_plan_updates_only_changed_log2phy_entries(monkeypatch):
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
+
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=3,
+            graph_compatible_offload=True,
+            async_load=True,
+            gmm_profile_path="/tmp/test-decode-log2phy-changed-only.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0, 1, 2),
+        num_logical_experts=4,
+    )
+    original_update = runtime_mod._update_log2phy_entries
+    calls = []
+
+    def recording_update(log2phy, *, expert_ids, slot_ids):
+        calls.append((tuple(expert_ids), tuple(slot_ids)))
+        return original_update(log2phy, expert_ids=expert_ids, slot_ids=slot_ids)
+
+    monkeypatch.setattr(runtime_mod, "_update_log2phy_entries", recording_update)
+    prepared = runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(1, 3),
+        num_logical_experts=4,
+    )
+
+    assert calls == [((3,), (0,))]
+    assert prepared.log2phy.tolist() == [0, 1, 2, 0]
+    assert prepared.mapping.active_experts == (1, 3)
+    assert prepared.mapping.active_slot_ids == (1, 0)
+    event = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ][-1]
+    assert event["payload"]["log2phy_update_count"] == 1
+
+
+def test_update_log2phy_entries_single_update_skips_tensor_materialization(monkeypatch):
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
+
+    log2phy = torch.full((4,), -1, dtype=torch.long)
+
+    def forbidden_as_tensor(*args, **kwargs):
+        raise AssertionError("single-entry log2phy update should not materialize tensors")
+
+    monkeypatch.setattr(runtime_mod.torch, "as_tensor", forbidden_as_tensor)
+    runtime_mod._update_log2phy_entries(
+        log2phy,
+        expert_ids=(2,),
+        slot_ids=(1,),
+    )
+
+    assert log2phy.tolist() == [-1, -1, 1, -1]
 
 
 def test_stage_fixed_slot_plan_updates_only_active_log2phy_entries(monkeypatch):

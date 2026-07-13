@@ -74,6 +74,7 @@ class ExpertSlotBank:
             for slot_id in range(num_slots)
         ]
         self._resident: dict[ExpertKey, int] = {}
+        self._resident_by_expert_id: dict[int, int] = {}
 
     def allocate_for(self, expert_key: ExpertKey, *, step_id: int) -> ExpertSlot:
         if expert_key in self._resident:
@@ -89,11 +90,13 @@ class ExpertSlotBank:
 
         if slot.expert_key is not None:
             self._resident.pop(slot.expert_key, None)
+            self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
         slot.expert_key = expert_key
         slot.state = SlotState.LOADING
         slot.version += 1
         slot.last_used_step = int(step_id)
         self._resident[expert_key] = slot.slot_id
+        self._resident_by_expert_id[int(expert_key.expert_id)] = slot.slot_id
         return slot
 
     def mark_ready(self, slot_id: int) -> None:
@@ -109,20 +112,27 @@ class ExpertSlotBank:
         slot_id = self._resident.get(expert_key)
         return None if slot_id is None else self.slots[slot_id]
 
+    def lookup_expert_id(self, expert_id: int) -> ExpertSlot | None:
+        slot_id = self._resident_by_expert_id.get(int(expert_id))
+        return None if slot_id is None else self.slots[slot_id]
+
     def assign_slot(self, slot_id: int, expert_key: ExpertKey, *, step_id: int) -> ExpertSlot:
         slot = self.slots[int(slot_id)]
         if slot.expert_key is not None and slot.expert_key != expert_key:
             self._resident.pop(slot.expert_key, None)
+            self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
         existing_slot_id = self._resident.get(expert_key)
         if existing_slot_id is not None and existing_slot_id != int(slot_id):
             old_slot = self.slots[int(existing_slot_id)]
             old_slot.expert_key = None
             old_slot.state = SlotState.EMPTY
+            self._resident_by_expert_id.pop(int(expert_key.expert_id), None)
         slot.expert_key = expert_key
         slot.version += 1
         slot.last_used_step = int(step_id)
         slot.state = SlotState.LOADING
         self._resident[expert_key] = int(slot_id)
+        self._resident_by_expert_id[int(expert_key.expert_id)] = int(slot_id)
         return slot
 
     def assign_transient_slot(
@@ -142,6 +152,7 @@ class ExpertSlotBank:
         slot = self.slots[int(slot_id)]
         if slot.expert_key is not None:
             self._resident.pop(slot.expert_key, None)
+            self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
         slot.expert_key = expert_key
         slot.version += 1
         slot.last_used_step = int(step_id)
@@ -152,6 +163,7 @@ class ExpertSlotBank:
         slot = self.slots[int(slot_id)]
         if slot.expert_key is not None:
             self._resident.pop(slot.expert_key, None)
+            self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
         slot.expert_key = None
         slot.state = SlotState.EMPTY
 

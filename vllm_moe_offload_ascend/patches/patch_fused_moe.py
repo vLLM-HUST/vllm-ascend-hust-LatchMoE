@@ -177,8 +177,8 @@ def _apply_env_defaults_from_gb() -> None:
         pass
 
 
-def _current_forward_is_prefill() -> bool | None:
-    """Return the authoritative forward phase when vLLM metadata is available."""
+def _current_forward_phase() -> str | None:
+    """Return prefill/decode/mixed from authoritative vLLM metadata."""
 
     try:
         from vllm.forward_context import (
@@ -206,18 +206,36 @@ def _current_forward_is_prefill() -> bool | None:
     else:
         metas = [attn_metadata]
 
+    has_prefill = False
+    has_decode = False
     for meta in metas:
         try:
             if int(getattr(meta, "num_prefills", 0) or 0) > 0:
-                return True
+                has_prefill = True
         except Exception:
             continue
     for meta in metas:
         try:
             if int(getattr(meta, "num_decodes", 0) or 0) > 0:
-                return False
+                has_decode = True
         except Exception:
             continue
+    if has_prefill and has_decode:
+        return "mixed"
+    if has_prefill:
+        return "prefill"
+    if has_decode:
+        return "decode"
+    return None
+
+
+def _current_forward_is_prefill() -> bool | None:
+    """Backward-compatible bool view; mixed contains prefill work."""
+    phase = _current_forward_phase()
+    if phase in {"prefill", "mixed"}:
+        return True
+    if phase == "decode":
+        return False
     return None
 
 
@@ -276,10 +294,18 @@ def _infer_forward_phase_int(num_tokens: int | None) -> int:
     """
     from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
         PHASE_DECODE,
+        PHASE_MIXED,
         PHASE_PREFILL,
         PHASE_UNKNOWN,
     )
 
+    authoritative = _current_forward_phase()
+    if authoritative == "mixed":
+        return PHASE_MIXED
+    if authoritative == "prefill":
+        return PHASE_PREFILL
+    if authoritative == "decode":
+        return PHASE_DECODE
     phase = _infer_forward_is_prefill_from_tokens(num_tokens)
     if phase is True:
         return PHASE_PREFILL
@@ -493,6 +519,68 @@ def _sum_profile_int(profile: dict[str, Any], key: str) -> int:
         return int(float(profile.get(key, 0) or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _estimate_b2_wave_h2d_bytes(
+    runtime: Any,
+    *,
+    layer_id: int,
+    wave: tuple[int, ...],
+    readiness: dict[int, bool],
+) -> int:
+    miss_experts = tuple(
+        int(expert_id)
+        for expert_id in wave
+        if not bool(readiness.get(int(expert_id), False))
+    )
+    cached_expert_bytes_fn = getattr(
+        runtime,
+        "cached_layer_expert_weight_bytes",
+        None,
+    )
+    layer_expert_weight_bytes = (
+        int(cached_expert_bytes_fn(layer_id=layer_id))
+        if callable(cached_expert_bytes_fn)
+        else 0
+    )
+    if layer_expert_weight_bytes > 0:
+        return int(layer_expert_weight_bytes) * len(miss_experts)
+    return int(
+        sum(
+            runtime.estimate_expert_weight_bytes(
+                layer_id=layer_id,
+                expert_id=int(expert_id),
+            )
+            for expert_id in miss_experts
+        )
+    )
+
+
+def _b2_profile_details_enabled() -> bool:
+    return _to_bool_env("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", "0")
+
+
+def _attach_b2_profile_details(
+    payload: dict[str, object],
+    *,
+    wave_plan,
+    async_schedule,
+    async_stage: bool,
+    wave_profiles: list[dict[str, Any]],
+) -> dict[str, object]:
+    if _b2_profile_details_enabled():
+        payload.update(
+            {
+                "wave_plan": wave_plan.to_jsonable(),
+                "async_schedule": (
+                    async_schedule.to_jsonable() if async_stage else None
+                ),
+                "waves": wave_profiles,
+            }
+        )
+    else:
+        payload["profile_details"] = "omitted"
+    return payload
 
 
 def _summarize_b2_wave_profiles(
@@ -864,9 +952,13 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         phase_is_prefill = _infer_forward_is_prefill_from_tokens(
             int(fused_experts_input.topk_ids.shape[0])
         )
-        if phase_is_prefill is False:
-            return None
-        is_prefill = bool(phase_is_prefill)
+        forward_phase = _current_forward_phase()
+        if forward_phase is None:
+            forward_phase = (
+                "prefill" if phase_is_prefill is True
+                else "decode" if phase_is_prefill is False
+                else "unknown"
+            )
         if runtime.is_resident_layer(int(offload.layer_id)):
             if _os.environ.get("SEW_B2_PROBE") or _os.environ.get("SEW_OFFLOAD_PROBE"):
                 print(
@@ -896,14 +988,14 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         else:
             token_count_ms = 0.0
         active_experts = tuple(sorted(token_counts))
-        b2_phase_match = runtime.should_use_b2_wave_prefill(
+        active_expert_count = len(active_experts)
+        b2_phase_match = runtime.should_use_b2_pair_waves(
             layer_id=offload.layer_id,
-            active_expert_count=len(set(active_experts)),
-            is_prefill=is_prefill,
+            active_expert_count=active_expert_count,
         )
         b2_overflow_handoff = (
             route_stats is not None
-            and len(set(active_experts)) > int(runtime.config.num_slots)
+            and active_expert_count > int(runtime.config.num_slots)
         )
         if not (b2_phase_match or b2_overflow_handoff):
             return None
@@ -917,6 +1009,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 "b2_total_start": b2_control_start,
                 "token_count_ms": token_count_ms,
                 "route_stats_cache_hit": route_stats_cache_hit,
+                "forward_phase": str(forward_phase),
                 "pair_offsets_by_expert": (
                     route_stats.pair_offsets_by_expert
                     if route_stats is not None
@@ -961,6 +1054,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             if control_profile
             else False
         )
+        forward_phase = (
+            str(control_profile.get("forward_phase", "unknown"))
+            if control_profile
+            else "unknown"
+        )
         pair_offsets_by_expert = (
             control_profile.get("pair_offsets_by_expert")
             if control_profile
@@ -972,7 +1070,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             token_count_ms = (perf_counter() - token_count_start) * 1000.0
         unique_active = tuple(sorted(token_counts))
         readiness_start = perf_counter()
-        readiness = runtime.slot_readiness_for_experts(
+        readiness, ready_slot_ids = runtime.slot_readiness_and_ready_slot_ids_for_experts(
             layer_id=offload.layer_id,
             expert_ids=unique_active,
         )
@@ -982,6 +1080,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             token_counts,
             num_slots,
             slot_readiness=readiness,
+            fold_partial_hits_into_miss=not bool(
+                runtime.config.b2_avoid_mixed_wave_d2d
+            ),
         )
         wave_plan_ms = (perf_counter() - wave_plan_start) * 1000.0
         waves = wave_plan.waves
@@ -1035,27 +1136,48 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         pair_index = None
         pair_index_start = perf_counter()
         from vllm_ascend.moe_offload.phase_split import (
+            build_b2_device_wave_microbatch_plans,
             build_b2_routed_pair_index,
             build_b2_wave_microbatch_plans,
             materialize_b2_pair_microbatches_from_plans,
         )
 
-        pair_index = build_b2_routed_pair_index(
-            fused_experts_input.topk_ids,
-            fused_experts_input.topk_weights,
-            pair_offsets_by_expert=pair_offsets_by_expert,
+        device_pair_planning = _to_bool_env(
+            "VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING",
+            "1",
         )
+        if not device_pair_planning:
+            pair_index = build_b2_routed_pair_index(
+                fused_experts_input.topk_ids,
+                fused_experts_input.topk_weights,
+                pair_offsets_by_expert=pair_offsets_by_expert,
+                validate_pair_offsets=(
+                    not pair_index_cache_hit
+                    or bool(_os.environ.get("SEW_B2_VALIDATE"))
+                ),
+            )
         pair_index_ms = (perf_counter() - pair_index_start) * 1000.0
         wave_microbatch_plan_start = perf_counter()
-        ready_slot_ids = runtime.ready_slot_ids_for_experts(
-            layer_id=offload.layer_id,
-            expert_ids=unique_active,
-        )
-        wave_microbatch_plans = build_b2_wave_microbatch_plans(
-            pair_index,
-            tuple(tuple(int(e) for e in wave) for wave in waves),
-            physical_slot_by_expert=ready_slot_ids,
-        )
+        if device_pair_planning:
+            wave_microbatch_plans = build_b2_device_wave_microbatch_plans(
+                fused_experts_input.topk_ids,
+                waves,
+                physical_slot_by_expert=ready_slot_ids,
+                wave_pair_counts=tuple(
+                    int(wave_plan.wave_tokens(wave)) for wave in waves
+                ),
+                include_logical_expert_ids=False,
+            )
+        else:
+            wave_microbatch_plans = build_b2_wave_microbatch_plans(
+                pair_index,
+                waves,
+                physical_slot_by_expert=ready_slot_ids,
+                preserve_pair_order=False,
+                include_logical_expert_ids=False,
+                include_topk_positions=False,
+                normalize_inputs=False,
+            )
         wave_microbatch_plan_ms = (
             perf_counter() - wave_microbatch_plan_start
         ) * 1000.0
@@ -1065,14 +1187,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         if async_stage:
             schedule_start = perf_counter()
             for wave_index, wave in enumerate(waves):
-                wave_h2d_bytes_by_index[int(wave_index)] = int(
-                    sum(
-                        runtime.estimate_expert_weight_bytes(
-                            layer_id=offload.layer_id,
-                            expert_id=int(expert_id),
-                        )
-                        for expert_id in wave
-                        if not bool(readiness.get(int(expert_id), False))
+                wave_h2d_bytes_by_index[int(wave_index)] = (
+                    _estimate_b2_wave_h2d_bytes(
+                        runtime,
+                        layer_id=offload.layer_id,
+                        wave=tuple(int(expert_id) for expert_id in wave),
+                        readiness=readiness,
                     )
                 )
                 wave_compute_cost_by_index[int(wave_index)] = float(
@@ -1356,8 +1476,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 mlp_ms = (perf_counter() - mlp_start) * 1000.0
                 prefetch_after_compute_count = 0
                 if current_buffer_index is not None:
-                    buffer_release_events[int(current_buffer_index)] = (
-                        torch.npu.current_stream().record_event()
+                    release_event = torch.npu.current_stream().record_event()
+                    buffer_release_events[int(current_buffer_index)] = release_event
+                    runtime.remember_prefill_stage_buffer_release(
+                        layer_id=offload.layer_id,
+                        buffer_index=int(current_buffer_index),
+                        event=release_event,
                     )
                     prefetch_after_compute_count = _prefetch_ahead(
                         issue_reason="prefetch_after_compute",
@@ -1717,53 +1841,60 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             or _os.getenv("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
             or _os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         ):
+            payload = {
+                "n_tokens": int(fused_experts_input.hidden_states.shape[0]),
+                "n_active": int(len(unique_active)),
+                "n_pairs": int(wave_plan.total_pairs),
+                "num_slots": int(num_slots),
+                "n_waves": int(len(waves)),
+                "masked_full_prompt_pairs": int(masked_full_prompt_pairs),
+                "work_conserving_saved_pairs": int(
+                    masked_full_prompt_pairs - wave_plan.total_pairs
+                ),
+                "wave_token_summary": {
+                    "min": int(min_wave_tokens),
+                    "max": int(max_wave_tokens),
+                    "mean": round(float(mean_wave_tokens), 3),
+                    "imbalance": round(float(wave_token_imbalance), 3),
+                },
+                "control_ms": {
+                    "token_count": round(token_count_ms, 3),
+                    "readiness": round(readiness_ms, 3),
+                    "wave_plan": round(wave_plan_ms, 3),
+                    "schedule": round(schedule_ms, 3),
+                    "initial_issue": round(initial_issue_ms, 3),
+                    "initial_stage_target": int(initial_stage_target),
+                    "initial_stage_issued": int(initial_stage_issued),
+                    "pair_index": round(pair_index_ms, 3),
+                    "wave_microbatch_plan": round(wave_microbatch_plan_ms, 3),
+                    "microbatch_materialize": round(
+                        microbatch_materialize_ms,
+                        3,
+                    ),
+                    "loop": round(loop_ms, 3),
+                    "scatter_total": round(scatter_total_ms, 3),
+                    "end_to_end": round(end_to_end_ms, 3),
+                },
+                "route_stats_cache_hit": bool(route_stats_cache_hit),
+                "pair_index_cache_hit": bool(pair_index_cache_hit),
+                "pair_planner_mode": (
+                    "npu_device" if device_pair_planning else "host_offsets"
+                ),
+                "forward_phase": str(forward_phase),
+                "wave_summary": wave_summary,
+            }
+            payload = _attach_b2_profile_details(
+                payload,
+                wave_plan=wave_plan,
+                async_schedule=async_schedule,
+                async_stage=async_stage,
+                wave_profiles=wave_profiles,
+            )
             runtime._record_profile_event(
                 "b2_work_conserving_prefill",
                 layer_id=offload.layer_id,
                 start=profile_start,
-                payload={
-                    "n_tokens": int(fused_experts_input.hidden_states.shape[0]),
-                    "n_active": int(len(unique_active)),
-                    "n_pairs": int(wave_plan.total_pairs),
-                    "num_slots": int(num_slots),
-                    "n_waves": int(len(waves)),
-                    "masked_full_prompt_pairs": int(masked_full_prompt_pairs),
-                    "work_conserving_saved_pairs": int(
-                        masked_full_prompt_pairs - wave_plan.total_pairs
-                    ),
-                    "wave_token_summary": {
-                        "min": int(min_wave_tokens),
-                        "max": int(max_wave_tokens),
-                        "mean": round(float(mean_wave_tokens), 3),
-                        "imbalance": round(float(wave_token_imbalance), 3),
-                    },
-                    "control_ms": {
-                        "token_count": round(token_count_ms, 3),
-                        "readiness": round(readiness_ms, 3),
-                        "wave_plan": round(wave_plan_ms, 3),
-                        "schedule": round(schedule_ms, 3),
-                        "initial_issue": round(initial_issue_ms, 3),
-                        "initial_stage_target": int(initial_stage_target),
-                        "initial_stage_issued": int(initial_stage_issued),
-                        "pair_index": round(pair_index_ms, 3),
-                        "wave_microbatch_plan": round(wave_microbatch_plan_ms, 3),
-                        "microbatch_materialize": round(
-                            microbatch_materialize_ms,
-                            3,
-                        ),
-                        "loop": round(loop_ms, 3),
-                        "scatter_total": round(scatter_total_ms, 3),
-                        "end_to_end": round(end_to_end_ms, 3),
-                    },
-                    "route_stats_cache_hit": bool(route_stats_cache_hit),
-                    "pair_index_cache_hit": bool(pair_index_cache_hit),
-                    "wave_summary": wave_summary,
-                    "wave_plan": wave_plan.to_jsonable(),
-                    "async_schedule": (
-                        async_schedule.to_jsonable() if async_stage else None
-                    ),
-                    "waves": wave_profiles,
-                },
+                payload=payload,
             )
         return FusedExpertsResult(
             routed_out=accumulated,
@@ -1786,6 +1917,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
     ):
         from vllm_ascend.moe_offload.phase_split import (
             B2DirectScatterPayload,
+            build_b2_device_scatter_descriptor,
             build_b2_pair_microbatch,
             build_b2_pair_microbatch_from_index,
             build_b2_pair_microbatch_from_plan,
@@ -1902,6 +2034,20 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             )
             if direct_scatter_enabled:
                 combine_start = perf_counter()
+                device_scatter_descriptor = None
+                if _to_bool_env(
+                    "VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING",
+                    "1",
+                ):
+                    device_scatter_descriptor = build_b2_device_scatter_descriptor(
+                        expanded_row_idx=(
+                            token_dispatch_output.combine_metadata.expanded_row_idx
+                        ),
+                        topk_weights=microbatch.topk_weights,
+                        restore_token_indices=microbatch.restore_token_indices,
+                        output_dtype=mlp_output.dtype,
+                        output_device=mlp_output.device,
+                    )
                 direct_scatter_payload = B2DirectScatterPayload(
                     permuted_tokens=mlp_output,
                     expanded_row_idx=(
@@ -1909,6 +2055,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     ),
                     topk_weights=microbatch.topk_weights,
                     restore_token_indices=microbatch.restore_token_indices,
+                    device_descriptor=device_scatter_descriptor,
                 )
                 routed_out = torch.empty(
                     0,
@@ -1960,6 +2107,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 "combine_ms": combine_ms,
                 "combine_mode": combine_mode,
                 "scatter_mode": scatter_mode,
+                "scatter_descriptor_mode": (
+                    "npu_device"
+                    if direct_scatter_payload is not None
+                    and direct_scatter_payload.device_descriptor is not None
+                    else "deferred"
+                ),
                 "direct_scatter_payload": direct_scatter_payload,
             },
         )
@@ -2162,6 +2315,83 @@ def _patch_fused_moe_runtime_hooks(_fused_moe: Any) -> None:
     _patch_ascend_moe_runner(_fused_moe)
 
 
+def _ondemand_stage_enabled() -> bool:
+    """Naive per-layer on-demand expert staging (no fixed-slot dataplane).
+
+    When on, the apply() wrapper stages a layer's CPU-resident expert weights to
+    the compute device right before the grouped MLP and evicts them back right
+    after. This is the honest baseline for "offload without fixed slots, eager":
+    it produces tokens under a tight HBM budget by paying a full H2D copy of the
+    active layer's experts on every forward, instead of a fixed-slot cache.
+    """
+    return _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_ONDEMAND_STAGE", "0")
+
+
+def _ondemand_stage_device():
+    """Current NPU device, or None when no NPU is available."""
+    import torch
+
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        return None
+    try:
+        if hasattr(npu, "is_available") and not npu.is_available():
+            return None
+        return torch.device("npu", npu.current_device())
+    except Exception:
+        return None
+
+
+def _stage_layer_experts_to_device(layer):
+    """Move a layer's CPU-resident expert weights to device for one forward.
+
+    Returns (staged, restore_fn). ``restore_fn`` rebinds the original CPU tensors
+    (zero-copy: the CPU tensor object is retained, never freed) and drops the
+    device staging copy. Only ``w13_weight``/``w2_weight`` that are actually on
+    CPU are touched, so resident layers and already-on-device layers are no-ops.
+    """
+    device = _ondemand_stage_device()
+    if device is None:
+        return False, None
+    try:
+        from vllm_ascend.utils import maybe_trans_nz
+    except Exception:
+        maybe_trans_nz = lambda w: w  # noqa: E731 - NZ recast is a no-op fallback
+
+    moved = []
+    for name in ("w13_weight", "w2_weight"):
+        param = getattr(layer, name, None)
+        data = getattr(param, "data", None)
+        if data is None or data.device.type != "cpu":
+            continue
+        cpu_data = data
+        # A CPU round-trip drops NZ back to ND; recast to match what the load
+        # path produced on device (no-op when NZ is disabled for this dtype).
+        param.data = maybe_trans_nz(cpu_data.to(device))
+        moved.append((param, cpu_data))
+    if not moved:
+        return False, None
+
+    def _restore() -> None:
+        for param, cpu_data in moved:
+            param.data = cpu_data
+        _empty_npu_cache_if_available()
+
+    return True, _restore
+
+
+def _empty_npu_cache_if_available() -> None:
+    import torch
+
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "empty_cache"):
+        return
+    try:
+        npu.empty_cache()
+    except Exception:
+        pass
+
+
 def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
     cls = getattr(_fused_moe, "AscendUnquantizedFusedMoEMethod", None)
     if cls is None or getattr(cls, "_ascend_moe_offload_runtime_patch", False):
@@ -2288,9 +2518,17 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                 layer_context.layer_id = lid
             # lid == -1: layer has no id; skip context so the seam does not
             # collide with other unidentified layers sharing key -1.
+        # Naive on-demand staging (no fixed slots): if this layer's experts were
+        # offloaded to CPU at load time, stage them to device for this forward
+        # and evict right after, so the plain grouped matmul sees device weights.
+        restore_staged = None
+        if layer is not None and _ondemand_stage_enabled():
+            _staged, restore_staged = _stage_layer_experts_to_device(layer)
         try:
             return original_apply(self, *args, **kwargs)
         finally:
+            if restore_staged is not None:
+                restore_staged()
             if old_layer_id is None and hasattr(layer_context, "layer_id"):
                 delattr(layer_context, "layer_id")
             else:

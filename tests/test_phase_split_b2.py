@@ -81,6 +81,47 @@ def test_plan_balanced_b2_waves_folds_partial_hit_tail_into_miss_waves():
     assert len(plan.waves) == 1
 
 
+def test_plan_balanced_b2_waves_can_keep_partial_hits_separate_to_avoid_d2d():
+    readiness = {1: True}
+    plan = plan_balanced_b2_waves(
+        {1: 10, 2: 9, 3: 8, 4: 7},
+        num_slots=4,
+        slot_readiness=readiness,
+        fold_partial_hits_into_miss=False,
+    )
+
+    assert plan.waves == ((2, 3, 4), (1,))
+    assert all(len(wave) <= 4 for wave in plan.waves)
+    assert all(
+        not (
+            any(readiness.get(expert_id, False) for expert_id in wave)
+            and any(not readiness.get(expert_id, False) for expert_id in wave)
+        )
+        for wave in plan.waves
+    )
+
+
+def test_plan_balanced_b2_waves_sorts_wave_members_for_contiguous_stage_copy():
+    plan = plan_balanced_b2_waves(
+        {5: 100, 1: 90, 2: 80, 4: 70},
+        num_slots=4,
+        slot_readiness={},
+    )
+
+    assert plan.waves == ((1, 2, 4, 5),)
+    assert plan.wave_tokens(plan.waves[0]) == 340
+
+
+def test_plan_balanced_b2_waves_keeps_mixed_wave_miss_prefix():
+    plan = plan_balanced_b2_waves(
+        {1: 10, 2: 100, 5: 90},
+        num_slots=3,
+        slot_readiness={1: True},
+    )
+
+    assert plan.waves == ((2, 5, 1),)
+
+
 def test_mixed_wave_microbatch_uses_positional_slots_not_main_bank_ids():
     """A folded mixed wave (hits + misses) is staged into a temporary stage bank
     at positional slots 0..k-1.  build_b2_wave_microbatch_plans must therefore NOT
@@ -89,7 +130,7 @@ def test_mixed_wave_microbatch_uses_positional_slots_not_main_bank_ids():
     corruption).  Pure-hit waves keep using main-bank ids (zero-copy fast path).
     """
     active = {1: 10, 2: 9, 3: 8, 4: 7}
-    readiness = {1: True, 2: False, 3: False, 4: False}
+    readiness = {1: False, 2: False, 3: False, 4: True}
     plan = plan_balanced_b2_waves(active, num_slots=4, slot_readiness=readiness)
     # The folding produces a single mixed wave.
     assert len(plan.waves) == 1
@@ -100,8 +141,9 @@ def test_mixed_wave_microbatch_uses_positional_slots_not_main_bank_ids():
     topk_weights = torch.ones(4, 2, dtype=torch.float32)
     pair_index = build_b2_routed_pair_index(topk_ids, topk_weights)
 
-    # Expert 1 is resident in MAIN-BANK slot 0, but its position in the wave is not 0.
-    ready_slot_ids = {1: 0}
+    # Expert 4 is resident in MAIN-BANK slot 0, but its position in the sorted
+    # staged wave is not 0.
+    ready_slot_ids = {4: 0}
     plans = build_b2_wave_microbatch_plans(
         pair_index, plan.waves, physical_slot_by_expert=ready_slot_ids
     )
@@ -401,6 +443,27 @@ def test_build_b2_routed_pair_index_accepts_cached_pair_offsets():
     assert mb.topk_ids.squeeze(1).tolist() == [0, 0, 2, 2, 0]
 
 
+def test_build_b2_routed_pair_index_can_skip_cached_offset_validation():
+    topk_ids = torch.tensor([[1, 2]], dtype=torch.long)
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="outside topk_ids flat size"):
+        build_b2_routed_pair_index(
+            topk_ids,
+            topk_weights,
+            pair_offsets_by_expert={1: (0, 99)},
+        )
+
+    index = build_b2_routed_pair_index(
+        topk_ids,
+        topk_weights,
+        pair_offsets_by_expert={1: (0, 99)},
+        validate_pair_offsets=False,
+    )
+
+    assert index.pair_offsets_by_expert[1] == (0, 99)
+
+
 def test_build_b2_pair_microbatch_from_wave_plan_matches_index_builder():
     hidden_states = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
     topk_ids = torch.tensor(
@@ -571,6 +634,163 @@ def test_build_b2_wave_microbatch_plans_match_single_wave_builder():
         assert torch.equal(batch_plan.topk_positions, single_plan.topk_positions)
         assert torch.equal(batch_plan.logical_expert_ids, single_plan.logical_expert_ids)
         assert torch.equal(batch_plan.physical_slot_ids, single_plan.physical_slot_ids)
+
+
+def test_build_b2_wave_microbatch_plans_can_skip_global_pair_order():
+    topk_ids = torch.tensor(
+        [
+            [1, 2],
+            [2, 1],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    (plan,) = build_b2_wave_microbatch_plans(
+        index,
+        ((2, 1),),
+        preserve_pair_order=False,
+    )
+
+    assert plan.pair_offsets.tolist() == [1, 2, 0, 3]
+    assert plan.logical_expert_ids.tolist() == [2, 2, 1, 1]
+    assert plan.physical_slot_ids.tolist() == [0, 0, 1, 1]
+
+
+def test_build_b2_wave_microbatch_plans_reuses_flat_pair_offsets():
+    topk_ids = torch.tensor(
+        [
+            [1, 2],
+            [3, 1],
+            [2, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    plans = build_b2_wave_microbatch_plans(
+        index,
+        ((2,), (3, 1)),
+        preserve_pair_order=False,
+    )
+
+    assert plans[0].pair_offsets.tolist() == [1, 4]
+    assert plans[1].pair_offsets.tolist() == [2, 5, 0, 3]
+    assert plans[0].layer_flat_pair_offsets is plans[1].layer_flat_pair_offsets
+    assert torch.equal(
+        plans[0].layer_flat_pair_offsets,
+        torch.tensor([1, 4, 2, 5, 0, 3]),
+    )
+
+
+def test_build_b2_wave_microbatch_plans_can_skip_input_normalization():
+    topk_ids = torch.tensor(
+        [
+            [1, 2],
+            [3, 1],
+            [2, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    default = build_b2_wave_microbatch_plans(
+        index,
+        (("2",), ("3", "1")),
+        physical_slot_by_expert={"1": "5"},
+        preserve_pair_order=False,
+    )
+    fast = build_b2_wave_microbatch_plans(
+        index,
+        ((2,), (3, 1)),
+        physical_slot_by_expert={1: 5},
+        preserve_pair_order=False,
+        normalize_inputs=False,
+    )
+
+    assert [plan.wave_experts for plan in default] == [plan.wave_experts for plan in fast]
+    assert [plan.pair_offsets.tolist() for plan in default] == [
+        plan.pair_offsets.tolist() for plan in fast
+    ]
+    assert [plan.physical_slot_ids.tolist() for plan in default] == [
+        plan.physical_slot_ids.tolist() for plan in fast
+    ]
+
+
+def test_build_b2_wave_microbatch_plans_can_omit_topk_positions():
+    hidden_states = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4)
+    topk_ids = torch.tensor(
+        [
+            [1, 2],
+            [3, 1],
+            [2, 3],
+        ],
+        dtype=torch.long,
+    )
+    topk_weights = torch.tensor(
+        [
+            [0.1, 0.2],
+            [0.3, 0.4],
+            [0.5, 0.6],
+        ],
+        dtype=torch.float32,
+    )
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    plans = build_b2_wave_microbatch_plans(
+        index,
+        ((2,), (3, 1)),
+        preserve_pair_order=False,
+        include_topk_positions=False,
+    )
+    microbatches = materialize_b2_pair_microbatches_from_plans(
+        hidden_states,
+        topk_weights,
+        plans,
+    )
+
+    assert all(plan.topk_positions.numel() == 0 for plan in plans)
+    assert all(plan.layer_topk_positions.numel() == 0 for plan in plans)
+    assert [plan.pair_offsets.tolist() for plan in plans] == [[1, 4], [2, 5, 0, 3]]
+    assert microbatches[0].topk_weights.squeeze(1).tolist() == pytest.approx([0.2, 0.5])
+    assert microbatches[1].topk_weights.squeeze(1).tolist() == pytest.approx(
+        [0.3, 0.6, 0.1, 0.4]
+    )
+
+
+def test_build_b2_wave_microbatch_plans_can_omit_logical_ids_with_slot_ids():
+    hidden_states = torch.arange(2 * 3, dtype=torch.float32).reshape(2, 3)
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    index = build_b2_routed_pair_index(topk_ids, topk_weights)
+
+    (plan,) = build_b2_wave_microbatch_plans(
+        index,
+        ((2, 1),),
+        preserve_pair_order=False,
+        include_logical_expert_ids=False,
+    )
+    assert plan.logical_expert_ids.numel() == 0
+
+    mb = build_b2_pair_microbatch_from_plan(
+        hidden_states,
+        topk_weights,
+        None,
+        plan,
+    )
+    assert mb.topk_ids.squeeze(1).tolist() == [0, 0, 1, 1]
+    assert mb.logical_expert_ids.numel() == 0
+
+    with pytest.raises(ValueError, match="omitted logical expert ids"):
+        build_b2_pair_microbatch_from_plan(
+            hidden_states,
+            topk_weights,
+            torch.arange(3, dtype=torch.long),
+            plan,
+        )
 
 
 def test_materialize_b2_pair_microbatches_from_plans_matches_per_wave_builder():
@@ -889,3 +1109,77 @@ def test_plan_capacity_bounded_phases_sets_slice_positions():
     # Logical ids must be the actual expert ids.
     assert wave0.expert_indices == (5, 10)
     assert wave1.expert_indices == (15, 20)
+
+
+def test_device_wave_microbatch_planner_matches_exact_pair_coverage():
+    from vllm_moe_offload_ascend.moe_offload.phase_split import (
+        build_b2_device_wave_microbatch_plans,
+        materialize_b2_pair_microbatches_from_plans,
+    )
+
+    topk_ids = torch.tensor([[3, 1], [2, 3], [0, 2]], dtype=torch.long)
+    topk_weights = torch.tensor(
+        [[0.6, 0.4], [0.7, 0.3], [0.8, 0.2]],
+        dtype=torch.float32,
+    )
+    waves = ((0, 3), (1, 2))
+    plans = build_b2_device_wave_microbatch_plans(
+        topk_ids,
+        waves,
+        wave_pair_counts=(3, 3),
+    )
+    hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    microbatches = materialize_b2_pair_microbatches_from_plans(
+        hidden,
+        topk_weights,
+        plans,
+    )
+
+    all_offsets = torch.cat(tuple(plan.pair_offsets for plan in plans))
+    assert all_offsets.sort().values.tolist() == list(range(6))
+    assert plans[0].physical_slot_ids.tolist() == [1, 1, 0]
+    assert plans[1].physical_slot_ids.tolist() == [0, 1, 1]
+    assert sum(batch.num_pairs for batch in microbatches) == 6
+    restored = torch.cat(
+        tuple(batch.restore_token_indices for batch in microbatches)
+    )
+    assert restored.sort().values.tolist() == [0, 0, 1, 1, 2, 2]
+
+
+def test_device_scatter_descriptor_preserves_exact_scatter_result():
+    from vllm_moe_offload_ascend.moe_offload.phase_split import (
+        B2DirectScatterPayload,
+        build_b2_device_scatter_descriptor,
+        direct_scatter_add_b2_permuted_outputs,
+    )
+
+    permuted = torch.tensor([[10.0, 1.0], [20.0, 2.0], [30.0, 3.0]])
+    expanded = torch.tensor([2, 0, 1], dtype=torch.int32)
+    weights = torch.tensor([[0.5], [0.25], [1.0]])
+    restore = torch.tensor([0, 1, 0], dtype=torch.long)
+    descriptor = build_b2_device_scatter_descriptor(
+        expanded_row_idx=expanded,
+        topk_weights=weights,
+        restore_token_indices=restore,
+        output_dtype=permuted.dtype,
+        output_device=permuted.device,
+    )
+    output = torch.zeros(2, 2)
+
+    direct_scatter_add_b2_permuted_outputs(
+        output,
+        (
+            B2DirectScatterPayload(
+                permuted_tokens=permuted,
+                expanded_row_idx=expanded,
+                topk_weights=weights,
+                restore_token_indices=restore,
+                device_descriptor=descriptor,
+            ),
+        ),
+    )
+
+    expected = torch.stack(
+        (permuted[2] * 0.5 + permuted[1], permuted[0] * 0.25)
+    )
+    assert torch.allclose(output, expected)

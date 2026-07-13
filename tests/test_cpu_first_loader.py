@@ -9,11 +9,12 @@ from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import (
     maybe_create_unquantized_cpu_first_weights,
     maybe_process_unquantized_cpu_first_weights,
 )
-from vllm_moe_offload_ascend.moe_offload.host_store import HostExpertStore
+from vllm_moe_offload_ascend.moe_offload.host_store import ExpertWeightBundle, HostExpertStore
 from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
 from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
 from vllm_moe_offload_ascend.moe_offload.transfer_engine import (
     TransferEngine,
+    _contiguous_load_runs,
     _try_batch_view,
 )
 
@@ -196,6 +197,52 @@ def test_transfer_engine_builds_batch_view_for_contiguous_host_experts():
     assert tuple(batch.shape) == (3, 2, 3)
     assert torch.equal(batch[2], store.get(7, 2).w13)
     assert _try_batch_view(non_contiguous) is None
+
+
+def test_transfer_engine_splits_run_around_non_contiguous_source():
+    layer = TinyLayer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(5 * 2 * 3, dtype=torch.float32).reshape(5, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(5 * 3 * 2, dtype=torch.float32).reshape(5, 3, 2),
+        requires_grad=False,
+    )
+    store = HostExpertStore()
+    store.register_layer(layer, clone_tensors=True)
+    bank = ExpertSlotBank(
+        5,
+        tuple(layer.w13_weight.shape[1:]),
+        tuple(layer.w2_weight.shape[1:]),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    detached_middle = ExpertWeightBundle(
+        layer_id=7,
+        expert_id=2,
+        w13=store.get(7, 2).w13.clone(),
+        w2=store.get(7, 2).w2.clone(),
+    )
+    bundles = (
+        store.get(7, 0),
+        store.get(7, 1),
+        detached_middle,
+        store.get(7, 3),
+        store.get(7, 4),
+    )
+    loads = tuple(
+        (bundle, bank.slots[slot_id])
+        for slot_id, bundle in enumerate(bundles)
+    )
+
+    runs = _contiguous_load_runs(loads)
+
+    assert [[bundle.expert_id for bundle, _ in run] for run in runs] == [
+        [0, 1],
+        [2],
+        [3, 4],
+    ]
 
 
 def test_transfer_engine_load_many_sync_copies_contiguous_run():

@@ -60,11 +60,12 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # to PHASE_UNKNOWN.  The stage op and its downstream consumer
 # (_maybe_run_b2_wave_prefill) must agree on the meaning of each value:
 #
-#   PHASE_DECODE  (0) — confirmed decode forward.  NEVER defer to the B2 wave
-#                       loop; a decode active set that exceeds num_slots is a
-#                       configuration error, not a recoverable overflow.
-#   PHASE_PREFILL (1) — confirmed prefill forward.  The B2 wave loop may claim
-#                       this call when active_count > num_slots.
+#   PHASE_DECODE  (0) — confirmed decode forward.
+#   PHASE_PREFILL (1) — confirmed prefill forward.
+#   PHASE_MIXED   (2) — scheduler batch contains both prefill and decode work.
+# For all three known phases, an active union larger than num_slots is handed
+# to the exact pair-wave executor. Every routed pair is computed once, so this
+# is a capacity mechanism rather than an approximation.
 #   PHASE_UNKNOWN (-1)— no reliable metadata (profile/dummy run).  Use only the
 #                       narrow overflow handshake (cache route-stats, let the
 #                       downstream B2 path decide) — do NOT treat as a confirmed
@@ -72,6 +73,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # ---------------------------------------------------------------------------
 PHASE_DECODE: int = 0
 PHASE_PREFILL: int = 1
+PHASE_MIXED: int = 2
 PHASE_UNKNOWN: int = -1
 
 
@@ -191,12 +193,10 @@ def _moe_offload_stage_impl(
     # D2H read of the active logical expert set. This is the host decision that
     # ACLGraph cannot record — legal here only because this op runs eager.
     flat_topk_ids = topk_ids.detach().reshape(-1).to("cpu", non_blocking=False)
-    active, counts = flat_topk_ids.unique(return_counts=True)
-    token_counts_by_expert = {
-        int(expert_id): int(count)
-        for expert_id, count in zip(active.tolist(), counts.tolist(), strict=True)
-        if 0 <= int(expert_id) < int(num_logical_experts) and int(count) > 0
-    }
+    token_counts_by_expert, flat_topk_id_list = _count_active_experts_from_cpu_topk(
+        flat_topk_ids,
+        num_logical_experts=int(num_logical_experts),
+    )
     active_experts = tuple(sorted(token_counts_by_expert))
 
     # B2 wave-streamed prefill deferral. When B2 is enabled and this is an eager
@@ -208,13 +208,9 @@ def _moe_offload_stage_impl(
     # topk_ids directly (its own per-wave log2phy), never reading this buffer.
     #
     # Phase semantics (see PHASE_* constants at the top of this module):
-    #   PHASE_PREFILL → B2 phase match when active_count > num_slots.
-    #   PHASE_DECODE  → NEVER defer.  An offloaded layer has no NPU full-weight
-    #                   copy, so a decode active set that exceeds num_slots cannot
-    #                   be wave-streamed (the downstream B2 path bails on confirmed
-    #                   decode).  Let stage_fixed_slot_plan raise its clear
-    #                   working-set guard error instead of silently leaving the
-    #                   previous step's log2phy in place (the corruption this fixes).
+    #   Known prefill/decode/mixed phases all defer capacity overflow to the exact
+    #   pair-wave executor. The stage seam caches the same route snapshot consumed
+    #   by the downstream executor, so it never leaves stale log2phy state behind.
     #   PHASE_UNKNOWN → narrow overflow handshake only: profile/dummy runs do not
     #                   expose phase metadata, so defer only when the working set
     #                   cannot fit AND the batch is too large to be a one-token-per-
@@ -222,11 +218,11 @@ def _moe_offload_stage_impl(
     #                   cannot rule out prefill.  The downstream B2 path consumes
     #                   this exact route-stats record before it is allowed to run.
     phase = int(phase)
-    active_count = len(set(active_experts))
-    b2_phase_match = runtime.should_use_b2_wave_prefill(
+    active_count = len(active_experts)
+    known_phase = phase in (PHASE_PREFILL, PHASE_DECODE, PHASE_MIXED)
+    b2_phase_match = known_phase and runtime.should_use_b2_pair_waves(
         layer_id=layer_id,
         active_expert_count=active_count,
-        is_prefill=(phase == PHASE_PREFILL),
     )
     max_num_seqs_hint = int(getattr(runtime.config, "max_num_seqs_hint", 0) or 0)
     token_count_hint = int(topk_ids.shape[0]) if topk_ids.ndim > 0 else 0
@@ -239,9 +235,16 @@ def _moe_offload_stage_impl(
         and active_count > int(runtime.config.num_slots)
     )
     if b2_phase_match or b2_overflow_fallback:
-        pair_offsets_by_expert: dict[int, tuple[int, ...]] = {}
-        if token_counts_by_expert:
-            flat_ids = [int(expert_id) for expert_id in flat_topk_ids.tolist()]
+        device_pair_planning = str(
+            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        pair_offsets_by_expert: dict[int, tuple[int, ...]] | None = None
+        if token_counts_by_expert and not device_pair_planning:
+            flat_ids = (
+                flat_topk_id_list
+                if flat_topk_id_list is not None
+                else [int(expert_id) for expert_id in flat_topk_ids.tolist()]
+            )
             buckets: dict[int, list[int]] = {
                 int(expert_id): [] for expert_id in token_counts_by_expert
             }
@@ -323,6 +326,43 @@ def _moe_offload_stage_impl(
             flush=True,
         )
     return
+
+
+def _count_active_experts_from_cpu_topk(
+    flat_topk_ids: torch.Tensor,
+    *,
+    num_logical_experts: int,
+    small_threshold: int = 64,
+) -> tuple[dict[int, int], list[int] | None]:
+    """Count active experts after the mandatory D2H route read.
+
+    Decode usually contributes only ``max_num_seqs * top_k`` ids (8 in the
+    current benchmark shape). For that tiny tensor, Python counting avoids the
+    overhead of a CPU ``torch.unique(return_counts=True)`` call on every
+    offloaded layer and every generated token. Prefill keeps the vectorized
+    unique path and rebuilds the flat id list only when B2 needs pair offsets.
+    """
+    if flat_topk_ids.numel() == 0:
+        return {}, []
+
+    flat_topk_ids = flat_topk_ids.reshape(-1)
+    if int(flat_topk_ids.numel()) <= int(small_threshold):
+        flat_ids = [int(expert_id) for expert_id in flat_topk_ids.tolist()]
+        counts: dict[int, int] = {}
+        for expert_id in flat_ids:
+            if 0 <= int(expert_id) < int(num_logical_experts):
+                counts[int(expert_id)] = counts.get(int(expert_id), 0) + 1
+        return counts, flat_ids
+
+    active, counts = flat_topk_ids.unique(return_counts=True)
+    return (
+        {
+            int(expert_id): int(count)
+            for expert_id, count in zip(active.tolist(), counts.tolist(), strict=True)
+            if 0 <= int(expert_id) < int(num_logical_experts) and int(count) > 0
+        },
+        None,
+    )
 
 
 def _moe_offload_stage_fake(

@@ -18,7 +18,6 @@
 from dataclasses import dataclass
 from enum import Enum
 from itertools import count
-import json
 import logging
 import os
 from pathlib import Path
@@ -38,6 +37,7 @@ from vllm_moe_offload_ascend.moe_offload.compute_bucket import (
 )
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
 from vllm_moe_offload_ascend.moe_offload.host_store import HostExpertStore
+from vllm_moe_offload_ascend.moe_offload.profile_io import append_jsonl
 from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
 from vllm_moe_offload_ascend.moe_offload.slot_mapping import ExpertSlotMapping, PreparedSlotWeights
 from vllm_moe_offload_ascend.moe_offload.trace_collector import TraceCollector, TraceRecord
@@ -57,6 +57,9 @@ class MoeOffloadMemoryLedger:
     original_expert_weight_bytes: int
     host_store_bytes: int
     slot_bank_bytes: int
+    prefill_stage_bank_count: int = 0
+    prefill_stage_bank_bytes: int = 0
+    prefill_stage_mapping_bytes: int = 0
 
     @property
     def original_expert_weights_retained(self) -> bool:
@@ -64,7 +67,21 @@ class MoeOffloadMemoryLedger:
 
     @property
     def total_managed_bytes(self) -> int:
-        return self.original_expert_weight_bytes + self.host_store_bytes + self.slot_bank_bytes
+        return (
+            self.original_expert_weight_bytes
+            + self.host_store_bytes
+            + self.slot_bank_bytes
+            + self.prefill_stage_bank_bytes
+            + self.prefill_stage_mapping_bytes
+        )
+
+    @property
+    def total_npu_slot_bytes(self) -> int:
+        return (
+            self.slot_bank_bytes
+            + self.prefill_stage_bank_bytes
+            + self.prefill_stage_mapping_bytes
+        )
 
     def to_jsonable(self) -> dict[str, int | bool]:
         return {
@@ -73,6 +90,10 @@ class MoeOffloadMemoryLedger:
             "original_expert_weight_bytes": int(self.original_expert_weight_bytes),
             "host_store_bytes": int(self.host_store_bytes),
             "slot_bank_bytes": int(self.slot_bank_bytes),
+            "prefill_stage_bank_count": int(self.prefill_stage_bank_count),
+            "prefill_stage_bank_bytes": int(self.prefill_stage_bank_bytes),
+            "prefill_stage_mapping_bytes": int(self.prefill_stage_mapping_bytes),
+            "total_npu_slot_bytes": int(self.total_npu_slot_bytes),
             "original_expert_weights_retained": self.original_expert_weights_retained,
             "total_managed_bytes": int(self.total_managed_bytes),
         }
@@ -160,7 +181,15 @@ class MoeOffloadRuntime:
         self._pending_trace_step_by_layer: dict[int, int] = {}
         self._host_store = HostExpertStore()
         self._slot_banks: dict[int, ExpertSlotBank] = {}
+        # Physical B2 stage buffers are layout-scoped, not layer-scoped. Layers
+        # execute serially through the MoE splitting seam, so equal-layout
+        # layers can safely lease the same double buffer when H2D waits for the
+        # previous compute-stream release event.
+        self._prefill_stage_pool: dict[tuple[object, ...], list[ExpertSlotBank]] = {}
         self._prefill_stage_banks: dict[int, list[ExpertSlotBank]] = {}
+        self._prefill_stage_pool_release_events: dict[
+            tuple[tuple[object, ...], int], object
+        ] = {}
         self._prefill_stage_log2phy_buffers: dict[int, list[torch.Tensor]] = {}
         self._original_expert_weight_bytes_by_layer: dict[int, int] = {}
         self._expert_weight_bytes_by_layer: dict[int, int] = {}
@@ -171,8 +200,10 @@ class MoeOffloadRuntime:
         # eager staging step. The captured graph reads this stable buffer, so the
         # data-dependent decision never enters the captured op stream.
         self._log2phy_buffers: dict[int, torch.Tensor] = {}
+        self._log2phy_slot_by_expert: dict[int, dict[int, int]] = {}
         self._transfer_engine = TransferEngine()
         self._profile_events: list[MoeOffloadProfileEvent] = []
+        self._memory_ledger_cache: MoeOffloadMemoryLedger | None = None
         self._compute_bucket_classifier: ComputeBucketClassifier | None = None
         self._compute_bucket_classifier_loaded = False
         self._prefill_route_stats_by_layer: dict[int, MoePrefillRouteStats] = {}
@@ -465,6 +496,8 @@ class MoeOffloadRuntime:
             dtype=torch.int32,
             device=device,
         )
+        self._log2phy_slot_by_expert[layer_id] = {}
+        self._invalidate_memory_ledger_cache()
         self._record_profile_event(
             "register_layer_for_fixed_slots",
             layer_id=layer_id,
@@ -484,15 +517,32 @@ class MoeOffloadRuntime:
         expert_ids: tuple[int, ...],
     ) -> dict[int, bool]:
         """Return whether each logical expert already has a READY fixed slot."""
+        readiness, _ = self.slot_readiness_and_ready_slot_ids_for_experts(
+            layer_id=layer_id,
+            expert_ids=expert_ids,
+        )
+        return readiness
+
+    def slot_readiness_and_ready_slot_ids_for_experts(
+        self,
+        *,
+        layer_id: int,
+        expert_ids: tuple[int, ...],
+    ) -> tuple[dict[int, bool], dict[int, int]]:
+        """Return READY status and main-slot ids with one slot-bank scan."""
         slot_bank = self._slot_banks.get(int(layer_id))
         if slot_bank is None:
-            return {int(expert_id): False for expert_id in expert_ids}
+            return {int(expert_id): False for expert_id in expert_ids}, {}
         readiness: dict[int, bool] = {}
+        ready_slot_ids: dict[int, int] = {}
         for expert_id in expert_ids:
-            key = ExpertKey(int(layer_id), int(expert_id))
-            slot = slot_bank.lookup(key)
-            readiness[int(expert_id)] = slot is not None and slot.state == SlotState.READY
-        return readiness
+            expert_id = int(expert_id)
+            slot = slot_bank.lookup_expert_id(expert_id)
+            is_ready = slot is not None and slot.state == SlotState.READY
+            readiness[expert_id] = is_ready
+            if is_ready:
+                ready_slot_ids[expert_id] = int(slot.slot_id)
+        return readiness, ready_slot_ids
 
     def ready_slot_ids_for_experts(
         self,
@@ -506,10 +556,10 @@ class MoeOffloadRuntime:
             return {}
         slot_ids: dict[int, int] = {}
         for expert_id in expert_ids:
-            key = ExpertKey(int(layer_id), int(expert_id))
-            slot = slot_bank.lookup(key)
+            expert_id = int(expert_id)
+            slot = slot_bank.lookup_expert_id(expert_id)
             if slot is not None and slot.state == SlotState.READY:
-                slot_ids[int(expert_id)] = int(slot.slot_id)
+                slot_ids[expert_id] = int(slot.slot_id)
         return slot_ids
 
     def estimate_expert_weight_bytes(
@@ -526,6 +576,16 @@ class MoeOffloadRuntime:
         if bundle.w2_scale is not None:
             total += _tensor_nbytes(bundle.w2_scale)
         return int(total)
+
+    def cached_layer_expert_weight_bytes(self, *, layer_id: int) -> int:
+        """Return the registered per-expert host bytes for uniform expert weights.
+
+        This is a fast-path estimate for B2 scheduling/profile aggregation.  It
+        avoids repeated host-store bundle lookups when all experts in a layer
+        share the same unquantized weight layout; callers that need exact
+        per-expert accounting should use ``estimate_expert_weight_bytes``.
+        """
+        return int(self._expert_weight_bytes_by_layer.get(int(layer_id), 0))
 
     def estimate_slot_expert_weight_bytes(
         self,
@@ -733,19 +793,66 @@ class MoeOffloadRuntime:
             return False
         return int(active_expert_count) > int(self.config.num_slots)
 
+    def should_use_b2_pair_waves(
+        self,
+        *,
+        layer_id: int,
+        active_expert_count: int,
+    ) -> bool:
+        """Gate the exact capacity-bounded executor for any serving phase.
+
+        Prefill, decode, and a scheduler-produced mixed batch all have the same
+        correctness requirement when their distinct expert union exceeds the
+        physical slot capacity: execute every routed pair exactly once across
+        bounded waves and scatter-add it back to its original token.
+        """
+        if not self.config.b2_wave_prefill:
+            return False
+        if not self.should_use_fixed_slot_plan_for_layer(int(layer_id)):
+            return False
+        return int(active_expert_count) > int(self.config.num_slots)
+
     def memory_ledger(self) -> MoeOffloadMemoryLedger:
+        cached = self._memory_ledger_cache
+        if cached is not None:
+            return cached
         original_bytes = sum(
             bytes_
             for layer_id, bytes_ in self._original_expert_weight_bytes_by_layer.items()
             if int(layer_id) not in self._released_original_weight_layers
         )
-        return MoeOffloadMemoryLedger(
+        # A later shared-pool implementation may expose the same physical bank
+        # through multiple layer entries. Count storage identity, not references.
+        unique_stage_banks = {
+            id(bank): bank
+            for banks in self._prefill_stage_banks.values()
+            for bank in banks
+        }
+        unique_stage_mappings = {
+            int(buffer.data_ptr()): buffer
+            for buffers in self._prefill_stage_log2phy_buffers.values()
+            for buffer in buffers
+        }
+        ledger = MoeOffloadMemoryLedger(
             registered_layers=len(self._slot_banks),
             host_experts=len(self._host_store),
             original_expert_weight_bytes=original_bytes,
             host_store_bytes=self._host_store.total_bytes,
             slot_bank_bytes=sum(slot_bank.total_bytes for slot_bank in self._slot_banks.values()),
+            prefill_stage_bank_count=len(unique_stage_banks),
+            prefill_stage_bank_bytes=sum(
+                bank.total_bytes for bank in unique_stage_banks.values()
+            ),
+            prefill_stage_mapping_bytes=sum(
+                _tensor_nbytes(buffer)
+                for buffer in unique_stage_mappings.values()
+            ),
         )
+        self._memory_ledger_cache = ledger
+        return ledger
+
+    def _invalidate_memory_ledger_cache(self) -> None:
+        self._memory_ledger_cache = None
 
     def profiling_summary(self) -> dict[str, object]:
         total_seconds_by_event: dict[str, float] = {}
@@ -893,6 +1000,7 @@ class MoeOffloadRuntime:
         release_layer_original_expert_weights(layer)
         self._released_original_weight_layers.add(layer_id)
         self._original_expert_weight_bytes_by_layer[layer_id] = 0
+        self._invalidate_memory_ledger_cache()
         self._record_profile_event(
             "release_original_expert_weights",
             layer_id=layer_id,
@@ -944,6 +1052,12 @@ class MoeOffloadRuntime:
             or _env_value("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
             or _env_value("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         )
+        profile_sample_rate = _decode_profile_sample_rate()
+        collect_profile = bool(collect_profile) and _should_sample_decode_profile(
+            step_id=step_id,
+            sample_rate=profile_sample_rate,
+        )
+        collect_profile_details = bool(collect_profile) and _profile_expert_lists_enabled()
         hit_experts: list[int] = []
         miss_experts: list[int] = []
         h2d_bytes = 0
@@ -952,6 +1066,11 @@ class MoeOffloadRuntime:
         _n_hits = 0
         _n_misses = 0
         stage_start = perf_counter() if collect_profile else 0.0
+        expert_weight_bytes = (
+            int(self._expert_weight_bytes_by_layer.get(layer_id, 0))
+            if collect_profile
+            else 0
+        )
         for expert_id in unique_active_experts:
             key = ExpertKey(layer_id, int(expert_id))
             slot = slot_bank.lookup(key)
@@ -961,7 +1080,7 @@ class MoeOffloadRuntime:
             if slot is not None and slot.state == SlotState.READY:
                 slot.last_used_step = int(step_id)
                 _n_hits += 1
-                if collect_profile:
+                if collect_profile_details:
                     hit_experts.append(int(expert_id))
                 continue
 
@@ -982,11 +1101,16 @@ class MoeOffloadRuntime:
                 ) from exc
             bundle = self._host_store.get(layer_id, int(expert_id))
             if collect_profile:
+                if expert_weight_bytes <= 0:
+                    expert_weight_bytes = int(
+                        self.estimate_expert_weight_bytes(
+                            layer_id=layer_id,
+                            expert_id=int(expert_id),
+                        )
+                    )
+                h2d_bytes += int(expert_weight_bytes)
+            if collect_profile_details:
                 miss_experts.append(int(expert_id))
-                h2d_bytes += self.estimate_expert_weight_bytes(
-                    layer_id=layer_id,
-                    expert_id=int(expert_id),
-                )
             sync_loads.append((bundle, slot))
 
         if sync_loads:
@@ -994,7 +1118,7 @@ class MoeOffloadRuntime:
             try:
                 self._transfer_engine.load_many_sync(
                     sync_loads,
-                    validate_layout=True,
+                    validate_layout=False,
                 )
             except Exception:
                 self._release_allocated_loads(slot_bank, sync_loads)
@@ -1012,32 +1136,41 @@ class MoeOffloadRuntime:
         )
         mapping_ms = (perf_counter() - mapping_start) * 1000.0 if collect_profile else 0.0
         if collect_profile:
+            payload = {
+                "n_active": int(len(unique_active_experts)),
+                "n_hits": int(_n_hits),
+                "n_misses": int(_n_misses),
+                "hit_rate": (
+                    round(float(_n_hits) / float(len(unique_active_experts)), 6)
+                    if unique_active_experts
+                    else 0.0
+                ),
+                "h2d_bytes": int(h2d_bytes),
+                "stage_ms": round(
+                    (perf_counter() - stage_start) * 1000.0,
+                    3,
+                ),
+                "load_sync_ms": round(float(load_sync_ms), 3),
+                "mapping_ms": round(float(mapping_ms), 3),
+                "step_id": int(step_id),
+                "num_slots": int(self.config.num_slots),
+                "profile_sample_rate": int(profile_sample_rate),
+            }
+            if collect_profile_details:
+                payload.update(
+                    {
+                        "active_experts": [int(e) for e in unique_active_experts],
+                        "hit_experts": hit_experts,
+                        "miss_experts": miss_experts,
+                    }
+                )
+            else:
+                payload["expert_lists"] = "omitted"
             self._record_profile_event(
                 "decode_fixed_slot_stage",
                 layer_id=layer_id,
                 start=mapping_start,
-                payload={
-                    "active_experts": [int(e) for e in unique_active_experts],
-                    "n_active": int(len(unique_active_experts)),
-                    "hit_experts": hit_experts,
-                    "miss_experts": miss_experts,
-                    "n_hits": int(len(hit_experts)),
-                    "n_misses": int(len(miss_experts)),
-                    "hit_rate": (
-                        round(float(len(hit_experts)) / float(len(unique_active_experts)), 6)
-                        if unique_active_experts
-                        else 0.0
-                    ),
-                    "h2d_bytes": int(h2d_bytes),
-                    "stage_ms": round(
-                        (perf_counter() - stage_start) * 1000.0,
-                        3,
-                    ),
-                    "load_sync_ms": round(float(load_sync_ms), 3),
-                    "mapping_ms": round(float(mapping_ms), 3),
-                    "step_id": int(step_id),
-                    "num_slots": int(self.config.num_slots),
-                },
+                payload=payload,
             )
         return PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
 
@@ -1096,6 +1229,12 @@ class MoeOffloadRuntime:
             or _env_value("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
             or _env_value("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         )
+        profile_sample_rate = _decode_profile_sample_rate()
+        collect_profile = bool(collect_profile) and _should_sample_decode_profile(
+            step_id=step_id,
+            sample_rate=profile_sample_rate,
+        )
+        collect_profile_details = bool(collect_profile) and _profile_expert_lists_enabled()
         hit_experts: list[int] = []
         miss_experts: list[int] = []
         h2d_bytes = 0
@@ -1108,6 +1247,11 @@ class MoeOffloadRuntime:
         _n_hits = 0
         _n_misses = 0
         stage_start = perf_counter() if collect_profile else 0.0
+        expert_weight_bytes = (
+            int(self._expert_weight_bytes_by_layer.get(layer_id, 0))
+            if collect_profile
+            else 0
+        )
 
         active_slot_ids: list[int] = []
         slot_to_expert: list[int | None] = [None] * len(slot_bank.slots)
@@ -1120,7 +1264,7 @@ class MoeOffloadRuntime:
             if slot is not None and slot.state == SlotState.READY:
                 slot.last_used_step = int(step_id)
                 _n_hits += 1
-                if collect_profile:
+                if collect_profile_details:
                     hit_experts.append(int(expert_id))
             else:
                 _n_misses += 1
@@ -1140,11 +1284,16 @@ class MoeOffloadRuntime:
                     ) from exc
                 bundle = self._host_store.get(layer_id, int(expert_id))
                 if collect_profile:
+                    if expert_weight_bytes <= 0:
+                        expert_weight_bytes = int(
+                            self.estimate_expert_weight_bytes(
+                                layer_id=layer_id,
+                                expert_id=int(expert_id),
+                            )
+                        )
+                    h2d_bytes += int(expert_weight_bytes)
+                if collect_profile_details:
                     miss_experts.append(int(expert_id))
-                    h2d_bytes += self.estimate_expert_weight_bytes(
-                        layer_id=layer_id,
-                        expert_id=int(expert_id),
-                    )
                 if self.config.async_load:
                     async_loads.append((bundle, slot))
                 else:
@@ -1156,7 +1305,7 @@ class MoeOffloadRuntime:
             try:
                 self._transfer_engine.load_many_sync(
                     sync_loads,
-                    validate_layout=True,
+                    validate_layout=False,
                 )
             except Exception:
                 self._release_allocated_loads(slot_bank, sync_loads)
@@ -1170,7 +1319,7 @@ class MoeOffloadRuntime:
                 ready_event = self._transfer_engine.load_many_async(
                     async_loads,
                     record_event=True,
-                    validate_layout=True,
+                    validate_layout=False,
                 )
             except Exception:
                 self._release_allocated_loads(slot_bank, async_loads)
@@ -1179,17 +1328,35 @@ class MoeOffloadRuntime:
                 load_enqueue_ms = (perf_counter() - load_start) * 1000.0
 
         mapping_start = perf_counter() if collect_profile else 0.0
+        active_slot_ids_tuple = tuple(active_slot_ids)
+        log2phy_update_experts, log2phy_update_slots = (
+            self._changed_log2phy_entries(
+                layer_id=layer_id,
+                expert_ids=unique_active_experts,
+                slot_ids=active_slot_ids_tuple,
+            )
+        )
+        if log2phy_update_experts:
+            _update_log2phy_entries(
+                log2phy,
+                expert_ids=log2phy_update_experts,
+                slot_ids=log2phy_update_slots,
+            )
+            self._remember_log2phy_entries(
+                layer_id=layer_id,
+                expert_ids=log2phy_update_experts,
+                slot_ids=log2phy_update_slots,
+            )
         for expert_id, slot_id in zip(unique_active_experts, active_slot_ids, strict=True):
-            log2phy[int(expert_id)] = int(slot_id)
             slot_to_expert[int(slot_id)] = int(expert_id)
         mapping = ExpertSlotMapping(
             layer_id=layer_id,
             active_experts=unique_active_experts,
             logical_to_physical=log2phy,
             slot_to_expert=tuple(slot_to_expert),
-            active_slot_ids=tuple(active_slot_ids),
+            active_slot_ids=active_slot_ids_tuple,
         )  # log2phy updated in-place above; always valid on this path
-        self._active_slot_ids_by_layer[layer_id] = tuple(active_slot_ids)
+        self._active_slot_ids_by_layer[layer_id] = active_slot_ids_tuple
         mapping_ms = (perf_counter() - mapping_start) * 1000.0 if collect_profile else 0.0
         if ready_event is not None:
             wait_start = perf_counter() if collect_profile else 0.0
@@ -1198,44 +1365,88 @@ class MoeOffloadRuntime:
                 ready_wait_ms = (perf_counter() - wait_start) * 1000.0
                 load_sync_ms += load_enqueue_ms + ready_wait_ms
         if collect_profile:
-            if not miss_experts:
+            if _n_misses <= 0:
                 stage_mode = "main_slot_hit"
             elif async_loads:
                 stage_mode = "async_decode_load_many"
             else:
                 stage_mode = "sync_decode_load"
+            payload = {
+                "n_active": int(len(unique_active_experts)),
+                "n_hits": int(_n_hits),
+                "n_misses": int(_n_misses),
+                "hit_rate": (
+                    round(float(_n_hits) / float(len(unique_active_experts)), 6)
+                    if unique_active_experts
+                    else 0.0
+                ),
+                "h2d_bytes": int(h2d_bytes),
+                "stage_ms": round(
+                    (perf_counter() - stage_start) * 1000.0,
+                    3,
+                ),
+                "load_sync_ms": round(float(load_sync_ms), 3),
+                "load_enqueue_ms": round(float(load_enqueue_ms), 3),
+                "ready_wait_ms": round(float(ready_wait_ms), 3),
+                "mapping_ms": round(float(mapping_ms), 3),
+                "step_id": int(step_id),
+                "num_slots": int(self.config.num_slots),
+                "mapping_mode": "persistent_log2phy",
+                "log2phy_update_count": int(len(log2phy_update_experts)),
+                "stage_mode": stage_mode,
+                "profile_sample_rate": int(profile_sample_rate),
+            }
+            if collect_profile_details:
+                payload.update(
+                    {
+                        "active_experts": [int(e) for e in unique_active_experts],
+                        "hit_experts": hit_experts,
+                        "miss_experts": miss_experts,
+                    }
+                )
+            else:
+                payload["expert_lists"] = "omitted"
             self._record_profile_event(
                 "decode_fixed_slot_stage",
                 layer_id=layer_id,
                 start=mapping_start,
-                payload={
-                    "active_experts": [int(e) for e in unique_active_experts],
-                    "n_active": int(len(unique_active_experts)),
-                    "hit_experts": hit_experts,
-                    "miss_experts": miss_experts,
-                    "n_hits": int(len(hit_experts)),
-                    "n_misses": int(len(miss_experts)),
-                    "hit_rate": (
-                        round(float(len(hit_experts)) / float(len(unique_active_experts)), 6)
-                        if unique_active_experts
-                        else 0.0
-                    ),
-                    "h2d_bytes": int(h2d_bytes),
-                    "stage_ms": round(
-                        (perf_counter() - stage_start) * 1000.0,
-                        3,
-                    ),
-                    "load_sync_ms": round(float(load_sync_ms), 3),
-                    "load_enqueue_ms": round(float(load_enqueue_ms), 3),
-                    "ready_wait_ms": round(float(ready_wait_ms), 3),
-                    "mapping_ms": round(float(mapping_ms), 3),
-                    "step_id": int(step_id),
-                    "num_slots": int(self.config.num_slots),
-                    "mapping_mode": "persistent_log2phy",
-                    "stage_mode": stage_mode,
-                },
+                payload=payload,
             )
         return PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
+
+    def _changed_log2phy_entries(
+        self,
+        *,
+        layer_id: int,
+        expert_ids: tuple[int, ...],
+        slot_ids: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if len(expert_ids) != len(slot_ids):
+            raise ValueError(
+                f"expert_ids and slot_ids length mismatch: {len(expert_ids)} != {len(slot_ids)}"
+            )
+        cached = self._log2phy_slot_by_expert.setdefault(int(layer_id), {})
+        update_experts: list[int] = []
+        update_slots: list[int] = []
+        for expert_id, slot_id in zip(expert_ids, slot_ids, strict=True):
+            expert_id = int(expert_id)
+            slot_id = int(slot_id)
+            if cached.get(expert_id) == slot_id:
+                continue
+            update_experts.append(expert_id)
+            update_slots.append(slot_id)
+        return tuple(update_experts), tuple(update_slots)
+
+    def _remember_log2phy_entries(
+        self,
+        *,
+        layer_id: int,
+        expert_ids: tuple[int, ...],
+        slot_ids: tuple[int, ...],
+    ) -> None:
+        cached = self._log2phy_slot_by_expert.setdefault(int(layer_id), {})
+        for expert_id, slot_id in zip(expert_ids, slot_ids, strict=True):
+            cached[int(expert_id)] = int(slot_id)
 
     def prepare_ready_slot_plan(
         self,
@@ -1372,6 +1583,11 @@ class MoeOffloadRuntime:
             buffer_index=int(buffer_index),
             template_bank=src_bank,
         )
+        if wait_event is None:
+            wait_event = self.prefill_stage_buffer_release_event(
+                layer_id=layer_id,
+                buffer_index=int(buffer_index),
+            )
         log2phy = self._get_prefill_stage_log2phy_buffer(
             layer_id=layer_id,
             buffer_index=int(buffer_index),
@@ -1563,8 +1779,12 @@ class MoeOffloadRuntime:
     ) -> ExpertSlotBank:
         if buffer_index < 0:
             raise ValueError(f"buffer_index must be non-negative, got {buffer_index}")
-        banks = self._prefill_stage_banks.setdefault(int(layer_id), [])
+        pool_key = self._prefill_stage_pool_key(template_bank)
+        banks = self._prefill_stage_pool.setdefault(pool_key, [])
+        self._prefill_stage_banks[int(layer_id)] = banks
         while len(banks) <= int(buffer_index):
+            allocation_start = perf_counter()
+            hbm_before = self._npu_hbm_snapshot(template_bank.w13_slots.device)
             banks.append(
                 ExpertSlotBank(
                     len(template_bank.slots),
@@ -1574,7 +1794,71 @@ class MoeOffloadRuntime:
                     device=template_bank.w13_slots.device,
                 )
             )
+            self._invalidate_memory_ledger_cache()
+            hbm_after = self._npu_hbm_snapshot(template_bank.w13_slots.device)
+            self._record_profile_event(
+                "prefill_stage_bank_allocate",
+                layer_id=int(layer_id),
+                start=allocation_start,
+                payload={
+                    "buffer_index": int(len(banks) - 1),
+                    "bank_bytes": int(banks[-1].total_bytes),
+                    "hbm_before": hbm_before,
+                    "hbm_after": hbm_after,
+                    "allocated_delta_bytes": int(
+                        hbm_after.get("allocated_bytes", 0)
+                        - hbm_before.get("allocated_bytes", 0)
+                    ),
+                    "free_delta_bytes": int(
+                        hbm_after.get("free_bytes", 0)
+                        - hbm_before.get("free_bytes", 0)
+                    ),
+                },
+            )
         return banks[int(buffer_index)]
+
+    def _prefill_stage_pool_key(
+        self,
+        template_bank: ExpertSlotBank,
+    ) -> tuple[object, ...]:
+        return (
+            str(template_bank.w13_slots.device),
+            str(template_bank.w13_slots.dtype),
+            len(template_bank.slots),
+            tuple(int(dim) for dim in template_bank.w13_slots.shape[1:]),
+            tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
+            tuple(int(stride) for stride in template_bank.w13_slots.stride()),
+            tuple(int(stride) for stride in template_bank.w2_slots.stride()),
+        )
+
+    def prefill_stage_buffer_release_event(
+        self,
+        *,
+        layer_id: int,
+        buffer_index: int,
+    ) -> object | None:
+        template_bank = self._slot_banks.get(int(layer_id))
+        if template_bank is None:
+            return None
+        key = self._prefill_stage_pool_key(template_bank)
+        return self._prefill_stage_pool_release_events.get(
+            (key, int(buffer_index))
+        )
+
+    def remember_prefill_stage_buffer_release(
+        self,
+        *,
+        layer_id: int,
+        buffer_index: int,
+        event: object | None,
+    ) -> None:
+        if event is None:
+            return
+        template_bank = self._slot_banks.get(int(layer_id))
+        if template_bank is None:
+            return
+        key = self._prefill_stage_pool_key(template_bank)
+        self._prefill_stage_pool_release_events[(key, int(buffer_index))] = event
 
     def _get_prefill_stage_log2phy_buffer(
         self,
@@ -1597,6 +1881,7 @@ class MoeOffloadRuntime:
                     device=device,
                 )
             )
+            self._invalidate_memory_ledger_cache()
         buf = buffers[int(buffer_index)]
         if int(buf.numel()) != int(num_logical_experts):
             raise RuntimeError(
@@ -1610,6 +1895,28 @@ class MoeOffloadRuntime:
                 f"{buffer_index} is on {buf.device}, expected {device}"
             )
         return buf
+
+    def _npu_hbm_snapshot(self, device: torch.device) -> dict[str, object]:
+        """Best-effort allocator/physical-HBM snapshot for allocation evidence."""
+        if device.type != "npu":
+            return {}
+        try:
+            npu = getattr(torch, "npu", None)
+            if npu is None:
+                return {}
+            index = device.index
+            if index is None:
+                index = int(npu.current_device())
+            free_bytes, total_bytes = npu.mem_get_info(int(index))
+            return {
+                "device_index": int(index),
+                "allocated_bytes": int(npu.memory_allocated(int(index))),
+                "reserved_bytes": int(npu.memory_reserved(int(index))),
+                "free_bytes": int(free_bytes),
+                "total_bytes": int(total_bytes),
+            }
+        except Exception as exc:
+            return {"snapshot_error": str(exc)}
 
     # --- Option 2: graph-compatible offload via decision/execution decoupling ---
 
@@ -1819,10 +2126,7 @@ class MoeOffloadRuntime:
         )
         if not profile_path:
             return
-        path = Path(profile_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event.to_jsonable(), sort_keys=True) + "\n")
+        append_jsonl(profile_path, event.to_jsonable())
 
     def _append_trace_record_jsonl(self, record: TraceRecord) -> None:
         trace_path = (
@@ -1832,10 +2136,7 @@ class MoeOffloadRuntime:
         )
         if not trace_path:
             return
-        path = Path(trace_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record.to_jsonable(), sort_keys=True) + "\n")
+        append_jsonl(trace_path, record.to_jsonable())
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -1845,6 +2146,24 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
 def _to_bool_env(name: str, default: str = "0") -> bool:
     value = os.getenv(name, default)
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _profile_expert_lists_enabled() -> bool:
+    value = os.getenv("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "1")
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _decode_profile_sample_rate() -> int:
+    value = os.getenv("VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE", "1")
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _should_sample_decode_profile(*, step_id: int, sample_rate: int) -> bool:
+    rate = max(1, int(sample_rate))
+    return rate <= 1 or int(step_id) % rate == 0
 
 
 def _is_current_graph_capturing() -> bool:
@@ -1905,3 +2224,39 @@ def _validate_active_expert_ids(
             f"num_logical_experts={int(num_logical_experts)}, "
             f"expert_ids={invalid_expert_ids}"
         )
+
+
+def _update_log2phy_entries(
+    log2phy: torch.Tensor,
+    *,
+    expert_ids: list[int] | tuple[int, ...],
+    slot_ids: list[int] | tuple[int, ...],
+) -> None:
+    """Update the active logical->physical entries in one tensor op.
+
+    Decode staging used to write one scalar ``log2phy[expert] = slot`` per
+    active expert. On NPU that becomes several tiny device writes on every
+    offloaded layer, and profiling shows this fixed mapping cost dominates even
+    hit-only decode steps. Batched ``index_copy_`` preserves the active-only
+    update contract while cutting the number of enqueued mapping ops.
+    """
+    if len(expert_ids) != len(slot_ids):
+        raise ValueError(
+            f"expert_ids and slot_ids length mismatch: {len(expert_ids)} != {len(slot_ids)}"
+        )
+    if not expert_ids:
+        return
+    if len(expert_ids) == 1:
+        log2phy[int(expert_ids[0])] = int(slot_ids[0])
+        return
+    index = torch.as_tensor(
+        tuple(int(expert_id) for expert_id in expert_ids),
+        dtype=torch.long,
+        device=log2phy.device,
+    )
+    values = torch.as_tensor(
+        tuple(int(slot_id) for slot_id in slot_ids),
+        dtype=log2phy.dtype,
+        device=log2phy.device,
+    )
+    log2phy.index_copy_(0, index, values)

@@ -72,6 +72,13 @@ class TransferEngine:
         import torch
 
         LayoutValidator.validate_copy_compatible(bundle, slot.as_bundle())
+        if _loads_target_cpu(((bundle, slot),)):
+            _wait_for_event(wait_event)
+            slot.state = SlotState.LOADING
+            _copy_loads(((bundle, slot),), non_blocking=False)
+            slot.state = SlotState.READY
+            return None
+
         stream = self._get_h2d_stream()
         if wait_event is not None:
             stream.wait_event(getattr(wait_event, "event", wait_event))
@@ -104,6 +111,15 @@ class TransferEngine:
         if validate_layout:
             for bundle, slot in loads:
                 LayoutValidator.validate_copy_compatible(bundle, slot.as_bundle())
+
+        if _loads_target_cpu(tuple(loads)):
+            _wait_for_event(wait_event)
+            for _, slot in loads:
+                slot.state = SlotState.LOADING
+            _copy_loads(tuple(loads), non_blocking=False)
+            for _, slot in loads:
+                slot.state = SlotState.READY
+            return None
 
         stream = self._get_h2d_stream()
         if wait_event is not None:
@@ -163,6 +179,21 @@ def _copy_loads(
         dst_w2.copy_(src_w2, non_blocking=non_blocking)
 
 
+def _loads_target_cpu(
+    loads: tuple[tuple[ExpertWeightBundle, ExpertSlot], ...],
+) -> bool:
+    return all(slot.w13.device.type == "cpu" and slot.w2.device.type == "cpu" for _, slot in loads)
+
+
+def _wait_for_event(wait_event) -> None:
+    if wait_event is None:
+        return
+    event = getattr(wait_event, "event", wait_event)
+    synchronize = getattr(event, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+
+
 def _contiguous_load_runs(
     loads: tuple[tuple[ExpertWeightBundle, ExpertSlot], ...],
 ) -> tuple[tuple[tuple[ExpertWeightBundle, ExpertSlot], ...], ...]:
@@ -171,13 +202,14 @@ def _contiguous_load_runs(
     previous_bundle: ExpertWeightBundle | None = None
     previous_slot: ExpertSlot | None = None
     for bundle, slot in loads:
-        can_extend = (
-            previous_bundle is not None
-            and previous_slot is not None
-            and int(bundle.layer_id) == int(previous_bundle.layer_id)
-            and int(bundle.expert_id) == int(previous_bundle.expert_id) + 1
-            and int(slot.slot_id) == int(previous_slot.slot_id) + 1
-        )
+        can_extend = previous_bundle is not None and previous_slot is not None
+        if can_extend:
+            can_extend = _can_batch_after(
+                previous_bundle,
+                previous_slot,
+                bundle,
+                slot,
+            )
         if not can_extend and current:
             runs.append(current)
             current = []
@@ -187,6 +219,39 @@ def _contiguous_load_runs(
     if current:
         runs.append(current)
     return tuple(tuple(run) for run in runs)
+
+
+def _can_batch_after(
+    previous_bundle: ExpertWeightBundle,
+    previous_slot: ExpertSlot,
+    bundle: ExpertWeightBundle,
+    slot: ExpertSlot,
+) -> bool:
+    return (
+        int(bundle.layer_id) == int(previous_bundle.layer_id)
+        and int(bundle.expert_id) == int(previous_bundle.expert_id) + 1
+        and int(slot.slot_id) == int(previous_slot.slot_id) + 1
+        and _tensor_is_next_contiguous(previous_bundle.w13, bundle.w13)
+        and _tensor_is_next_contiguous(previous_bundle.w2, bundle.w2)
+        and _tensor_is_next_contiguous(previous_slot.w13, slot.w13)
+        and _tensor_is_next_contiguous(previous_slot.w2, slot.w2)
+    )
+
+
+def _tensor_is_next_contiguous(previous, current) -> bool:
+    if current.device != previous.device or current.dtype != previous.dtype:
+        return False
+    if tuple(current.shape) != tuple(previous.shape):
+        return False
+    if tuple(current.stride()) != tuple(previous.stride()):
+        return False
+    element_size = int(previous.element_size())
+    delta_bytes = int(current.data_ptr()) - int(previous.data_ptr())
+    return (
+        delta_bytes > 0
+        and delta_bytes % element_size == 0
+        and int(delta_bytes // element_size) == int(previous.numel())
+    )
 
 
 def _try_batch_view(tensors: tuple[object, ...]):

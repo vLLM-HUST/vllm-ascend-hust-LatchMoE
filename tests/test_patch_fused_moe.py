@@ -178,6 +178,103 @@ def test_b2_wave_profile_summary_reports_overlap_and_stage_breakdown():
     assert summary["max_stage_wait_ms"] == 4.5
 
 
+def test_b2_profile_details_omitted_by_default(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _attach_b2_profile_details,
+    )
+
+    class Jsonable:
+        def to_jsonable(self):
+            raise AssertionError("default details must not materialize json")
+
+    monkeypatch.delenv("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", raising=False)
+    payload = _attach_b2_profile_details(
+        {"wave_summary": {"wave_count": 1}},
+        wave_plan=Jsonable(),
+        async_schedule=Jsonable(),
+        async_stage=True,
+        wave_profiles=[{"experts": [1, 2], "h2d_bytes": 128}],
+    )
+
+    assert payload == {
+        "wave_summary": {"wave_count": 1},
+        "profile_details": "omitted",
+    }
+
+
+def test_b2_profile_details_can_be_enabled(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _attach_b2_profile_details,
+    )
+
+    class Jsonable:
+        def __init__(self, value):
+            self.value = value
+
+        def to_jsonable(self):
+            return self.value
+
+    monkeypatch.setenv("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", "1")
+    payload = _attach_b2_profile_details(
+        {"wave_summary": {"wave_count": 2}},
+        wave_plan=Jsonable({"waves": [[3, 4]]}),
+        async_schedule=Jsonable({"enabled": True}),
+        async_stage=True,
+        wave_profiles=[{"experts": [3, 4], "h2d_bytes": 256}],
+    )
+
+    assert payload["wave_summary"] == {"wave_count": 2}
+    assert payload["wave_plan"] == {"waves": [[3, 4]]}
+    assert payload["async_schedule"] == {"enabled": True}
+    assert payload["waves"] == [{"experts": [3, 4], "h2d_bytes": 256}]
+    assert "profile_details" not in payload
+
+
+def test_estimate_b2_wave_h2d_bytes_uses_cached_layer_bytes():
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _estimate_b2_wave_h2d_bytes,
+    )
+
+    class FakeRuntime:
+        def cached_layer_expert_weight_bytes(self, *, layer_id):
+            assert layer_id == 7
+            return 128
+
+        def estimate_expert_weight_bytes(self, **kwargs):
+            raise AssertionError("cached layer bytes should avoid per-expert estimates")
+
+    assert _estimate_b2_wave_h2d_bytes(
+        FakeRuntime(),
+        layer_id=7,
+        wave=(1, 2, 3, 4),
+        readiness={2: True},
+    ) == 128 * 3
+
+
+def test_estimate_b2_wave_h2d_bytes_falls_back_without_cache():
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _estimate_b2_wave_h2d_bytes,
+    )
+
+    class FakeRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def estimate_expert_weight_bytes(self, *, layer_id, expert_id):
+            self.calls.append((layer_id, expert_id))
+            return 10 + int(expert_id)
+
+    runtime = FakeRuntime()
+
+    assert _estimate_b2_wave_h2d_bytes(
+        runtime,
+        layer_id=7,
+        wave=(1, 2, 3),
+        readiness={2: True},
+    ) == 24
+    assert runtime.calls == [(7, 1), (7, 3)]
+
+
 def test_register_aliases_plugin_modules_under_vllm_ascend_namespace(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14")
 
@@ -448,7 +545,7 @@ def test_b2_prefill_skips_resident_layer_before_route_stats(monkeypatch):
     ]
 
 
-def test_b2_does_not_treat_multi_request_decode_as_prefill(monkeypatch):
+def test_b2_runs_exact_pair_waves_for_multi_request_decode_overflow(monkeypatch):
     import torch
 
     import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
@@ -471,13 +568,16 @@ def test_b2_does_not_treat_multi_request_decode_as_prefill(monkeypatch):
         )
 
         def is_resident_layer(self, layer_id):
-            raise AssertionError("decode path must not run prefill resident check")
+            return False
 
         def should_use_fixed_slot_plan_for_layer(self, layer_id):
-            raise AssertionError("decode path must not inspect B2 fixed-slot plan")
+            return True
 
         def consume_prefill_route_stats_record(self, **kwargs):
-            raise AssertionError("decode path must not consume prefill route stats")
+            return None
+
+        def should_use_b2_pair_waves(self, *, layer_id, active_expert_count):
+            return active_expert_count > 2
 
     monkeypatch.setattr(patch_fused_moe, "_current_forward_is_prefill", lambda: False)
     monkeypatch.setattr(
@@ -502,9 +602,8 @@ def test_b2_does_not_treat_multi_request_decode_as_prefill(monkeypatch):
     comm = FakeCommMethod()
     TokenDispatcherWithAllGather = type("TokenDispatcherWithAllGather", (), {})
     comm.token_dispatcher = TokenDispatcherWithAllGather()
-    comm._run_b2_wave_prefill = lambda **kwargs: (_ for _ in ()).throw(
-        AssertionError("decode batch must not run B2")
-    )
+    calls = []
+    comm._run_b2_wave_prefill = lambda **kwargs: calls.append(kwargs) or "b2"
     fused_experts_input = SimpleNamespace(
         hidden_states=torch.empty((4, 16)),
         topk_ids=torch.tensor([[1, 2], [2, 3], [3, 4], [4, 5]]),
@@ -514,7 +613,8 @@ def test_b2_does_not_treat_multi_request_decode_as_prefill(monkeypatch):
     assert comm._maybe_run_b2_wave_prefill(
         fused_experts_input,
         before_dispatch_evt=None,
-    ) is None
+    ) == "b2"
+    assert calls[0]["control_profile"]["forward_phase"] == "decode"
 
 
 def test_stage_op_defers_capacity_overflow_to_b2_without_phase_hint(monkeypatch):
@@ -641,13 +741,7 @@ def test_stage_op_does_not_defer_decode_overflow_without_shape_hint(monkeypatch)
     assert runtime.cached is None
 
 
-def test_stage_op_confirmed_decode_overflow_fails_closed_even_with_b2(monkeypatch):
-    """H3 regression: a CONFIRMED decode whose active set exceeds num_slots must
-    NOT be deferred to B2 (the downstream B2 path bails on decode, which would
-    leave the previous step's log2phy stale and mis-route).  Even with a large
-    prefill-shaped token count, PHASE_DECODE must fail-close via the working-set
-    guard rather than silently cache-and-skip.
-    """
+def test_stage_op_confirmed_decode_overflow_defers_to_exact_pair_waves(monkeypatch):
     import torch
 
     import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
@@ -674,15 +768,15 @@ def test_stage_op_confirmed_decode_overflow_fails_closed_even_with_b2(monkeypatc
         def is_layer_registered(self, layer_id):
             return True
 
-        def should_use_b2_wave_prefill(self, *, layer_id, active_expert_count, is_prefill):
-            return bool(is_prefill) and active_expert_count > self.config.num_slots
+        def should_use_b2_pair_waves(self, *, layer_id, active_expert_count):
+            return active_expert_count > self.config.num_slots
 
         def cache_prefill_route_stats(self, **kwargs):
             self.cached = kwargs
 
         def stage_fixed_slot_plan(self, **kwargs):
             self.stage_calls += 1
-            raise RuntimeError("working set overflow")
+            raise AssertionError("decode overflow must hand off to exact pair waves")
 
     runtime = FakeRuntime()
     monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
@@ -690,16 +784,15 @@ def test_stage_op_confirmed_decode_overflow_fails_closed_even_with_b2(monkeypatc
 
     # Many tokens (prefill-shaped) but phase is CONFIRMED decode.
     topk_ids = torch.tensor([[0, 1, 2, 3]] * 8, dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="working set overflow"):
-        moe_offload_stage_op._moe_offload_stage_impl(
-            topk_ids,
-            layer_id=7,
-            num_logical_experts=64,
-            phase=moe_offload_stage_op.PHASE_DECODE,
-        )
+    moe_offload_stage_op._moe_offload_stage_impl(
+        topk_ids,
+        layer_id=7,
+        num_logical_experts=64,
+        phase=moe_offload_stage_op.PHASE_DECODE,
+    )
 
-    assert runtime.stage_calls == 1
-    assert runtime.cached is None
+    assert runtime.stage_calls == 0
+    assert runtime.cached is not None
 
 
 def test_stage_op_confirmed_prefill_overflow_defers_to_b2(monkeypatch):
@@ -731,8 +824,8 @@ def test_stage_op_confirmed_prefill_overflow_defers_to_b2(monkeypatch):
         def is_layer_registered(self, layer_id):
             return True
 
-        def should_use_b2_wave_prefill(self, *, layer_id, active_expert_count, is_prefill):
-            return bool(is_prefill) and active_expert_count > self.config.num_slots
+        def should_use_b2_pair_waves(self, *, layer_id, active_expert_count):
+            return active_expert_count > self.config.num_slots
 
         def cache_prefill_route_stats(self, **kwargs):
             self.cached = kwargs
@@ -756,6 +849,39 @@ def test_stage_op_confirmed_prefill_overflow_defers_to_b2(monkeypatch):
     assert runtime.stage_calls == 0
     assert runtime.cached is not None
     assert runtime.cached["layer_id"] == 7
+
+
+def test_stage_op_small_topk_counter_uses_python_counts_and_keeps_flat_ids():
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+        _count_active_experts_from_cpu_topk,
+    )
+
+    counts, flat_ids = _count_active_experts_from_cpu_topk(
+        torch.tensor([3, 1, 3, -1, 7, 129], dtype=torch.int64),
+        num_logical_experts=128,
+    )
+
+    assert counts == {1: 1, 3: 2, 7: 1}
+    assert flat_ids == [3, 1, 3, -1, 7, 129]
+
+
+def test_stage_op_large_topk_counter_does_not_keep_flat_ids():
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+        _count_active_experts_from_cpu_topk,
+    )
+
+    counts, flat_ids = _count_active_experts_from_cpu_topk(
+        torch.tensor([0, 1, 1, 2, 2, 2], dtype=torch.int64),
+        num_logical_experts=128,
+        small_threshold=2,
+    )
+
+    assert counts == {0: 1, 1: 2, 2: 3}
+    assert flat_ids is None
 
 
 # ---------------------------------------------------------------------------

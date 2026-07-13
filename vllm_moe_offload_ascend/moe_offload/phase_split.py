@@ -28,13 +28,13 @@ top-k / token count.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
+from itertools import repeat
 from time import perf_counter
 from typing import TYPE_CHECKING
 
 from vllm_ascend import envs
+from vllm_moe_offload_ascend.moe_offload.profile_io import append_jsonl
 
 if TYPE_CHECKING:
     import torch
@@ -247,6 +247,7 @@ class B2WaveMicrobatchPlan:
     topk_positions: "torch.Tensor"
     logical_expert_ids: "torch.Tensor"
     physical_slot_ids: "torch.Tensor"
+    flat_pair_offsets: "torch.Tensor | None" = None
     top_k: int = 1
     layer_pair_start: int = 0
     layer_pair_end: int = 0
@@ -254,6 +255,7 @@ class B2WaveMicrobatchPlan:
     layer_topk_positions: "torch.Tensor | None" = None
     layer_logical_expert_ids: "torch.Tensor | None" = None
     layer_physical_slot_ids: "torch.Tensor | None" = None
+    layer_flat_pair_offsets: "torch.Tensor | None" = None
 
     @property
     def num_pairs(self) -> int:
@@ -261,6 +263,8 @@ class B2WaveMicrobatchPlan:
 
     @property
     def pair_offsets(self):
+        if self.flat_pair_offsets is not None:
+            return self.flat_pair_offsets
         return self.token_indices * int(self.top_k) + self.topk_positions
 
 
@@ -279,6 +283,16 @@ class B2DirectScatterPayload:
     expanded_row_idx: "torch.Tensor"
     topk_weights: "torch.Tensor"
     restore_token_indices: "torch.Tensor"
+    device_descriptor: "B2DeviceScatterDescriptor | None" = None
+
+
+@dataclass(frozen=True)
+class B2DeviceScatterDescriptor:
+    """NPU-resident indices and weights consumed by final layer scatter."""
+
+    permuted_row_indices: "torch.Tensor"
+    token_indices: "torch.Tensor"
+    weights: "torch.Tensor"
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +484,7 @@ def plan_balanced_b2_waves(
     num_slots: int,
     *,
     slot_readiness: dict[int, bool] | None = None,
+    fold_partial_hits_into_miss: bool = True,
 ) -> B2WavePlan:
     """Plan capacity-bounded waves, balanced by routed token count.
 
@@ -533,10 +548,10 @@ def plan_balanced_b2_waves(
     miss_bins = _pack(miss_experts)
 
     # Preserve full hit-only waves: these can compute directly from the main slot
-    # cache and are useful cover for async miss-wave staging. Partial hit waves are
-    # different: keeping a tiny hit tail separate increases wave count and repeats
-    # dispatch/GMM/scatter overhead. Fold that tail into miss waves when there is
-    # spare capacity; the staged path will copy those hit experts device-to-device.
+    # cache and are useful cover for async miss-wave staging. Partial hit waves can
+    # either stay hit-only (avoids D2D copies from the main bank into a temp bank)
+    # or be folded into miss waves (fewer waves, but mixed staged waves copy READY
+    # experts device-to-device).
     full_hit_bins: list[list[int]] = []
     partial_hit_experts: list[int] = []
     for wave in hit_bins:
@@ -545,7 +560,7 @@ def plan_balanced_b2_waves(
         else:
             partial_hit_experts.extend(int(expert_id) for expert_id in wave)
 
-    if miss_bins and partial_hit_experts:
+    if fold_partial_hits_into_miss and miss_bins and partial_hit_experts:
         miss_loads = [sum(active[int(expert_id)] for expert_id in wave) for wave in miss_bins]
         remaining_hit_experts = sorted(
             partial_hit_experts,
@@ -571,7 +586,26 @@ def plan_balanced_b2_waves(
     else:
         partial_hit_bins = _pack(partial_hit_experts)
 
-    waves = tuple(tuple(wave) for wave in (full_hit_bins + miss_bins + partial_hit_bins))
+    def _copy_friendly_wave(wave: list[int]) -> tuple[int, ...]:
+        normalized_wave = tuple(int(expert_id) for expert_id in wave)
+        # Sort miss-only waves so host expert ids and stage slot ids advance
+        # together, letting the transfer engine coalesce contiguous H2D copies.
+        # Mixed waves deliberately keep the miss-first, hit-tail layout produced
+        # above: sorting them can interleave main-slot D2D hits with host H2D
+        # misses and force the transfer engine back to per-expert copies.
+        if normalized_wave and all(
+            not readiness.get(int(expert_id), False)
+            for expert_id in normalized_wave
+        ):
+            return tuple(sorted(normalized_wave))
+        return normalized_wave
+
+    # Keep the balanced wave membership and wave order; only normalize miss-only
+    # staged waves for copy coalescing.
+    waves = tuple(
+        _copy_friendly_wave(wave)
+        for wave in (full_hit_bins + miss_bins + partial_hit_bins)
+    )
     return B2WavePlan(waves=waves, token_counts_by_expert=active)
 
 
@@ -868,6 +902,7 @@ def build_b2_routed_pair_index(
     topk_weights: "torch.Tensor",
     *,
     pair_offsets_by_expert: dict[int, tuple[int, ...]] | None = None,
+    validate_pair_offsets: bool = True,
 ) -> B2RoutedPairIndex:
     """Build a reusable routed-pair index for wave microbatch construction.
 
@@ -903,21 +938,30 @@ def build_b2_routed_pair_index(
             for expert_id, offsets in buckets.items()
             if offsets
         }
-    else:
+    elif validate_pair_offsets:
         pair_offsets_by_expert = {
             int(expert_id): tuple(int(offset) for offset in offsets)
             for expert_id, offsets in pair_offsets_by_expert.items()
             if offsets
         }
+    else:
+        pair_offsets_by_expert = {
+            int(expert_id): (
+                offsets if isinstance(offsets, tuple) else tuple(offsets)
+            )
+            for expert_id, offsets in pair_offsets_by_expert.items()
+            if offsets
+        }
 
-    max_offset = int(topk_ids.numel())
-    for expert_id, offsets in pair_offsets_by_expert.items():
-        for offset in offsets:
-            if offset < 0 or offset >= max_offset:
-                raise ValueError(
-                    f"pair offset {offset} for expert {expert_id} outside "
-                    f"topk_ids flat size {max_offset}"
-                )
+    if validate_pair_offsets:
+        max_offset = int(topk_ids.numel())
+        for expert_id, offsets in pair_offsets_by_expert.items():
+            for offset in offsets:
+                if offset < 0 or offset >= max_offset:
+                    raise ValueError(
+                        f"pair offset {offset} for expert {expert_id} outside "
+                        f"topk_ids flat size {max_offset}"
+                    )
 
     return B2RoutedPairIndex(
         topk_ids=topk_ids,
@@ -997,12 +1041,20 @@ def build_b2_wave_microbatch_plan(
     wave_experts: tuple[int, ...],
     *,
     physical_slot_by_expert: dict[int, int] | None = None,
+    preserve_pair_order: bool = True,
+    include_logical_expert_ids: bool = True,
+    include_topk_positions: bool = True,
+    normalize_inputs: bool = True,
 ) -> B2WaveMicrobatchPlan:
     """Precompute all wave-specific routed-pair tensors except log2phy remap."""
     plans = build_b2_wave_microbatch_plans(
         pair_index,
         (wave_experts,),
         physical_slot_by_expert=physical_slot_by_expert,
+        preserve_pair_order=preserve_pair_order,
+        include_logical_expert_ids=include_logical_expert_ids,
+        include_topk_positions=include_topk_positions,
+        normalize_inputs=normalize_inputs,
     )
     return plans[0]
 
@@ -1012,6 +1064,10 @@ def build_b2_wave_microbatch_plans(
     waves: tuple[tuple[int, ...], ...],
     *,
     physical_slot_by_expert: dict[int, int] | None = None,
+    preserve_pair_order: bool = True,
+    include_logical_expert_ids: bool = True,
+    include_topk_positions: bool = True,
+    normalize_inputs: bool = True,
 ) -> tuple[B2WaveMicrobatchPlan, ...]:
     """Precompute routed-pair tensors for all B2 waves with one device tensor.
 
@@ -1023,77 +1079,38 @@ def build_b2_wave_microbatch_plans(
     views for the individual wave plans. ``physical_slot_by_expert`` lets hit
     waves reuse main-slot physical ids without building a full log2phy buffer;
     experts not present in that mapping keep the temporary-wave slot id.
+
+    ``B2RoutedPairIndex`` already owns an expert -> flat pair-offset map. Reuse
+    it here instead of rediscovering wave membership from ``topk_ids`` with
+    device-side ``nonzero`` scans; the latter is a noticeable prefill control
+    cost on Ascend for the common 4096-token, two-wave shape.
     """
     import torch
 
-    normalized_waves = tuple(tuple(int(e) for e in wave) for wave in waves)
-    physical_slots = (
-        {int(expert_id): int(slot_id) for expert_id, slot_id in physical_slot_by_expert.items()}
-        if physical_slot_by_expert is not None
-        else {}
-    )
-    wave_sizes: list[int] = []
-    all_token_indices: list[int] = []
-    all_topk_positions: list[int] = []
-    all_logical_ids: list[int] = []
-    all_slot_ids: list[int] = []
-    for wave in normalized_waves:
-        wave_pairs: list[tuple[int, int, int]] = []
-        # Main-bank physical ids are valid ONLY when the whole wave is a pure-hit
-        # wave executed against the main slot bank (zero-copy path).  A mixed wave
-        # (any miss) is staged into a temporary stage bank at positional slots
-        # 0..k-1; applying a main-bank slot id to a hit expert in that wave indexes
-        # the wrong position in the stage bank and produces silent weight corruption.
-        wave_is_pure_hit = bool(physical_slots) and all(
-            int(e) in physical_slots for e in wave
+    if normalize_inputs:
+        normalized_waves = tuple(tuple(int(e) for e in wave) for wave in waves)
+        physical_slots = (
+            {
+                int(expert_id): int(slot_id)
+                for expert_id, slot_id in physical_slot_by_expert.items()
+            }
+            if physical_slot_by_expert is not None
+            else {}
         )
-        for slot_id, expert_id in enumerate(wave):
-            physical_id = (
-                int(physical_slots[int(expert_id)])
-                if wave_is_pure_hit
-                else int(slot_id)
-            )
-            wave_pairs.extend(
-                (int(offset), physical_id, int(expert_id))
-                for offset in pair_index.pair_offsets_by_expert.get(
-                    int(expert_id),
-                    (),
-                )
-            )
-        wave_pairs.sort(key=lambda item: item[0])
-        wave_sizes.append(len(wave_pairs))
-        for offset, slot_id, expert_id in wave_pairs:
-            all_token_indices.append(int(offset) // int(pair_index.top_k))
-            all_topk_positions.append(int(offset) % int(pair_index.top_k))
-            all_logical_ids.append(int(expert_id))
-            all_slot_ids.append(int(slot_id))
+    else:
+        normalized_waves = waves
+        physical_slots = physical_slot_by_expert or {}
+    device = pair_index.topk_ids.device
+    topk_dtype = pair_index.topk_ids.dtype
+    empty_long = torch.empty(0, dtype=torch.long, device=device)
+    if not normalized_waves:
+        return ()
 
-    all_token_indices_tensor = torch.tensor(
-        all_token_indices,
-        dtype=torch.long,
-        device=pair_index.topk_ids.device,
-    )
-    all_topk_positions_tensor = torch.tensor(
-        all_topk_positions,
-        dtype=torch.long,
-        device=pair_index.topk_ids.device,
-    )
-    all_logical_ids_tensor = torch.tensor(
-        all_logical_ids,
-        dtype=pair_index.topk_ids.dtype,
-        device=pair_index.topk_ids.device,
-    )
-    all_physical_slot_ids = torch.tensor(
-        all_slot_ids,
-        dtype=pair_index.topk_ids.dtype,
-        device=pair_index.topk_ids.device,
-    )
-    if all_token_indices_tensor.numel() == 0:
-        empty_long = all_token_indices_tensor
+    if int(pair_index.topk_ids.numel()) == 0:
         empty_ids = torch.empty(
             0,
-            dtype=pair_index.topk_ids.dtype,
-            device=pair_index.topk_ids.device,
+            dtype=topk_dtype,
+            device=device,
         )
         return tuple(
             B2WaveMicrobatchPlan(
@@ -1102,6 +1119,7 @@ def build_b2_wave_microbatch_plans(
                 topk_positions=empty_long,
                 logical_expert_ids=empty_ids,
                 physical_slot_ids=empty_ids,
+                flat_pair_offsets=empty_long,
                 top_k=int(pair_index.top_k),
                 layer_pair_start=0,
                 layer_pair_end=0,
@@ -1109,9 +1127,124 @@ def build_b2_wave_microbatch_plans(
                 layer_topk_positions=empty_long,
                 layer_logical_expert_ids=empty_ids,
                 layer_physical_slot_ids=empty_ids,
+                layer_flat_pair_offsets=empty_long,
             )
             for wave in normalized_waves
         )
+
+    all_token_indices: list[int] = []
+    all_topk_positions: list[int] = []
+    all_pair_offsets: list[int] = []
+    all_logical_ids: list[int] = []
+    all_physical_slot_ids_list: list[int] = []
+    wave_sizes: list[int] = []
+    for wave in normalized_waves:
+        # Main-bank physical ids are valid ONLY when the whole wave is a pure-hit
+        # wave executed against the main slot bank (zero-copy path). A mixed wave
+        # is staged into a temporary bank at positional slots 0..k-1.
+        wave_is_pure_hit = bool(physical_slots) and all(
+            int(e) in physical_slots for e in wave
+        )
+        wave_pairs: list[tuple[int, int, int]] = []
+        wave_size = 0
+        for slot_id, expert_id in enumerate(wave):
+            expert_id = int(expert_id)
+            physical_slot_id = (
+                int(physical_slots[int(expert_id)])
+                if wave_is_pure_hit
+                else int(slot_id)
+            )
+            offsets = pair_index.pair_offsets_by_expert.get(expert_id, ())
+            wave_size += len(offsets)
+            if preserve_pair_order:
+                wave_pairs.extend(
+                    (int(offset), expert_id, physical_slot_id)
+                    for offset in offsets
+                )
+            else:
+                all_pair_offsets.extend(offsets)
+                offset_count = len(offsets)
+                if include_logical_expert_ids:
+                    all_logical_ids.extend(repeat(int(expert_id), offset_count))
+                all_physical_slot_ids_list.extend(
+                    repeat(int(physical_slot_id), offset_count)
+                )
+        if preserve_pair_order:
+            wave_pairs.sort(key=lambda item: item[0])
+            for pair_offset, expert_id, physical_slot_id in wave_pairs:
+                all_token_indices.append(int(pair_offset) // int(pair_index.top_k))
+                all_topk_positions.append(int(pair_offset) % int(pair_index.top_k))
+                if include_logical_expert_ids:
+                    all_logical_ids.append(int(expert_id))
+                all_physical_slot_ids_list.append(int(physical_slot_id))
+        wave_sizes.append(int(wave_size))
+
+    has_pairs = bool(all_token_indices if preserve_pair_order else all_pair_offsets)
+    if not has_pairs:
+        empty_ids = torch.empty(0, dtype=topk_dtype, device=device)
+        return tuple(
+            B2WaveMicrobatchPlan(
+                wave_experts=wave,
+                token_indices=empty_long,
+                topk_positions=empty_long,
+                logical_expert_ids=empty_ids,
+                physical_slot_ids=empty_ids,
+                flat_pair_offsets=empty_long,
+                top_k=int(pair_index.top_k),
+                layer_pair_start=0,
+                layer_pair_end=0,
+                layer_token_indices=empty_long,
+                layer_topk_positions=empty_long,
+                layer_logical_expert_ids=empty_ids,
+                layer_physical_slot_ids=empty_ids,
+                layer_flat_pair_offsets=empty_long,
+            )
+            for wave in normalized_waves
+        )
+
+    all_pair_offsets_tensor = None
+    if preserve_pair_order:
+        all_token_indices_tensor = torch.tensor(
+            all_token_indices,
+            dtype=torch.long,
+            device=device,
+        )
+        all_topk_positions_tensor = torch.tensor(
+            all_topk_positions,
+            dtype=torch.long,
+            device=device,
+        )
+    else:
+        all_pair_offsets_tensor = torch.tensor(
+            all_pair_offsets,
+            dtype=torch.long,
+            device=device,
+        )
+        all_token_indices_tensor = torch.div(
+            all_pair_offsets_tensor,
+            int(pair_index.top_k),
+            rounding_mode="floor",
+        ).to(dtype=torch.long)
+        if include_topk_positions:
+            all_topk_positions_tensor = torch.remainder(
+                all_pair_offsets_tensor,
+                int(pair_index.top_k),
+            ).to(dtype=torch.long)
+        else:
+            all_topk_positions_tensor = empty_long
+    if include_logical_expert_ids:
+        all_logical_ids_tensor = torch.tensor(
+            all_logical_ids,
+            dtype=topk_dtype,
+            device=device,
+        )
+    else:
+        all_logical_ids_tensor = torch.empty(0, dtype=topk_dtype, device=device)
+    all_physical_slot_ids = torch.tensor(
+        all_physical_slot_ids_list,
+        dtype=topk_dtype,
+        device=device,
+    )
 
     plans: list[B2WaveMicrobatchPlan] = []
     cursor = 0
@@ -1124,6 +1257,11 @@ def build_b2_wave_microbatch_plans(
                 topk_positions=all_topk_positions_tensor[cursor:end],
                 logical_expert_ids=all_logical_ids_tensor[cursor:end],
                 physical_slot_ids=all_physical_slot_ids[cursor:end],
+                flat_pair_offsets=(
+                    all_pair_offsets_tensor[cursor:end]
+                    if all_pair_offsets_tensor is not None
+                    else None
+                ),
                 top_k=int(pair_index.top_k),
                 layer_pair_start=cursor,
                 layer_pair_end=end,
@@ -1131,10 +1269,141 @@ def build_b2_wave_microbatch_plans(
                 layer_topk_positions=all_topk_positions_tensor,
                 layer_logical_expert_ids=all_logical_ids_tensor,
                 layer_physical_slot_ids=all_physical_slot_ids,
+                layer_flat_pair_offsets=all_pair_offsets_tensor,
             )
         )
         cursor = end
     return tuple(plans)
+
+
+def build_b2_device_wave_microbatch_plans(
+    topk_ids: "torch.Tensor",
+    waves: tuple[tuple[int, ...], ...],
+    *,
+    physical_slot_by_expert: dict[int, int] | None = None,
+    wave_pair_counts: tuple[int, ...] | None = None,
+    include_logical_expert_ids: bool = False,
+) -> tuple[B2WaveMicrobatchPlan, ...]:
+    """Compact routed pairs into wave descriptors on the tensor device.
+
+    Only the tiny expert-to-wave and expert-to-slot tables are authored by the
+    host. The O(tokens*top_k) membership scan, pair-offset compaction, token
+    indices, and physical-slot lookup stay on NPU for serving inputs.
+    """
+    import torch
+
+    normalized_waves = tuple(tuple(int(e) for e in wave) for wave in waves)
+    if not normalized_waves:
+        return ()
+    top_k = int(topk_ids.shape[1]) if topk_ids.ndim > 1 else 1
+    device = topk_ids.device
+    dtype = topk_ids.dtype
+    max_expert = max((max(wave, default=-1) for wave in normalized_waves), default=-1)
+    num_logical_experts = int(max_expert + 1)
+    expert_to_wave = [-1] * num_logical_experts
+    expert_to_slot = [-1] * num_logical_experts
+    ready_slots = physical_slot_by_expert or {}
+    for wave_index, wave in enumerate(normalized_waves):
+        pure_hit = bool(ready_slots) and all(int(e) in ready_slots for e in wave)
+        for slot_index, expert_id in enumerate(wave):
+            expert_to_wave[int(expert_id)] = int(wave_index)
+            expert_to_slot[int(expert_id)] = (
+                int(ready_slots[int(expert_id)]) if pure_hit else int(slot_index)
+            )
+
+    wave_map = torch.tensor(expert_to_wave, dtype=torch.long, device=device)
+    slot_map = torch.tensor(expert_to_slot, dtype=dtype, device=device)
+    flat_ids = topk_ids.reshape(-1)
+    flat_long = flat_ids.to(dtype=torch.long)
+    pair_wave_ids = wave_map.index_select(0, flat_long)
+    offsets_by_wave = tuple(
+        torch.nonzero(pair_wave_ids == int(wave_index), as_tuple=False).reshape(-1)
+        for wave_index in range(len(normalized_waves))
+    )
+    all_offsets = torch.cat(offsets_by_wave, dim=0)
+    all_token_indices = torch.div(
+        all_offsets,
+        int(top_k),
+        rounding_mode="floor",
+    ).to(dtype=torch.long)
+    all_physical_slots = slot_map.index_select(
+        0,
+        flat_long.index_select(0, all_offsets),
+    )
+    all_logical_ids = (
+        flat_ids.index_select(0, all_offsets)
+        if include_logical_expert_ids
+        else torch.empty(0, dtype=dtype, device=device)
+    )
+    empty_long = torch.empty(0, dtype=torch.long, device=device)
+    sizes = (
+        tuple(int(value) for value in wave_pair_counts)
+        if wave_pair_counts is not None
+        else tuple(int(offsets.numel()) for offsets in offsets_by_wave)
+    )
+    if len(sizes) != len(normalized_waves):
+        raise ValueError("wave_pair_counts must align with waves")
+    if sum(sizes) != int(topk_ids.numel()):
+        raise ValueError(
+            "device pair planner requires waves to cover every routed pair: "
+            f"planned={sum(sizes)} routed={int(topk_ids.numel())}"
+        )
+
+    plans: list[B2WaveMicrobatchPlan] = []
+    cursor = 0
+    for wave, size in zip(normalized_waves, sizes, strict=True):
+        end = cursor + int(size)
+        plans.append(
+            B2WaveMicrobatchPlan(
+                wave_experts=wave,
+                token_indices=all_token_indices[cursor:end],
+                topk_positions=empty_long,
+                logical_expert_ids=(
+                    all_logical_ids[cursor:end]
+                    if include_logical_expert_ids
+                    else all_logical_ids
+                ),
+                physical_slot_ids=all_physical_slots[cursor:end],
+                flat_pair_offsets=all_offsets[cursor:end],
+                top_k=int(top_k),
+                layer_pair_start=cursor,
+                layer_pair_end=end,
+                layer_token_indices=all_token_indices,
+                layer_topk_positions=empty_long,
+                layer_logical_expert_ids=all_logical_ids,
+                layer_physical_slot_ids=all_physical_slots,
+                layer_flat_pair_offsets=all_offsets,
+            )
+        )
+        cursor = end
+    return tuple(plans)
+
+
+def build_b2_device_scatter_descriptor(
+    *,
+    expanded_row_idx: "torch.Tensor",
+    topk_weights: "torch.Tensor",
+    restore_token_indices: "torch.Tensor",
+    output_dtype: "torch.dtype",
+    output_device: "torch.device",
+) -> B2DeviceScatterDescriptor:
+    """Build the final scatter descriptor entirely with device tensor ops."""
+    import torch
+
+    return B2DeviceScatterDescriptor(
+        permuted_row_indices=expanded_row_idx.reshape(-1).abs().to(
+            device=output_device,
+            dtype=torch.long,
+        ),
+        token_indices=restore_token_indices.reshape(-1).to(
+            device=output_device,
+            dtype=torch.long,
+        ),
+        weights=topk_weights.reshape(-1).to(
+            device=output_device,
+            dtype=output_dtype,
+        ),
+    )
 
 
 def build_b2_pair_microbatch_from_plan(
@@ -1172,11 +1441,14 @@ def build_b2_pair_microbatch_from_plan(
             logical_expert_ids=torch.empty(0, dtype=plan.logical_expert_ids.dtype, device=plan.logical_expert_ids.device),
         )
 
-    physical_ids = (
-        logical_to_physical[plan.logical_expert_ids]
-        if logical_to_physical is not None
-        else plan.physical_slot_ids
-    )
+    if logical_to_physical is not None:
+        if int(plan.logical_expert_ids.numel()) != int(plan.num_pairs):
+            raise ValueError(
+                "B2 wave plan omitted logical expert ids but log2phy remap was requested"
+            )
+        physical_ids = logical_to_physical[plan.logical_expert_ids]
+    else:
+        physical_ids = plan.physical_slot_ids
     if os.environ.get("SEW_B2_VALIDATE"):
         if bool((physical_ids < 0).detach().cpu().any().item()):
             missing = plan.logical_expert_ids[physical_ids < 0].detach().cpu().unique().tolist()
@@ -1186,10 +1458,10 @@ def build_b2_pair_microbatch_from_plan(
     return B2PairMicrobatch(
         hidden_states=hidden_states.index_select(0, restore_token_indices).contiguous(),
         topk_ids=physical_ids.reshape(-1, 1).contiguous(),
-        topk_weights=topk_weights[
-            plan.token_indices,
-            plan.topk_positions,
-        ].reshape(-1, 1).contiguous(),
+        topk_weights=topk_weights.reshape(-1).index_select(
+            0,
+            plan.pair_offsets.to(device=topk_weights.device, dtype=torch.long),
+        ).reshape(-1, 1).contiguous(),
         restore_token_indices=restore_token_indices,
         logical_expert_ids=plan.logical_expert_ids.contiguous(),
     )
@@ -1246,29 +1518,29 @@ def materialize_b2_pair_microbatches_from_plans(
     first_plan = plans[0]
     can_reuse_layer_tensors = (
         first_plan.layer_token_indices is not None
-        and first_plan.layer_topk_positions is not None
         and first_plan.layer_physical_slot_ids is not None
         and first_plan.layer_logical_expert_ids is not None
+        and first_plan.layer_flat_pair_offsets is not None
         and int(first_plan.layer_pair_start) == 0
         and int(plans[-1].layer_pair_end) == int(total_pairs)
         and all(
             plan.layer_token_indices is first_plan.layer_token_indices
-            and plan.layer_topk_positions is first_plan.layer_topk_positions
             and plan.layer_physical_slot_ids is first_plan.layer_physical_slot_ids
             and plan.layer_logical_expert_ids is first_plan.layer_logical_expert_ids
+            and plan.layer_flat_pair_offsets is first_plan.layer_flat_pair_offsets
             for plan in plans
         )
     )
     if can_reuse_layer_tensors:
         all_token_indices = first_plan.layer_token_indices
-        all_topk_positions = first_plan.layer_topk_positions
         all_physical_slot_ids = first_plan.layer_physical_slot_ids
         all_logical_expert_ids = first_plan.layer_logical_expert_ids
+        all_pair_offsets = first_plan.layer_flat_pair_offsets
     else:
         all_token_indices = torch.cat(tuple(plan.token_indices for plan in plans))
-        all_topk_positions = torch.cat(tuple(plan.topk_positions for plan in plans))
         all_physical_slot_ids = torch.cat(tuple(plan.physical_slot_ids for plan in plans))
         all_logical_expert_ids = torch.cat(tuple(plan.logical_expert_ids for plan in plans))
+        all_pair_offsets = torch.cat(tuple(plan.pair_offsets for plan in plans))
     restore_token_indices = all_token_indices.to(
         device=hidden_states.device,
         dtype=torch.long,
@@ -1278,10 +1550,10 @@ def materialize_b2_pair_microbatches_from_plans(
         restore_token_indices,
     ).contiguous()
     materialized_topk_ids = all_physical_slot_ids.reshape(-1, 1).contiguous()
-    materialized_topk_weights = topk_weights[
-        all_token_indices,
-        all_topk_positions,
-    ].reshape(-1, 1).contiguous()
+    materialized_topk_weights = topk_weights.reshape(-1).index_select(
+        0,
+        all_pair_offsets.to(device=topk_weights.device, dtype=torch.long),
+    ).reshape(-1, 1).contiguous()
 
     microbatches: list[B2PairMicrobatch] = []
     cursor = 0
@@ -1357,6 +1629,7 @@ def direct_scatter_add_b2_permuted_output(
     expanded_row_idx: "torch.Tensor",
     topk_weights: "torch.Tensor",
     restore_token_indices: "torch.Tensor",
+    device_descriptor: B2DeviceScatterDescriptor | None = None,
 ) -> "torch.Tensor":
     """Fuse AllGather top_k=1 unpermute with B2 scatter-add.
 
@@ -1373,19 +1646,32 @@ def direct_scatter_add_b2_permuted_output(
     if permuted_tokens.numel() == 0:
         return full_output
 
-    expanded = expanded_row_idx.reshape(-1).abs().to(
-        device=permuted_tokens.device,
-        dtype=torch.long,
+    expanded = (
+        device_descriptor.permuted_row_indices
+        if device_descriptor is not None
+        else expanded_row_idx.reshape(-1).abs().to(
+            device=permuted_tokens.device,
+            dtype=torch.long,
+        )
     )
-    weights = topk_weights.reshape(-1).to(
-        device=permuted_tokens.device,
-        dtype=permuted_tokens.dtype,
+    weights = (
+        device_descriptor.weights
+        if device_descriptor is not None
+        else topk_weights.reshape(-1).to(
+            device=permuted_tokens.device,
+            dtype=permuted_tokens.dtype,
+        )
+    )
+    scatter_indices = (
+        device_descriptor.token_indices
+        if device_descriptor is not None
+        else restore_token_indices.to(full_output.device)
     )
     gathered = permuted_tokens.index_select(0, expanded)
     weighted = gathered * weights.unsqueeze(-1)
     full_output.index_add_(
         0,
-        restore_token_indices.to(full_output.device),
+        scatter_indices,
         weighted.to(full_output.device),
     )
     return full_output
@@ -1414,6 +1700,7 @@ def direct_scatter_add_b2_permuted_outputs(
             expanded_row_idx=payload.expanded_row_idx,
             topk_weights=payload.topk_weights,
             restore_token_indices=payload.restore_token_indices,
+            device_descriptor=payload.device_descriptor,
         )
 
     import torch
@@ -1421,19 +1708,32 @@ def direct_scatter_add_b2_permuted_outputs(
     weighted_chunks = []
     restore_chunks = []
     for payload in non_empty:
-        expanded = payload.expanded_row_idx.reshape(-1).abs().to(
-            device=payload.permuted_tokens.device,
-            dtype=torch.long,
+        descriptor = payload.device_descriptor
+        expanded = (
+            descriptor.permuted_row_indices
+            if descriptor is not None
+            else payload.expanded_row_idx.reshape(-1).abs().to(
+                device=payload.permuted_tokens.device,
+                dtype=torch.long,
+            )
         )
-        weights = payload.topk_weights.reshape(-1).to(
-            device=payload.permuted_tokens.device,
-            dtype=payload.permuted_tokens.dtype,
+        weights = (
+            descriptor.weights
+            if descriptor is not None
+            else payload.topk_weights.reshape(-1).to(
+                device=payload.permuted_tokens.device,
+                dtype=payload.permuted_tokens.dtype,
+            )
         )
         gathered = payload.permuted_tokens.index_select(0, expanded)
         weighted_chunks.append(
             (gathered * weights.unsqueeze(-1)).to(full_output.device)
         )
-        restore_chunks.append(payload.restore_token_indices.to(full_output.device))
+        restore_chunks.append(
+            descriptor.token_indices
+            if descriptor is not None
+            else payload.restore_token_indices.to(full_output.device)
+        )
 
     if not weighted_chunks:
         return full_output
@@ -1864,7 +2164,4 @@ def _write_phase_split_profile_jsonl(event: PhaseSplitProfileEvent) -> None:
     profile_path = envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
     if not profile_path:
         return
-    path = Path(profile_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event.to_jsonable(), sort_keys=True) + "\n")
+    append_jsonl(profile_path, event.to_jsonable())

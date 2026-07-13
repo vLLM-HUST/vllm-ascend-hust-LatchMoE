@@ -24,14 +24,13 @@ Stage C (compute), and Stage M (combine) elapsed times using
 
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vllm_ascend import envs
+from vllm_moe_offload_ascend.moe_offload.profile_io import append_jsonl
 
 if TYPE_CHECKING:
     import torch
@@ -361,22 +360,16 @@ class MoePipelineProfiler:
         profile_path = envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
         if not profile_path:
             return
-        path = Path(profile_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"event": "moe_pipeline_timing", **timing.to_jsonable()}
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        append_jsonl(profile_path, entry)
 
     @staticmethod
     def _write_detail_jsonl(timing: MoePipelineDetailTiming) -> None:
         profile_path = envs.VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH
         if not profile_path:
             return
-        path = Path(profile_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"event": "moe_pipeline_detail_timing", **timing.to_jsonable()}
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        append_jsonl(profile_path, entry)
 
 
 _pipeline_profiler: MoePipelineProfiler | None = None

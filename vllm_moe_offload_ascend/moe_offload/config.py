@@ -25,6 +25,10 @@ from vllm_moe_offload_ascend.moe_offload.tiered_residency import (
 )
 
 
+def _bool_env(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class MoeOffloadConfig:
     enabled: bool = False
@@ -68,6 +72,10 @@ class MoeOffloadConfig:
     transfer_aware_wave_schedule: bool = True
     prefill_prefetch_depth: int = 1
     prefill_buffer_count: int = 2
+    # Prefer extra hit-only waves over copying READY main-slot experts into a
+    # temporary miss wave. This preserves the fixed HBM slot budget; it only
+    # changes B2 wave membership to avoid device-to-device staging traffic.
+    b2_avoid_mixed_wave_d2d: bool = True
     # P1-C scaffold: optional profiling-suite plan for stable grouped compute buckets.
     compute_bucket_plan_path: str = ""
     # Non-offload MoE GroupedMatmul diagnostics and plan inputs.
@@ -107,6 +115,10 @@ class MoeOffloadConfig:
             transfer_aware_wave_schedule=envs.VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE,
             prefill_prefetch_depth=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH,
             prefill_buffer_count=envs.VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT,
+            b2_avoid_mixed_wave_d2d=_bool_env(
+                "VLLM_ASCEND_MOE_OFFLOAD_B2_AVOID_MIXED_D2D",
+                "1",
+            ),
             compute_bucket_plan_path=envs.VLLM_ASCEND_MOE_COMPUTE_BUCKET_PLAN_PATH,
             gmm_trace_path=envs.VLLM_ASCEND_MOE_GMM_TRACE_PATH,
             gmm_profile_path=envs.VLLM_ASCEND_MOE_GMM_PROFILE_PATH,
