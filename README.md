@@ -3,14 +3,6 @@
 **LatchMoE: Graph-Compatible MoE Expert Offloading on Ascend NPUs**
 
 > 📄 **Paper**: in preparation
->
-> LatchMoE is a MoE expert-offloading runtime for vLLM on Ascend NPUs that
-> makes routing-driven expert staging compatible with ACLGraph replay. It
-> keeps expert weights in a fixed, pre-allocated NPU slot bank so captured
-> graphs always see stable tensor addresses, and moves all routing-driven
-> staging outside the replay boundary. This lets a memory-constrained single
-> NPU serve MoE models that do not fit in HBM, without giving up graph-mode
-> decoding. The fixed-slot dataplane is named `SEW` in code and configuration.
 
 ---
 
