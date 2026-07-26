@@ -1,6 +1,6 @@
 # vllm-moe-offload-ascend
 
-**LatchMoE: Graph-Compatible MoE Expert Offloading on Ascend NPUs**
+**LatchMoE: Address-stable, Graph-compatible expert offloading framework for MoE inference**
 
 > 📄 **Paper**: in preparation
 
