@@ -17,7 +17,7 @@
 """Graph-compatible MoE offload: the ROUTER op (SEW-Offload, Option B piece 1).
 
 Part of the three-way decomposition of the opaque ``vllm::moe_forward`` custom
-op (see docs/sew-offload/13-moe-forward-split-design.md). The monolithic
+op. The monolithic
 ``moe_forward`` hides ``select_experts`` *inside* its body, so a staging seam
 placed there is invisible to the FX graph splitter (R3 negative result). To make
 staging a real top-level split point we hoist the router decision into this

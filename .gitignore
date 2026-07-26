@@ -6,3 +6,8 @@ build/
 .eggs/
 *.so
 *.jsonl
+.pytest_cache/
+
+# Benchmark outputs (see benchmark/artifacts/.gitignore for placeholders)
+benchmark/artifacts/runs/
+benchmark/artifacts/reports/

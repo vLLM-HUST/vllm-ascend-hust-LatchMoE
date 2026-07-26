@@ -1,24 +1,27 @@
-# SEW-Offload Ascend Benchmark
+# Benchmark Harness
 
 This directory is the standard benchmark harness for `vllm-moe-offload-ascend`.
-It follows the useful shape of `vllm-hust-benchmark`: keep benchmark scenarios
-as data, render commands from a stable registry, preserve raw artifacts, and
-separate run orchestration from result summarization.
+Its design principles: keep benchmark scenarios as data, render commands from a
+stable registry, preserve raw artifacts, and separate run orchestration from
+result summarization.
 
 The benchmark is tailored to one systems question:
 
-> Can SEW-Offload make MoE expert offloading feasible and graph-compatible on a
-> memory-constrained single Ascend 910B-class NPU?
+> Can slot-stable expert offloading make MoE expert offloading feasible and
+> graph-compatible on a memory-constrained single Ascend 910B-class NPU?
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
 | `configs/sew_offload_v1.yaml` | Canonical model, dataset, workload, case, metric, and artifact contract. |
-| `scenarios/sew_offload_scenarios.json` | vllm-hust-benchmark-style workload registry. |
+| `scenarios/sew_offload_scenarios.json` | Workload registry, stored as data. |
 | `scripts/sew_bench.py` | Validate config, list cases/workloads, prepare ShareGPT manifests, render plans, summarize runs. |
 | `scripts/run_suite.py` | Standard server benchmark runner for `case x workload` experiments. |
 | `scripts/run_openai_manifest.py` | OpenAI-compatible streaming client for JSONL workload manifests. |
+| `scripts/collect_evidence.py` | Collect cross-run evidence tables from unit artifacts. |
+| `scripts/sharegpt_manifest.py` | Build tokenized ShareGPT workload manifests. |
+| `scripts/bench_sharegpt.py` | Standalone OpenAI-compatible ShareGPT benchmark client. |
 | `schemas/sew_offload_config.schema.json` | Human-readable schema for the canonical config. |
 | `artifacts/` | Generated manifests and run outputs. Ignored by git except small placeholders. |
 
@@ -96,12 +99,9 @@ python benchmark/scripts/collect_evidence.py \
 
 ## Design Boundary
 
-The main benchmark path is server-based because the paper needs TTFT, TPOT,
-throughput, graph-capture evidence, server logs, and profile JSONL artifacts
-from the same serving boundary users will operate. Single-process tools under
-`tools/` remain useful for smoke checks, output equivalence, trace-only
-collection, and low-level debugging, but they are not the canonical source for
-paper-level performance numbers.
+The main benchmark path is server-based because the evaluation needs TTFT,
+TPOT, throughput, graph-capture evidence, server logs, and profile JSONL
+artifacts from the same serving boundary users will operate.
 
 The default supported boundary is intentionally narrow:
 

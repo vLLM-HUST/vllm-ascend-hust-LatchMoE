@@ -338,8 +338,8 @@ def prepare_workloads(
     requests_per_bucket: int | None = None,
     buckets: list[str] | None = None,
 ) -> int:
-    sys.path.insert(0, str(REPO_ROOT))
-    from tools.sharegpt_manifest import build_sharegpt_manifest
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from sharegpt_manifest import build_sharegpt_manifest
 
     selected = set(buckets or []) or None
     target = repo_relative(manifest_path or config["dataset"]["manifest_path"])
