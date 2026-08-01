@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,26 @@ def test_platform_plugin_entry_point_is_declared() -> None:
     assert (
         'moe_offload_ascend = "vllm_moe_offload_ascend:register"' in config
     )
+
+
+def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
+    manifest = json.loads(
+        (REPO_ROOT / ".vllm-hust" / "optimization.json").read_text()
+    )
+
+    assert manifest["schema_version"] == 1
+    assert manifest["id"] == "latchmoe"
+    assert manifest["entrypoint"] == {
+        "group": "vllm.platform_plugins",
+        "name": "moe_offload_ascend",
+    }
+    assert manifest["parameters"]["offload_gb"]["default"] == "14"
+    assert manifest["activation"]["vllm_plugins"] == [
+        "ascend",
+        "moe_offload_ascend",
+    ]
+    environment = manifest["activation"]["environment"]
+    assert environment["VLLM_ASCEND_MOE_OFFLOAD_GB"] == "${offload_gb}"
 
 
 def test_register_applies_patches_once(monkeypatch: pytest.MonkeyPatch) -> None:
