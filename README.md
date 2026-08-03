@@ -2,7 +2,9 @@
 
 **LatchMoE: Address-stable, Graph-compatible expert offloading framework for MoE inference**
 
-> 📄 **Paper**: in preparation
+> 📄 **Paper**: [USENIX-style draft](paper/main.pdf) and
+> [claim ledger](paper/CLAIMS.md). The current performance table remains
+> preliminary until its raw run manifests and repetitions are checked in.
 
 - 负责人：李昶吾（`@Li-changwu`）、陈德斌（`@pluviophile-chen`）
 - 当前工作：[运行时边界与 graph 路径证据 #4](https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE/issues/4)
