@@ -149,6 +149,16 @@ PY
 
 ## Quick Start
 
+With sibling `vllm-hust-dev-hub`, the repository manifest handles installation,
+entry-point validation, safe defaults, and environment injection:
+
+```bash
+cd ../vllm-hust-dev-hub
+./manage.sh restart --optimization latchmoe --offload-gb 14
+```
+
+The equivalent low-level invocation is documented below for standalone use.
+
 ```bash
 # Offload budget in GiB; setting this enables the plugin via AutoConfig
 export VLLM_ASCEND_MOE_OFFLOAD_GB=14
