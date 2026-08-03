@@ -40,9 +40,10 @@ def load_collect_evidence():
 
 
 
-def test_benchmark_config_validates():
+def test_benchmark_config_validates(monkeypatch):
     sew_bench = load_sew_bench()
     config = sew_bench.load_config()
+    monkeypatch.setattr(Path, "exists", lambda _path: True)
 
     assert sew_bench.validate_config(config) == []
     assert config["dataset"]["source"] == "sharegpt"
@@ -241,5 +242,4 @@ def test_collect_evidence_extracts_log_and_profile_fields(tmp_path):
     assert row["slot_bank_gib"] == 2.0
     assert row["h2d_gib_total"] == 2048 / collect.BYTES_PER_GIB
     assert row["stage_ms_total"] == 3.0
-
 
