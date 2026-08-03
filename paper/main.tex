@@ -1,0 +1,343 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix-2020-09}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xspace}
+\usepackage{url}
+
+\newcommand{\system}{LatchMoE\xspace}
+
+\title{LatchMoE: Graph-Compatible Expert Offloading through Address-Stable Residency}
+
+\author{Anonymous submission}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Sparse mixture-of-experts (MoE) models reduce arithmetic per token but retain a
+large parameter footprint.  Expert offloading can fit such models on a
+memory-constrained accelerator, yet conventional offloading changes weight
+locations on the decode path.  This behavior conflicts with graph replay,
+which relies on stable addresses and a repeatable execution topology; disabling
+replay exposes a host-bound decode path.
+
+We present \system, an expert-offloading runtime that separates dynamic expert
+residency from captured tensor addresses.  \system preallocates fixed device
+slots, stages routed experts outside the replay boundary, protects slots with
+an explicit transfer/compute lifecycle, and executes oversized prefill working
+sets in capacity-bounded waves.  The resulting data plane accepts placement
+plans without embedding a particular prediction policy.
+
+The implementation targets a hook-enabled vLLM-Ascend stack and includes
+host-side correctness tests and a manifest-oriented online benchmark harness.
+Existing engineering measurements on Qwen3-30B-A3B report 1.66$\times$ lower
+median time to first token, 2.30$\times$ lower median time per output token,
+and 2.22$\times$ higher output throughput than the same offload configuration
+with graph capture disabled.  These numbers are preliminary because their raw
+run manifests are not yet checked into this repository.  We therefore state
+the mechanism and correctness claims independently and specify the repeated
+online evaluation required before submission.
+\end{abstract}
+
+\section{Introduction}
+
+Mixture-of-experts models activate only a small subset of their parameters for
+each token, but all experts must remain available for routing.  This mismatch
+between sparse computation and dense capacity makes expert weights a dominant
+memory cost.  Parallel systems distribute experts across devices
+\cite{deepspeedmoe}, while single-device systems can instead retain inactive
+experts in host memory and transfer them on demand \cite{moeinfinity}.  The
+latter approach reduces device-memory demand but adds a transfer decision to
+the latency-critical serving loop.
+
+Modern serving engines amortize host launch overhead by capturing repeated
+decode work into an accelerator graph.  Expert offloading breaks a hidden
+assumption of this optimization: the tensors referenced by a replayed graph
+must have stable addresses even when routing changes which expert is needed.
+A direct implementation either copies weights into changing allocations inside
+the captured region or disables capture.  The first choice invalidates replay
+semantics; the second returns decode to a host-dispatched execution path.
+
+The key observation behind \system is that expert \emph{identity} may change
+without changing the addresses consumed by the captured kernels.  We allocate
+a fixed bank of expert slots and expose a logical-to-physical mapping to the
+MoE computation.  Routing changes update the mapping and stage weights at a
+replay boundary; captured kernels continue to read the same slot tensors.
+This separation turns dynamic residency into metadata and transfer work around
+an otherwise stable graph.
+
+Address stability alone is insufficient.  A transfer must not overwrite a slot
+still used by in-flight compute, and a prompt can activate more experts than
+the bank can hold.  \system therefore pairs the slot bank with a checked
+lifecycle and capacity-bounded wave prefill.  Events establish when a slot may
+be reused, while wave execution limits the simultaneous working set and can
+overlap staging for the next wave.
+
+We implement \system as a vLLM platform plugin with a narrow set of
+vLLM-Ascend hook points.  The repository also contains a server-based benchmark
+that records time to first token (TTFT), time per output token (TPOT),
+throughput, graph events, HBM use, and transfer events under one artifact
+contract.  We do not treat a forced eager run as a successful graph result;
+eager execution appears only as an explicit comparison case.
+
+This paper makes three contributions:
+
+\begin{itemize}
+  \item It identifies address instability, rather than expert sparsity alone,
+    as the systems mismatch between offloading and graph replay.
+  \item It introduces an address-stable expert data plane with replay-boundary
+    staging, compute-protected slot reuse, and capacity-bounded wave prefill.
+  \item It defines a reproducible evaluation contract that separates graph
+    correctness, memory feasibility, transfer behavior, and service metrics.
+\end{itemize}
+
+The remainder of the paper describes the mismatch and design requirements
+(\S\ref{sec:background}), presents the data plane and lifecycle
+(\S\ref{sec:design}), discusses implementation (\S\ref{sec:implementation}),
+and reports current evidence and the submission evaluation plan
+(\S\ref{sec:evaluation}).
+
+\section{Background and Problem}
+\label{sec:background}
+
+\subsection{MoE residency under limited memory}
+
+An MoE layer contains $E$ experts but routes each token to only $k \ll E$ of
+them.  Sparse activation reduces compute, as in Switch Transformers
+\cite{switch}, but not the capacity needed to make every expert available.
+Offloading exploits temporal sparsity: inactive weights remain in host memory,
+and the runtime caches or prefetches experts into a bounded device-resident
+set.  Systems such as MoE-Infinity use activation traces to improve these
+decisions \cite{moeinfinity}; FlexGen demonstrates the broader value of
+coordinating model storage across heterogeneous memory \cite{flexgen}.
+
+The runtime cost is determined not only by bytes transferred.  Demand loads can
+stall a decode step, prefetches can contend with computation, and residency
+updates can add host work.  For graph-based execution, residency also interacts
+with capture validity.
+
+\subsection{Why ordinary offloading breaks replay}
+
+Graph replay records a repeated sequence of operations and their tensor
+relationships.  A naive expert cache materializes the selected expert in a new
+buffer or mutates the weight pointer used by the MoE kernel.  Both approaches
+make the repeated decode iteration depend on dynamic host actions inside the
+captured region.  Falling back to eager execution restores flexibility but
+removes the optimization we seek to preserve.
+
+We require four properties:
+
+\begin{enumerate}
+  \item \textbf{Address stability:} captured kernels reference a fixed set of
+    device allocations.
+  \item \textbf{Ownership safety:} a slot has one logical expert and cannot be
+    overwritten while compute uses its current generation.
+  \item \textbf{Capacity safety:} no route may silently exceed the configured
+    slot budget.
+  \item \textbf{Observable replay:} graph capture, replay, and fallback events
+    are recorded and cannot be replaced by a forced eager success.
+\end{enumerate}
+
+\section{Design}
+\label{sec:design}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.94\columnwidth}{
+\centering
+router output $\rightarrow$ placement plan $\rightarrow$ replay-boundary staging\\
+$\downarrow$\\
+pinned host experts $\rightarrow$ fixed device slot bank $\rightarrow$ captured MoE\\
+$\uparrow$\hspace{5em}$\downarrow$\\
+transfer events \hspace{4em} logical-to-physical mapping
+}}
+\caption{\system keeps tensor addresses stable and moves dynamic routing into
+metadata and transfers outside the captured region.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Fixed-slot expert virtualization}
+
+At initialization, \system allocates a fixed number of equal-shaped expert
+slots.  A slot has a stable tensor address, an owner $(\ell,e)$ consisting of
+layer and expert identifiers, and a monotonically increasing generation.
+The logical-to-physical map translates a routed expert to its current slot.
+Captured grouped matrix multiplications consume slot tensors and indices, not
+fresh expert allocations.
+
+The slot count is derived from the offload target, physical HBM, a KV-cache
+reserve, and a minimum net-saving constraint.  Explicit capacity checks reject
+an active working set that cannot be represented by the current execution
+mode.  This prevents an apparently successful run from borrowing unaccounted
+memory.
+
+\subsection{Replay-boundary staging}
+
+The router produces active expert identities.  A placement-plan adapter
+computes retain, evict, demand-load, and optional prefetch sets.  The adapter is
+deliberately policy-neutral: LRU or predictive control can be supplied by a
+separate controller without changing the slot bank.
+
+Staging occurs before the captured MoE region.  Host weights are copied on a
+dedicated transfer stream, and the mapping is published only after the
+corresponding load completes.  The graph then replays against stable slots.
+No transfer or allocation is hidden inside the captured kernel sequence.
+
+\subsection{Compute-protected lifecycle}
+
+Each slot progresses through an ownership protocol: free, loading, ready,
+computing, and eviction-pending.  Loading establishes a new owner and
+generation.  Compute records the generation it consumes and protects that slot
+until its completion event.  Eviction waits for both transfer and compute
+dependencies.  Shutdown drains pending work before releasing storage.
+
+The central safety invariant is:
+
+\begin{quote}
+A mapping may expose expert $(\ell,e)$ at slot $s$ only if $s$ is ready, owns
+$(\ell,e)$, and its published generation equals the generation checked by the
+consumer.
+\end{quote}
+
+Violations fail closed rather than selecting an eager path.
+
+\subsection{Capacity-bounded wave prefill}
+
+Prefill can route many tokens and activate more experts than the slot bank can
+hold simultaneously.  \system partitions routed work into waves whose expert
+set fits the bank.  For each wave, it stages missing experts, computes the
+corresponding token subset, and restores output order before combining results.
+With multiple staging buffers, the next wave's transfers can overlap the
+current wave's compute.
+
+Wave construction preserves token-to-expert assignments; it changes execution
+order, not routing semantics.  Correctness tests compare the scattered and
+restored output against the unpartitioned result.
+
+\section{Implementation}
+\label{sec:implementation}
+
+\system is a Python package registered through vLLM's platform-plugin entry
+point.  The implementation contains the slot bank, pinned host store, transfer
+engine, prefill wave scheduler, automatic capacity configuration, profile
+events, and fused-MoE adapters.  A hook-enabled vLLM-Ascend fork exposes the
+boundaries at which routing, staging, and graph state can be coordinated.
+
+The integration leaves request scheduling and the OpenAI-compatible API
+unchanged.  Disabling the plugin restores the runtime's null hooks.  Native
+weight-offload flags cannot be combined with \system because two independent
+owners of expert storage would violate the slot invariant.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+We separate existing preliminary observations from the experiments required to
+support a submission claim.
+
+\subsection{Current evidence}
+
+The repository includes host-side tests for slot ownership, phase splitting,
+wave restoration, graph guards, and benchmark artifact collection.  These
+tests validate contracts but do not measure online performance.
+
+Table~\ref{tab:preliminary} reproduces existing engineering measurements from
+the project record.  The configuration is Qwen3-30B-A3B in BF16 on one
+64-GiB Ascend 910B-class device, TP1, \texttt{max\_num\_seqs=1}, 200
+ShareGPT requests, and a 14-GiB offload budget.  Both columns use the \system
+offload data plane; only graph capture is toggled.  The raw manifest-backed run
+bundle is not checked into this repository, so the values are preliminary and
+must not be interpreted as repeated or independently reproduced results.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Metric & Capture off & Capture on \\
+\midrule
+Median TTFT (ms) & 2283.2 & 1373.6 \\
+Median TPOT (ms/token) & 192.5 & 83.6 \\
+Output throughput (token/s) & 4.71 & 10.47 \\
+\bottomrule
+\end{tabular}
+\caption{Preliminary engineering measurements recorded by the project.  Raw
+manifests and repetitions are required before these values become paper
+evidence.}
+\label{tab:preliminary}
+\end{table}
+
+\subsection{Submission experiment matrix}
+
+The checked-in harness defines real ShareGPT prompt buckets, explicit graph and
+eager cases, 14- and 28-GiB budgets, and artifact-preserving failure outcomes.
+The final evaluation must answer four questions:
+
+\begin{description}
+  \item[Q1: Feasibility.] Does full residency fail under the same HBM/KV
+    reservation for which \system serves requests successfully?
+  \item[Q2: Graph compatibility.] Do capture and replay complete, and what
+    fraction of decode steps replay without fallback?
+  \item[Q3: Performance.] How do TTFT, TPOT, inter-token latency, throughput,
+    and failure rate compare with native offload and the same data plane with
+    capture disabled?
+  \item[Q4: Attribution.] What do fixed slots, asynchronous loading, transfer
+    ordering, wave prefill, and automatic capacity selection each contribute?
+\end{description}
+
+Each cell requires three independent service starts and must report median and
+dispersion.  Results must carry parent/runtime revisions, device identity,
+model and workload digests, graph mode, HBM accounting, raw client metrics,
+server logs, and transfer profiles.  Formal runs may use only an idle device
+from NPU4--7.  A graph failure is retained as a failed artifact, not rerun with
+forced eager execution.
+
+\section{Discussion and Limitations}
+
+\paragraph{Policy is intentionally separate.}
+\system supplies the data plane and a generic plan interface.  Predictive
+placement, route-transition models, and EPLB comparisons belong to a separate
+control-plane study.  This boundary allows all policies to share identical
+slots, transfers, and graph behavior.
+
+\paragraph{Current scope.}
+The validated configuration is a single low-concurrency device and one
+unquantized MoE model.  Multi-device expert parallelism changes the comparison
+because its transfers are device-to-device rather than host-to-device.  Higher
+concurrency can also change active-set size and overlap opportunities.
+
+\paragraph{Evidence gap.}
+The absence of checked-in raw artifacts is the primary submission blocker.
+Until the repeated matrix is complete, the paper supports a mechanism and
+correctness argument, not a general performance claim.
+
+\section{Related Work}
+
+MoE architectures use sparse routing to increase parameter capacity without
+activating every parameter per token \cite{switch}.  DeepSpeed-MoE combines
+model and parallelism techniques for large-scale MoE inference
+\cite{deepspeedmoe}.  MoE-Infinity focuses on activation-aware caching and
+prefetch for expert offloading \cite{moeinfinity}.  \system addresses a
+different constraint: keeping the offload data plane compatible with captured
+decode execution through stable slot addresses and an explicit lifecycle.
+
+Heterogeneous inference systems such as FlexGen coordinate storage and
+execution across device, host, and disk memory \cite{flexgen}.  vLLM uses
+paged KV-cache management and continuous batching to improve LLM serving
+\cite{vllm}.  \system is complementary: it virtualizes expert weights rather
+than KV blocks and preserves the repeated MoE execution graph while residency
+changes.
+
+\section{Conclusion}
+
+\system decouples dynamic expert identity from the stable addresses required
+by graph replay.  Fixed slots, replay-boundary staging, protected ownership,
+and wave prefill form a graph-compatible offload data plane.  The current
+artifact establishes the design and its host-side contracts; repeated,
+manifest-backed online evaluation remains necessary to establish the breadth
+and magnitude of its performance benefit.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
