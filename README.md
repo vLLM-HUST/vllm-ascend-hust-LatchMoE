@@ -4,7 +4,23 @@
 
 > 📄 **Paper**: in preparation
 
+- 负责人：李昶吾（`@Li-changwu`）、陈德斌（`@pluviophile-chen`）
+- 当前工作：[运行时边界与 graph 路径证据 #4](https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE/issues/4)
+
 ---
+
+## Project Boundary
+
+LatchMoE is the runtime-mechanism project. It owns the address-stable slot
+bank, Host Store and H2D path, graph-replay lifecycle, wave prefill, and a
+generic placement-plan adapter. Policy research such as Static, frequency,
+route-transition, EPLB matched comparisons, and experiment orchestration is
+owned by the separate
+[`intellistream/ascend-moe-control`](https://github.com/intellistream/ascend-moe-control)
+project. New control policies must not be added to LatchMoE's main branch.
+
+Graph-path failures must be diagnosed directly. Forced eager execution is not
+an acceptable substitute for graph validation.
 
 ## What LatchMoE Does
 
