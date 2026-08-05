@@ -83,6 +83,14 @@ def _is_unset(value: Any) -> bool:
     return value is None or value == ""
 
 
+def _path_exists(path: str | Path) -> tuple[bool, str | None]:
+    resolved = repo_relative(path)
+    try:
+        return resolved.exists(), None
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def validate_config(config: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     required = {
@@ -111,14 +119,20 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if dataset.get("synthetic_smoke_allowed") is not False:
         issues.append("dataset.synthetic_smoke_allowed must be false")
     dataset_path = dataset.get("local_path")
-    if dataset_path and not repo_relative(dataset_path).exists():
-        issues.append(f"dataset.local_path does not exist: {dataset_path}")
+    if dataset_path:
+        exists, error = _path_exists(dataset_path)
+        if not exists:
+            detail = f" ({error})" if error else ""
+            issues.append(f"dataset.local_path is unavailable: {dataset_path}{detail}")
 
     model = config.get("model") or {}
     for key in ("path", "tokenizer"):
         value = model.get(key)
-        if value and not repo_relative(value).exists():
-            issues.append(f"model.{key} does not exist: {value}")
+        if value:
+            exists, error = _path_exists(value)
+            if not exists:
+                detail = f" ({error})" if error else ""
+                issues.append(f"model.{key} is unavailable: {value}{detail}")
 
     buckets = config.get("workload_buckets") or []
     bucket_names = _names(buckets)
@@ -144,6 +158,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     case_names = _names(cases)
     for duplicate in _duplicates(case_names):
         issues.append(f"duplicate case: {duplicate}")
+    for case in cases:
+        if "--enforce-eager" in {str(item) for item in case.get("server_args", [])}:
+            issues.append(f"case {case.get('name', '')} uses forbidden --enforce-eager")
 
     experiments = config.get("experiments") or {}
     experiment_names = set(experiments)

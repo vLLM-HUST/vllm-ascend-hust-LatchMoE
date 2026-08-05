@@ -62,32 +62,43 @@ def test_benchmark_case_names_are_unique_and_cover_required_roles():
     assert {
         "no_offload_capacity_probe",
         "native_prefetch_14gb",
-        "native_prefetch_14gb_eager",
         "legacy_layered_14gb",
-        "legacy_layered_14gb_eager",
         "sew_14gb_autoslots",
-        "sew_14gb_capture_disabled",
         "sew_28gb_autoslots",
-        "sew_28gb_slots32_capture_disabled",
     }.issubset(set(names))
     assert {"baseline", "main", "ablation", "sensitivity"}.issubset(roles)
 
 
-def test_end_to_end_experiment_includes_eager_and_capture_disabled_baselines():
+def test_end_to_end_experiment_is_graph_only():
     sew_bench = load_sew_bench()
     config = sew_bench.load_config()
     e1_cases = set(config["experiments"]["e1_end_to_end"]["cases"])
 
     assert {
         "native_prefetch_14gb",
-        "native_prefetch_14gb_eager",
         "legacy_layered_14gb",
-        "legacy_layered_14gb_eager",
-        "sew_14gb_capture_disabled",
         "sew_14gb_autoslots",
-        "sew_28gb_slots32_capture_disabled",
         "sew_28gb_slots32",
     }.issubset(e1_cases)
+    assert all(
+        "--enforce-eager" not in case.get("server_args", [])
+        for case in config["cases"]
+    )
+
+
+def test_validator_reports_unreadable_paths_instead_of_crashing(monkeypatch):
+    sew_bench = load_sew_bench()
+    config = sew_bench.load_config()
+    original_exists = Path.exists
+
+    def guarded_exists(path):
+        if str(path).endswith("Qwen3-30B-A3B"):
+            raise PermissionError("blocked test path")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", guarded_exists)
+    issues = sew_bench.validate_config(config)
+    assert any("PermissionError" in issue for issue in issues)
 
 
 def test_sew_cases_do_not_mix_native_prefetch_flags():
@@ -242,4 +253,3 @@ def test_collect_evidence_extracts_log_and_profile_fields(tmp_path):
     assert row["slot_bank_gib"] == 2.0
     assert row["h2d_gib_total"] == 2048 / collect.BYTES_PER_GIB
     assert row["stage_ms_total"] == 3.0
-

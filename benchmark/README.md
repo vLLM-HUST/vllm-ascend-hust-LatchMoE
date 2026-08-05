@@ -37,11 +37,11 @@ test -f /data/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json
 
 If the model or dataset lives elsewhere, edit
 `benchmark/configs/sew_offload_v1.yaml` before preparing workloads. For formal
-experiments in this project, do not use NPU 0-3; pick an idle device from NPU
-4-7, for example:
+experiments in this project, use only an explicitly reserved and idle physical
+NPU5 or NPU6. This repository is graph-only and rejects forced eager cases.
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=4
+export ASCEND_RT_VISIBLE_DEVICES=5
 ```
 
 Validate the benchmark definition:
