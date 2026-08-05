@@ -126,3 +126,11 @@ Each benchmark unit writes:
 
 Failed units still write `unit_result.json`; expected OOM or graph-capture
 failures are evidence, not missing data.
+# Managed graph-mode launch
+
+Non-dry suite runs start and stop the service only through the pinned
+`third_party/vllm-hust-dev-hub/manage.sh`. Supply physical NPU5 or NPU6, an
+immutable image digest, a unique container name, and a release-ack directory.
+The runner rejects occupied ports/devices, active custody units, forced eager,
+and external manager paths. `--no-start-server` remains a probe mode and must
+not be labeled repository-owned online evidence.
