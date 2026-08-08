@@ -31,6 +31,15 @@ class SlotState(str, Enum):
     COMPUTING = "computing"
 
 
+@dataclass(frozen=True)
+class SlotLease:
+    """Identity of one immutable slot ownership interval."""
+
+    slot_id: int
+    expert_key: ExpertKey
+    version: int
+
+
 @dataclass
 class ExpertSlot:
     slot_id: int
@@ -48,6 +57,22 @@ class ExpertSlot:
             expert_id=key.expert_id,
             w13=self.w13,
             w2=self.w2,
+        )
+
+    def lease(self) -> SlotLease:
+        if self.expert_key is None:
+            raise RuntimeError(f"slot {self.slot_id} has no owner")
+        return SlotLease(
+            slot_id=int(self.slot_id),
+            expert_key=self.expert_key,
+            version=int(self.version),
+        )
+
+    def matches_lease(self, lease: SlotLease) -> bool:
+        return (
+            int(self.slot_id) == int(lease.slot_id)
+            and self.expert_key == lease.expert_key
+            and int(self.version) == int(lease.version)
         )
 
 
@@ -118,6 +143,7 @@ class ExpertSlotBank:
 
     def assign_slot(self, slot_id: int, expert_key: ExpertKey, *, step_id: int) -> ExpertSlot:
         slot = self.slots[int(slot_id)]
+        self._require_reassignable(slot)
         if slot.expert_key is not None and slot.expert_key != expert_key:
             self._resident.pop(slot.expert_key, None)
             self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
@@ -150,6 +176,7 @@ class ExpertSlotBank:
         overhead.
         """
         slot = self.slots[int(slot_id)]
+        self._require_reassignable(slot)
         if slot.expert_key is not None:
             self._resident.pop(slot.expert_key, None)
             self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
@@ -159,8 +186,12 @@ class ExpertSlotBank:
         slot.state = SlotState.LOADING
         return slot
 
-    def clear_slot(self, slot_id: int) -> None:
+    def clear_slot(self, slot_id: int, *, force: bool = False) -> None:
         slot = self.slots[int(slot_id)]
+        if not force and slot.state == SlotState.COMPUTING:
+            raise RuntimeError(
+                f"slot {slot.slot_id} is computing and cannot be reassigned"
+            )
         if slot.expert_key is not None:
             self._resident.pop(slot.expert_key, None)
             self._resident_by_expert_id.pop(int(slot.expert_key.expert_id), None)
@@ -188,6 +219,13 @@ class ExpertSlotBank:
         if not candidates:
             return None
         return min(candidates, key=lambda slot: (slot.last_used_step, slot.slot_id))
+
+    @staticmethod
+    def _require_reassignable(slot: ExpertSlot) -> None:
+        if slot.state in (SlotState.LOADING, SlotState.COMPUTING):
+            raise RuntimeError(
+                f"slot {slot.slot_id} is {slot.state.value} and cannot be reassigned"
+            )
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:

@@ -6,6 +6,8 @@ from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
 from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import (
     CPU_FIRST_MARKER,
     CPU_FIRST_PROCESSED_MARKER,
+    _can_process_cpu_first_weight_pair,
+    ensure_moe_layer_id,
     maybe_create_unquantized_cpu_first_weights,
     maybe_process_unquantized_cpu_first_weights,
 )
@@ -37,6 +39,32 @@ class FakeRuntime:
 
 class TinyLayer(torch.nn.Module):
     layer_id = 7
+
+
+def test_ensure_moe_layer_id_recovers_routed_experts_layer_name():
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.12.mlp.experts"
+
+    assert ensure_moe_layer_id(layer) == 12
+    assert layer.layer_id == 12
+
+
+def test_ensure_moe_layer_id_uses_fused_moe_id_before_name_is_available():
+    layer = torch.nn.Module()
+    layer.moe_layer_id = 7
+
+    assert ensure_moe_layer_id(layer) == 7
+    assert layer.layer_id == 7
+
+def test_cpu_first_processing_accepts_vllm_temporary_npu_weights():
+    npu_weight = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    cpu_weight = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    meta_weight = SimpleNamespace(device=SimpleNamespace(type="meta"))
+
+    assert _can_process_cpu_first_weight_pair(npu_weight, npu_weight)
+    assert _can_process_cpu_first_weight_pair(cpu_weight, cpu_weight)
+    assert not _can_process_cpu_first_weight_pair(npu_weight, cpu_weight)
+    assert not _can_process_cpu_first_weight_pair(meta_weight, meta_weight)
 
 
 def test_cpu_first_create_weights_allocates_offloaded_experts_on_cpu():

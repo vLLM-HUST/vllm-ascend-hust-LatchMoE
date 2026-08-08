@@ -19,24 +19,45 @@ from dataclasses import dataclass
 
 from vllm_moe_offload_ascend.moe_offload.host_store import ExpertWeightBundle
 from vllm_moe_offload_ascend.moe_offload.layout import LayoutValidator
-from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlot, SlotState
+from vllm_moe_offload_ascend.moe_offload.slot_bank import (
+    ExpertSlot,
+    SlotLease,
+    SlotState,
+)
 
 
-@dataclass(frozen=True)
+@dataclass
 class TransferReadyEvent:
     """Transfer-stream event plus the slots it makes consumable."""
 
     event: object | None
-    slots: tuple[ExpertSlot, ...]
+    leases: tuple[tuple[ExpertSlot, SlotLease], ...]
+    completed: bool = False
 
     def mark_ready(self) -> None:
-        for slot in self.slots:
+        if self.completed:
+            return
+        for slot, lease in self.leases:
+            if not slot.matches_lease(lease):
+                raise RuntimeError(
+                    "stale H2D completion for slot "
+                    f"{slot.slot_id}: expected {lease.expert_key} v{lease.version}, "
+                    f"found {slot.expert_key} v{slot.version}"
+                )
+            if slot.state != SlotState.LOADING:
+                raise RuntimeError(
+                    f"H2D completion for slot {slot.slot_id} requires loading state, "
+                    f"found {slot.state.value}"
+                )
+        for slot, _ in self.leases:
             slot.state = SlotState.READY
+        self.completed = True
 
 
 class TransferEngine:
     def __init__(self) -> None:
         self._h2d_stream = None
+        self._pending_ready_events: list[TransferReadyEvent] = []
 
     def load_sync(self, bundle: ExpertWeightBundle, slot: ExpertSlot) -> None:
         LayoutValidator.validate_copy_compatible(bundle, slot.as_bundle())
@@ -93,7 +114,12 @@ class TransferEngine:
             stream.synchronize()
             slot.state = SlotState.READY
             return None
-        return TransferReadyEvent(ready_event, (slot,))
+        transfer_event = TransferReadyEvent(
+            ready_event,
+            ((slot, slot.lease()),),
+        )
+        self._pending_ready_events.append(transfer_event)
+        return transfer_event
 
     def load_many_async(
         self,
@@ -138,12 +164,20 @@ class TransferEngine:
             for slot in slots:
                 slot.state = SlotState.READY
             return None
-        return TransferReadyEvent(ready_event, slots)
+        transfer_event = TransferReadyEvent(
+            ready_event,
+            tuple((slot, slot.lease()) for slot in slots),
+        )
+        self._pending_ready_events.append(transfer_event)
+        return transfer_event
 
     def synchronize(self) -> None:
         """Wait for all queued H2D copies on the transfer stream to finish."""
         if self._h2d_stream is not None:
             self._h2d_stream.synchronize()
+        pending, self._pending_ready_events = self._pending_ready_events, []
+        for ready_event in pending:
+            ready_event.mark_ready()
 
     def _get_h2d_stream(self):
         if self._h2d_stream is None:

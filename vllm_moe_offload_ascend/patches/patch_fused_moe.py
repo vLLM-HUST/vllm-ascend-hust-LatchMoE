@@ -30,6 +30,7 @@ Strategy (two-step):
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 from collections.abc import Callable
@@ -412,6 +413,71 @@ def _patch_kv_cache_capacity_backstop() -> None:
         _kv_utils._report_kv_cache_config = _report_kv_cache_config
 
 
+def _opapi_supports_add_rms_norm_bias() -> bool:
+    """Return whether the active CANN runtime exports the fused RMSNorm ABI."""
+    try:
+        opapi = ctypes.CDLL("libopapi.so")
+    except OSError:
+        return False
+    return all(
+        hasattr(opapi, symbol)
+        for symbol in (
+            "aclnnAddRmsNormBias",
+            "aclnnAddRmsNormBiasGetWorkspaceSize",
+        )
+    )
+
+
+def _patch_rms_norm_bias_cann_compat() -> None:
+    """Use the supported torch_npu RMSNorm path on older CANN runtimes.
+
+    This affects only vLLM-Ascend's residual RMSNorm custom op. It deliberately
+    leaves the LatchMoE router -> stage -> MLP custom-op seam enabled.
+    """
+    if _opapi_supports_add_rms_norm_bias():
+        return
+    try:
+        import importlib
+
+        layernorm = importlib.import_module("vllm_ascend.ops.layernorm")
+    except Exception:
+        return
+
+    cls = getattr(layernorm, "AscendRMSNorm", None)
+    original = getattr(cls, "forward_oot", None)
+    if cls is None or not callable(original):
+        return
+    if getattr(original, "_latchmoe_cann_rmsnorm_compat", False):
+        return
+
+    def _forward_oot(self, x, residual=None):
+        if residual is None:
+            return original(self, x, residual)
+
+        import torch
+        import torch_npu
+
+        residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
+        x, _, residual = torch_npu.npu_add_rms_norm(
+            x,
+            residual,
+            self.weight,
+            self.variance_epsilon,
+        )
+        if self.bias is not None:
+            x.add_(self.bias)
+        return x, residual
+
+    _forward_oot._latchmoe_cann_rmsnorm_compat = True
+    _forward_oot.__wrapped__ = original
+    cls.forward_oot = _forward_oot
+    print(
+        "LATCHMOE_CANN_COMPAT rmsnorm_bias=fallback "
+        "reason=missing_aclnnAddRmsNormBias",
+        flush=True,
+    )
+
+
 def apply_patches() -> None:
     # 0. Eagerly write env defaults so spawned worker processes see them.
     _apply_env_defaults_from_gb()
@@ -433,6 +499,34 @@ def apply_patches() -> None:
     _patch_platform_splitting_ops()
     _patch_engine_args_autoconfig()
     _patch_kv_cache_capacity_backstop()
+
+
+
+
+def _install_runtime_patches_when_ready() -> bool:
+    """Install op aliases and runtime patches after device-op initialization.
+
+    Platform plugin discovery can call ``register()`` while
+    ``vllm_ascend.device.device_op`` is still importing. Importing
+    ``vllm_ascend.ops`` in that window leaves its package cached without the
+    custom-op registrations that its own cycle guard skipped. NPUWorker calls
+    ``adapt_patch()`` after the device module is complete, which retries this
+    function at a stable point.
+    """
+
+    if _ascend_device_op_is_initializing():
+        return False
+
+    # The parent ops package may already be cached from the guarded partial
+    # import, so import the registration module explicitly before loading MoE
+    # modules that reference torch.ops.vllm custom ops.
+    import importlib
+
+    importlib.import_module("vllm_ascend.ops.register_custom_ops")
+    _patch_rms_norm_bias_cann_compat()
+    _inject_sys_modules()
+    _install_runtime_module_patches()
+    return True
 
 
 def _patch_adapt_patch_reinstall() -> None:
@@ -505,6 +599,37 @@ def _install_runtime_module_patches() -> None:
 
 def _to_bool_env(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+
+
+def _graph_capture_slot_weights(runtime: Any, *, layer_id: int):
+    """Return graph-visible slot weights or reject an unsafe native fallback."""
+    if not bool(getattr(runtime.config, "graph_compatible_offload", False)):
+        return None
+    if not runtime.should_use_fixed_slot_plan_for_layer(int(layer_id)):
+        return None
+    capture_weights = runtime.capture_safe_slot_weights(layer_id=int(layer_id))
+    if capture_weights is None:
+        raise RuntimeError(
+            "graph-compatible MoE offload requires registered fixed-slot "
+            f"weights for layer {int(layer_id)}; refusing to capture or replay "
+            "with the native-weight fallback"
+        )
+    return capture_weights
+
+
+def _unpack_mlp_apply_result(result: Any) -> tuple[Any, Any | None]:
+    """Normalize old Tensor and new ``(Tensor, event)`` MoE MLP returns."""
+
+    if not isinstance(result, tuple):
+        return result, None
+    if len(result) != 2:
+        raise RuntimeError(
+            "MoE _apply_mlp returned an unsupported tuple with "
+            f"{len(result)} elements"
+        )
+    return result[0], result[1]
 
 
 def _sum_profile_number(profile: dict[str, Any], key: str) -> float:
@@ -822,10 +947,25 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         get_moe_offload_runtime,
     )
 
-    MoEFusedExpertsInput = _comm.MoEFusedExpertsInput
-    MoEOffloadParams = _comm.MoEOffloadParams
-    MoERoutingParams = _comm.MoERoutingParams
-    MoEWeights = _comm.MoEWeights
+    def _resolve_runtime_contract(name: str) -> Any:
+        contract = getattr(_comm, name, None)
+        if contract is not None:
+            return contract
+
+        # Newer vLLM-Ascend keeps the typed payloads in moe_runtime_args and
+        # no longer re-exports every contract from moe_comm_method.
+        import importlib
+
+        moe_runtime_args = importlib.import_module(
+            "vllm_ascend.ops.fused_moe.moe_runtime_args"
+        )
+
+        return getattr(moe_runtime_args, name)
+
+    MoEFusedExpertsInput = _resolve_runtime_contract("MoEFusedExpertsInput")
+    MoEOffloadParams = _resolve_runtime_contract("MoEOffloadParams")
+    MoERoutingParams = _resolve_runtime_contract("MoERoutingParams")
+    MoEWeights = _resolve_runtime_contract("MoEWeights")
     FusedExpertsResult = _comm.FusedExpertsResult
     build_mlp_compute_input = _comm.build_mlp_compute_input
     build_token_dispatch_input = _comm.build_token_dispatch_input
@@ -904,10 +1044,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             return fused_experts_input
 
         runtime = get_moe_offload_runtime()
+        capture_weights = _graph_capture_slot_weights(
+            runtime,
+            layer_id=int(offload.layer_id),
+        )
         if runtime.config.graph_compatible_offload:
-            capture_weights = runtime.capture_safe_slot_weights(
-                layer_id=offload.layer_id
-            )
             if _os.environ.get("SEW_OFFLOAD_PROBE"):
                 buf = runtime.log2phy_buffer(offload.layer_id)
                 print(
@@ -923,8 +1064,6 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     fused_experts_input,
                     capture_weights,
                 )
-            if _is_current_graph_capturing():
-                return fused_experts_input
 
         return original_maybe_apply(self, fused_experts_input)
 
@@ -2425,8 +2564,9 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
             params_dtype,
             **extra_weight_attrs,
         ):
+            layer_id = ensure_moe_layer_id(layer)
             runtime = get_moe_offload_runtime()
-            if maybe_create_unquantized_cpu_first_weights(
+            handled = maybe_create_unquantized_cpu_first_weights(
                 self,
                 layer,
                 runtime=runtime,
@@ -2435,7 +2575,16 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                 intermediate_size_per_partition=intermediate_size_per_partition,
                 params_dtype=params_dtype,
                 extra_weight_attrs=extra_weight_attrs,
-            ):
+            )
+            if _to_bool_env("SEW_CPU_FIRST_PROBE", "0"):
+                print(
+                    "SEW_CPU_FIRST create "
+                    f"method={type(self).__name__} layer_id={layer_id} "
+                    f"moe_layer_id={getattr(layer, 'moe_layer_id', None)} "
+                    f"cpu_first={runtime.config.cpu_first_load} handled={handled}",
+                    flush=True,
+                )
+            if handled:
                 return None
             return original_create_weights(
                 self,
@@ -2484,12 +2633,23 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
     _fused_moe.select_experts = select_experts
 
     def process_weights_after_loading(self, layer):
+        layer_id = ensure_moe_layer_id(layer)
         runtime = get_moe_offload_runtime()
-        if maybe_process_unquantized_cpu_first_weights(
+        handled = maybe_process_unquantized_cpu_first_weights(
             self,
             layer,
             runtime=runtime,
-        ):
+        )
+        if _to_bool_env("SEW_CPU_FIRST_PROBE", "0"):
+            print(
+                "SEW_CPU_FIRST process "
+                f"method={type(self).__name__} layer_id={layer_id} "
+                f"marker={getattr(layer, '_ascend_moe_cpu_first_load', False)} "
+                f"cpu_first={runtime.config.cpu_first_load} handled={handled} "
+                f"registered={runtime.is_layer_registered(layer_id) if layer_id >= 0 else False}",
+                flush=True,
+            )
+        if handled:
             return None
         result = original_process_weights(self, layer)
         layer_id = int(getattr(layer, "layer_id", -1))
@@ -2564,7 +2724,7 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             return False
 
     def _seam_config_guards_pass(self) -> bool:
-        from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
+        from vllm_moe_offload_ascend.moe_offload.runtime import get_moe_offload_runtime
 
         def _probe(reason: str) -> None:
             if _os.environ.get("SEW_SEAM_PROBE"):
@@ -2796,7 +2956,7 @@ def _patch_platform_splitting_ops() -> None:
             try:
                 from vllm.config.compilation import CUDAGraphMode
 
-                if compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE:
+                if not compilation_config.cudagraph_mode.requires_piecewise_compilation():
                     return
             except Exception:
                 return

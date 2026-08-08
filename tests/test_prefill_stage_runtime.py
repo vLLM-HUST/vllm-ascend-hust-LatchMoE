@@ -6,6 +6,7 @@ from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
 from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
 from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
+from vllm_moe_offload_ascend.moe_offload.transfer_engine import TransferReadyEvent
 
 
 class TinyLayer(torch.nn.Module):
@@ -45,6 +46,32 @@ def test_slot_bank_lookup_expert_id_tracks_resident_index():
     bank.assign_transient_slot(second.slot_id, ExpertKey(7, 9), step_id=3)
     assert bank.lookup_expert_id(5) is None
     assert bank.lookup_expert_id(9) is None
+
+
+def test_transfer_ready_event_binds_slot_owner_and_generation():
+    bank = ExpertSlotBank(
+        1,
+        (1, 1),
+        (1, 1),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    slot = bank.assign_slot(0, ExpertKey(7, 0), step_id=1)
+    ready = TransferReadyEvent(object(), ((slot, slot.lease()),))
+
+    ready.mark_ready()
+    ready.mark_ready()
+    assert slot.state == SlotState.READY
+
+    slot.state = SlotState.LOADING
+    stale_ready = TransferReadyEvent(object(), ((slot, slot.lease()),))
+    bank.clear_slot(0)
+    replacement = bank.assign_slot(0, ExpertKey(7, 1), step_id=2)
+
+    with pytest.raises(RuntimeError, match="stale H2D completion"):
+        stale_ready.mark_ready()
+    assert replacement.state == SlotState.LOADING
+    assert replacement.expert_key == ExpertKey(7, 1)
 
 
 def test_memory_ledger_is_cached_and_invalidated_on_structural_changes():
@@ -280,6 +307,28 @@ def test_prefill_stage_plan_reuses_fixed_log2phy_per_buffer():
     assert second.log2phy.tolist() == [-1, -1, 0, -1]
     assert third.log2phy.data_ptr() != first_ptr
     assert third.log2phy.tolist() == [-1, -1, -1, 0]
+
+
+def test_prefill_stage_plan_rejects_buffer_outside_configured_capacity():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            prefill_buffer_count=1,
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    with pytest.raises(RuntimeError, match="prefill_buffer_count=1"):
+        runtime.prepare_prefill_stage_plan(
+            layer_id=7,
+            active_experts=(0,),
+            num_logical_experts=4,
+            device=torch.device("cpu"),
+            buffer_index=1,
+            async_load=False,
+        )
 
 
 def test_prefill_stage_plan_can_skip_log2phy_for_wave_plan_remap():
@@ -688,11 +737,11 @@ def test_slot_allocation_waits_for_loading_slots_before_eviction(monkeypatch):
     slot.state = SlotState.LOADING
     sync_calls = []
 
-    monkeypatch.setattr(
-        runtime._transfer_engine,
-        "synchronize",
-        lambda: sync_calls.append("sync"),
-    )
+    def synchronize():
+        sync_calls.append("sync")
+        slot.state = SlotState.READY
+
+    monkeypatch.setattr(runtime._transfer_engine, "synchronize", synchronize)
 
     allocated = runtime._allocate_slot_with_loading_fallback(
         bank,
@@ -758,6 +807,28 @@ def test_slot_allocation_waits_for_computing_slots_before_eviction(monkeypatch):
     assert allocated.state == SlotState.LOADING
     assert bank.lookup(ExpertKey(7, 0)) is None
     assert bank.lookup(ExpertKey(7, 1)).state == SlotState.READY
+
+
+def test_computing_slot_cannot_be_reassigned_before_its_completion_event():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=1))
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    prepared = runtime.prepare_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0,),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+    bank = runtime._slot_banks[7]
+    handle = runtime.begin_slot_compute(prepared)
+    assert handle is not None
+
+    with pytest.raises(RuntimeError, match="cannot be reassigned"):
+        bank.assign_slot(0, ExpertKey(7, 1), step_id=2)
+    with pytest.raises(RuntimeError, match="cannot be reassigned"):
+        bank.clear_slot(0)
+
+    runtime.end_slot_compute(handle)
 
 
 def test_prepare_fixed_slot_plan_rolls_back_failed_sync_load(monkeypatch):
@@ -955,6 +1026,26 @@ def test_stage_fixed_slot_plan_writes_persistent_log2phy_directly():
     ]
     assert stage_events[-1]["payload"]["mapping_mode"] == "persistent_log2phy"
     assert not any(event["name"] == "decode_log2phy_commit" for event in events)
+
+
+def test_capture_safe_slot_weights_locks_fixed_address_fingerprint():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    prepared = runtime.capture_safe_slot_weights(layer_id=7)
+
+    assert prepared is not None
+    assert prepared.w1.data_ptr() == runtime._slot_banks[7].w13_slots.data_ptr()
+    assert prepared.log2phy.data_ptr() == runtime.log2phy_buffer(7).data_ptr()
+    with pytest.raises(RuntimeError, match="addresses are already captured"):
+        runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
 
 
 def test_stage_fixed_slot_plan_batches_decode_misses_async(monkeypatch):

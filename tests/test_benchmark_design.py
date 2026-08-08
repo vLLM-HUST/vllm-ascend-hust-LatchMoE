@@ -45,7 +45,7 @@ def test_benchmark_config_validates(monkeypatch):
     config = sew_bench.load_config()
     monkeypatch.setattr(Path, "exists", lambda _path: True)
 
-    assert sew_bench.validate_config(config) == []
+    assert sew_bench.validate_config(config, check_resource_paths=False) == []
     assert config["dataset"]["source"] == "sharegpt"
     assert config["dataset"]["random_dataset_allowed"] is False
     assert config["dataset"]["synthetic_smoke_allowed"] is False

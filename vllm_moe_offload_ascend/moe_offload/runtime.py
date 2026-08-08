@@ -38,7 +38,11 @@ from vllm_moe_offload_ascend.moe_offload.compute_bucket import (
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
 from vllm_moe_offload_ascend.moe_offload.host_store import HostExpertStore
 from vllm_moe_offload_ascend.moe_offload.profile_io import append_jsonl
-from vllm_moe_offload_ascend.moe_offload.slot_bank import ExpertSlotBank, SlotState
+from vllm_moe_offload_ascend.moe_offload.slot_bank import (
+    ExpertSlotBank,
+    SlotLease,
+    SlotState,
+)
 from vllm_moe_offload_ascend.moe_offload.slot_mapping import ExpertSlotMapping, PreparedSlotWeights
 from vllm_moe_offload_ascend.moe_offload.trace_collector import TraceCollector, TraceRecord
 from vllm_moe_offload_ascend.moe_offload.expert_weight_release import release_layer_original_expert_weights
@@ -171,6 +175,19 @@ class MoePrefillRouteStats:
 class SlotComputeHandle:
     layer_id: int
     slot_ids: tuple[int, ...]
+    leases: tuple[SlotLease, ...]
+
+
+@dataclass(frozen=True)
+class SlotAddressFingerprint:
+    w13_data_ptr: int
+    w2_data_ptr: int
+    log2phy_data_ptr: int
+    w13_shape: tuple[int, ...]
+    w2_shape: tuple[int, ...]
+    log2phy_shape: tuple[int, ...]
+    device: str
+    dtype: str
 
 
 class MoeOffloadRuntime:
@@ -201,6 +218,7 @@ class MoeOffloadRuntime:
         # data-dependent decision never enters the captured op stream.
         self._log2phy_buffers: dict[int, torch.Tensor] = {}
         self._log2phy_slot_by_expert: dict[int, dict[int, int]] = {}
+        self._graph_slot_address_fingerprints: dict[int, SlotAddressFingerprint] = {}
         self._transfer_engine = TransferEngine()
         self._profile_events: list[MoeOffloadProfileEvent] = []
         self._memory_ledger_cache: MoeOffloadMemoryLedger | None = None
@@ -208,7 +226,7 @@ class MoeOffloadRuntime:
         self._compute_bucket_classifier_loaded = False
         self._prefill_route_stats_by_layer: dict[int, MoePrefillRouteStats] = {}
         self._active_slot_ids_by_layer: dict[int, tuple[int, ...]] = {}
-        self._slot_compute_done_events: dict[tuple[int, int], object] = {}
+        self._slot_compute_done_events: dict[tuple[int, int, int], object] = {}
 
     def trace_routing(
         self,
@@ -459,6 +477,11 @@ class MoeOffloadRuntime:
         layer_id = int(getattr(layer, "layer_id", -1))
         if layer_id < 0:
             raise ValueError("layer.layer_id is required for fixed-slot registration")
+        if layer_id in self._graph_slot_address_fingerprints:
+            raise RuntimeError(
+                f"layer {layer_id} fixed-slot addresses are already captured; "
+                "re-registering would invalidate an ACLGraph replay"
+            )
 
         start = perf_counter()
         cpu_first_layer = is_cpu_first_layer(layer)
@@ -623,28 +646,48 @@ class MoeOffloadRuntime:
     def _drain_slot_bank_inflight_work(self, slot_bank: ExpertSlotBank) -> None:
         if any(slot.state == SlotState.LOADING for slot in slot_bank.slots):
             self._transfer_engine.synchronize()
-            for slot in slot_bank.slots:
-                if slot.state == SlotState.LOADING:
-                    slot.state = SlotState.READY
+            loading_slots = [
+                slot.slot_id
+                for slot in slot_bank.slots
+                if slot.state == SlotState.LOADING
+            ]
+            if loading_slots:
+                raise RuntimeError(
+                    "H2D synchronization completed without a matching ready event "
+                    f"for slots {loading_slots}"
+                )
 
         computing_slots = [
             slot for slot in slot_bank.slots if slot.state == SlotState.COMPUTING
         ]
         events_to_sync: list[object] = []
         seen_events: set[int] = set()
+        leases: list[SlotLease] = []
         for slot in computing_slots:
-            key = slot.expert_key
-            if key is None:
-                slot.state = SlotState.EMPTY
-                continue
-            event_key = (int(key.layer_id), int(slot.slot_id))
+            lease = slot.lease()
+            leases.append(lease)
+            event_key = (
+                int(lease.expert_key.layer_id),
+                int(lease.slot_id),
+                int(lease.version),
+            )
             event = self._slot_compute_done_events.pop(event_key, None)
-            if event is not None and id(event) not in seen_events:
+            if event is None:
+                raise RuntimeError(
+                    "computing slot has no completion event: "
+                    f"layer={lease.expert_key.layer_id} slot={lease.slot_id} "
+                    f"version={lease.version}"
+                )
+            if id(event) not in seen_events:
                 seen_events.add(id(event))
                 events_to_sync.append(event)
         for event in events_to_sync:
             self._synchronize_event(event)
-        for slot in computing_slots:
+        for slot, lease in zip(computing_slots, leases, strict=True):
+            if not slot.matches_lease(lease):
+                raise RuntimeError(
+                    f"slot {lease.slot_id} ownership changed while compute was in flight"
+                )
             if slot.state == SlotState.COMPUTING:
                 slot.state = SlotState.READY
 
@@ -671,7 +714,7 @@ class MoeOffloadRuntime:
     ) -> None:
         for _, slot in loads:
             if getattr(slot, "state", None) == SlotState.LOADING:
-                slot_bank.clear_slot(int(slot.slot_id))
+                slot_bank.clear_slot(int(slot.slot_id), force=True)
 
     def begin_slot_compute(
         self,
@@ -694,11 +737,60 @@ class MoeOffloadRuntime:
             )
         if not slot_ids:
             return None
+        is_graph_capture = _is_current_graph_capturing()
+        leases: list[SlotLease] = []
         for slot_id in slot_ids:
             slot = slot_bank.slots[int(slot_id)]
-            if slot.state == SlotState.READY:
-                slot_bank.mark_computing(int(slot_id))
-        return SlotComputeHandle(layer_id=layer_id, slot_ids=slot_ids)
+            if int(slot_id) >= len(prepared.mapping.slot_to_expert):
+                raise RuntimeError(
+                    f"prepared slot mapping has no owner entry for slot {slot_id}"
+                )
+            expected_expert = prepared.mapping.slot_to_expert[int(slot_id)]
+            expected_key = (
+                ExpertKey(layer_id, int(expected_expert))
+                if expected_expert is not None
+                else None
+            )
+            if slot.expert_key != expected_key:
+                raise RuntimeError(
+                    f"prepared mapping owner mismatch for slot {slot_id}: "
+                    f"expected {expected_key}, found {slot.expert_key}"
+                )
+            if slot.state == SlotState.COMPUTING and is_graph_capture:
+                # vLLM-Ascend enters capture on a dedicated stream after making
+                # that stream wait for the preceding default stream. Transfer
+                # this matching completion record to the capture stream instead
+                # of synchronizing the host from inside graph capture.
+                lease = slot.lease()
+                event_key = (
+                    int(lease.expert_key.layer_id),
+                    int(lease.slot_id),
+                    int(lease.version),
+                )
+                if self._slot_compute_done_events.pop(event_key, None) is None:
+                    raise RuntimeError(
+                        "capturing slot has no completion event from the "
+                        "preceding eager compute: "
+                        f"layer={lease.expert_key.layer_id} slot={lease.slot_id} "
+                        f"version={lease.version}"
+                    )
+                if not slot.matches_lease(lease):
+                    raise RuntimeError(
+                        f"slot {lease.slot_id} ownership changed before capture handoff"
+                    )
+                slot.state = SlotState.READY
+            if slot.state != SlotState.READY:
+                raise RuntimeError(
+                    f"prepared slot {slot_id} is not ready for compute: {slot.state.value}"
+                )
+            leases.append(slot.lease())
+        for slot_id in slot_ids:
+            slot_bank.mark_computing(int(slot_id))
+        return SlotComputeHandle(
+            layer_id=layer_id,
+            slot_ids=slot_ids,
+            leases=tuple(leases),
+        )
 
     def end_slot_compute(self, handle: SlotComputeHandle | None) -> None:
         if handle is None:
@@ -706,16 +798,29 @@ class MoeOffloadRuntime:
         slot_bank = self._slot_banks.get(int(handle.layer_id))
         if slot_bank is None:
             return
-        event = self._record_current_stream_event_or_none()
-        for slot_id in handle.slot_ids:
-            slot = slot_bank.slots[int(slot_id)]
+        for lease in handle.leases:
+            slot = slot_bank.slots[int(lease.slot_id)]
+            if not slot.matches_lease(lease):
+                raise RuntimeError(
+                    f"slot {lease.slot_id} ownership changed before compute completed"
+                )
             if slot.state != SlotState.COMPUTING:
-                continue
+                raise RuntimeError(
+                    f"slot {lease.slot_id} is not computing at compute completion: "
+                    f"{slot.state.value}"
+                )
+        event = self._record_current_stream_event_or_none()
+        for lease in handle.leases:
+            slot = slot_bank.slots[int(lease.slot_id)]
             if event is None:
                 slot.state = SlotState.READY
             else:
                 self._slot_compute_done_events[
-                    (int(handle.layer_id), int(slot_id))
+                    (
+                        int(handle.layer_id),
+                        int(lease.slot_id),
+                        int(lease.version),
+                    )
                 ] = event
 
     def _record_current_stream_event_or_none(self):
@@ -1042,6 +1147,16 @@ class MoeOffloadRuntime:
         if slot_bank is None:
             raise RuntimeError(f"layer {layer_id} is not registered for fixed-slot execution")
 
+        # Complete the preceding execution before reserving this plan's misses.
+        # A synchronous batch marks new slots LOADING until the batch is issued
+        # after this loop; draining only after those reservations can mistake
+        # unsubmitted work for an in-flight H2D transfer.
+        if any(
+            slot.state in (SlotState.LOADING, SlotState.COMPUTING)
+            for slot in slot_bank.slots
+        ):
+            self._drain_slot_bank_inflight_work(slot_bank)
+
         step_id = (
             int(step_id)
             if step_id is not None and int(step_id) >= 0
@@ -1218,6 +1333,16 @@ class MoeOffloadRuntime:
         slot_bank = self._slot_banks.get(layer_id)
         if slot_bank is None:
             raise RuntimeError(f"layer {layer_id} is not registered for fixed-slot execution")
+
+        # Complete the preceding execution before reserving this plan's misses.
+        # A synchronous batch marks new slots LOADING until the batch is issued
+        # after this loop; draining only after those reservations can mistake
+        # unsubmitted work for an in-flight H2D transfer.
+        if any(
+            slot.state in (SlotState.LOADING, SlotState.COMPUTING)
+            for slot in slot_bank.slots
+        ):
+            self._drain_slot_bank_inflight_work(slot_bank)
 
         step_id = (
             int(step_id)
@@ -1559,6 +1684,8 @@ class MoeOffloadRuntime:
         if not self.should_use_fixed_slots:
             raise RuntimeError("prefill stage plan requested while fixed slots are disabled")
 
+        self._validate_prefill_buffer_index(int(buffer_index))
+
         layer_id = int(layer_id)
         if self.is_resident_layer(layer_id):
             raise RuntimeError(
@@ -1777,8 +1904,7 @@ class MoeOffloadRuntime:
         buffer_index: int,
         template_bank: ExpertSlotBank,
     ) -> ExpertSlotBank:
-        if buffer_index < 0:
-            raise ValueError(f"buffer_index must be non-negative, got {buffer_index}")
+        self._validate_prefill_buffer_index(buffer_index)
         pool_key = self._prefill_stage_pool_key(template_bank)
         banks = self._prefill_stage_pool.setdefault(pool_key, [])
         self._prefill_stage_banks[int(layer_id)] = banks
@@ -1837,6 +1963,7 @@ class MoeOffloadRuntime:
         layer_id: int,
         buffer_index: int,
     ) -> object | None:
+        self._validate_prefill_buffer_index(buffer_index)
         template_bank = self._slot_banks.get(int(layer_id))
         if template_bank is None:
             return None
@@ -1852,6 +1979,7 @@ class MoeOffloadRuntime:
         buffer_index: int,
         event: object | None,
     ) -> None:
+        self._validate_prefill_buffer_index(buffer_index)
         if event is None:
             return
         template_bank = self._slot_banks.get(int(layer_id))
@@ -1868,8 +1996,7 @@ class MoeOffloadRuntime:
         num_logical_experts: int,
         device: torch.device,
     ) -> torch.Tensor:
-        if buffer_index < 0:
-            raise ValueError(f"buffer_index must be non-negative, got {buffer_index}")
+        self._validate_prefill_buffer_index(buffer_index)
         if num_logical_experts <= 0:
             raise ValueError("num_logical_experts must be greater than 0")
         buffers = self._prefill_stage_log2phy_buffers.setdefault(int(layer_id), [])
@@ -1895,6 +2022,14 @@ class MoeOffloadRuntime:
                 f"{buffer_index} is on {buf.device}, expected {device}"
             )
         return buf
+
+    def _validate_prefill_buffer_index(self, buffer_index: int) -> None:
+        count = int(self.config.effective_prefill_buffer_count)
+        if int(buffer_index) < 0 or int(buffer_index) >= count:
+            raise RuntimeError(
+                f"prefill buffer index {buffer_index} is outside configured capacity "
+                f"prefill_buffer_count={count}"
+            )
 
     def _npu_hbm_snapshot(self, device: torch.device) -> dict[str, object]:
         """Best-effort allocator/physical-HBM snapshot for allocation evidence."""
@@ -1952,6 +2087,7 @@ class MoeOffloadRuntime:
                 "stage_fixed_slot_plan must run eager (outside graph capture); "
                 "it performs host decision + H2D staging"
             )
+        self._assert_locked_slot_addresses(int(layer_id))
         buf = self._log2phy_buffers[int(layer_id)]
         prepared = self.prepare_fixed_slot_plan_into_log2phy(
             layer_id=int(layer_id),
@@ -1982,6 +2118,7 @@ class MoeOffloadRuntime:
         buf = self._log2phy_buffers.get(layer_id)
         if slot_bank is None or buf is None:
             return None
+        self._lock_graph_slot_addresses(layer_id)
         from vllm_moe_offload_ascend.moe_offload.slot_mapping import ExpertSlotMapping
 
         mapping = ExpertSlotMapping(
@@ -1995,6 +2132,40 @@ class MoeOffloadRuntime:
             active_slot_ids=(),
         )
         return PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
+
+    def _slot_address_fingerprint(self, layer_id: int) -> SlotAddressFingerprint:
+        slot_bank = self._slot_banks.get(int(layer_id))
+        log2phy = self._log2phy_buffers.get(int(layer_id))
+        if slot_bank is None or log2phy is None:
+            raise RuntimeError(
+                f"layer {layer_id} has no fixed-slot tensors to fingerprint"
+            )
+        return SlotAddressFingerprint(
+            w13_data_ptr=int(slot_bank.w13_slots.data_ptr()),
+            w2_data_ptr=int(slot_bank.w2_slots.data_ptr()),
+            log2phy_data_ptr=int(log2phy.data_ptr()),
+            w13_shape=tuple(int(dim) for dim in slot_bank.w13_slots.shape),
+            w2_shape=tuple(int(dim) for dim in slot_bank.w2_slots.shape),
+            log2phy_shape=tuple(int(dim) for dim in log2phy.shape),
+            device=str(slot_bank.w13_slots.device),
+            dtype=str(slot_bank.w13_slots.dtype),
+        )
+
+    def _lock_graph_slot_addresses(self, layer_id: int) -> None:
+        fingerprint = self._slot_address_fingerprint(layer_id)
+        existing = self._graph_slot_address_fingerprints.get(int(layer_id))
+        if existing is None:
+            self._graph_slot_address_fingerprints[int(layer_id)] = fingerprint
+            return
+        if existing != fingerprint:
+            raise RuntimeError(
+                f"fixed-slot address fingerprint changed for captured layer {layer_id}"
+            )
+
+    def _assert_locked_slot_addresses(self, layer_id: int) -> None:
+        if int(layer_id) not in self._graph_slot_address_fingerprints:
+            return
+        self._lock_graph_slot_addresses(int(layer_id))
 
     def stage_full_residency_slot_plan(self, *, layer_id: int) -> bool:
         """Regime A staging hook: one-time fill of slots + log2phy before capture.

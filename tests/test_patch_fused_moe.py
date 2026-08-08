@@ -1,14 +1,245 @@
 import sys
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 import vllm_moe_offload_ascend
 from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+    _ascend_device_op_is_initializing,
+    _install_runtime_patches_when_ready,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
     _patch_kv_cache_capacity_backstop,
+    _unpack_mlp_apply_result,
 )
+
+
+def test_runtime_patch_install_waits_for_ascend_device_op(monkeypatch):
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    device_op = ModuleType("vllm_ascend.device.device_op")
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_inject_sys_modules",
+        lambda: pytest.fail("must not import Ascend ops during device-op initialization"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_install_runtime_module_patches",
+        lambda: pytest.fail("must not patch runtime modules during device-op initialization"),
+    )
+
+    assert _ascend_device_op_is_initializing() is True
+    assert _install_runtime_patches_when_ready() is False
+
+
+def test_runtime_patch_install_registers_custom_ops_before_moe_modules(monkeypatch):
+    import importlib
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    device_op = ModuleType("vllm_ascend.device.device_op")
+    device_op.DeviceOperator = object
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+    events = []
+
+    original_import_module = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == "vllm_ascend.ops.register_custom_ops":
+            events.append("register_custom_ops")
+            return ModuleType(name)
+        return original_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_inject_sys_modules",
+        lambda: events.append("inject_sys_modules"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_install_runtime_module_patches",
+        lambda: events.append("install_runtime_module_patches"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_patch_rms_norm_bias_cann_compat",
+        lambda: events.append("patch_rms_norm_bias_cann_compat"),
+    )
+
+    assert _ascend_device_op_is_initializing() is False
+    assert _install_runtime_patches_when_ready() is True
+    assert events == [
+        "register_custom_ops",
+        "patch_rms_norm_bias_cann_compat",
+        "inject_sys_modules",
+        "install_runtime_module_patches",
+    ]
+
+
+def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
+    import importlib
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeRMSNorm:
+        weight = "weight"
+        variance_epsilon = 1e-6
+        bias = None
+
+        def forward_oot(self, x, residual=None):
+            return ("original", x, residual)
+
+    fake_layernorm = ModuleType("vllm_ascend.ops.layernorm")
+    fake_layernorm.AscendRMSNorm = FakeRMSNorm
+    original_import_module = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == "vllm_ascend.ops.layernorm":
+            return fake_layernorm
+        return original_import_module(name, package)
+
+    fake_torch = ModuleType("torch")
+    fake_torch.ops = SimpleNamespace(
+        vllm=SimpleNamespace(maybe_chunk_residual=lambda _x, residual: residual)
+    )
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.npu_add_rms_norm = lambda x, residual, weight, eps: (
+        ("normalized", x, residual, weight, eps),
+        None,
+        "next_residual",
+    )
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(patch_fused_moe, "_opapi_supports_add_rms_norm_bias", lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    patch_fused_moe._patch_rms_norm_bias_cann_compat()
+
+    assert FakeRMSNorm().forward_oot("x", "residual") == (
+        ("normalized", "x", "residual", "weight", 1e-6),
+        "next_residual",
+    )
+    assert FakeRMSNorm().forward_oot("x") == ("original", "x", None)
+
+
+def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
+    import vllm_ascend.platform as platform
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeNPUPlatform:
+        @classmethod
+        def check_and_update_config(cls, _vllm_config):
+            return None
+
+    monkeypatch.setattr(platform, "NPUPlatform", FakeNPUPlatform)
+    monkeypatch.setattr(patch_fused_moe, "_install_runtime_module_patches", lambda: None)
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "1")
+
+    patch_fused_moe._patch_platform_splitting_ops()
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            splitting_ops=[],
+        )
+    )
+
+    FakeNPUPlatform.check_and_update_config(config)
+
+    assert "vllm::moe_offload_stage" in config.compilation_config.splitting_ops
+
+
+def test_comm_hook_resolves_contracts_from_new_runtime_args(monkeypatch):
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeCommMethod:
+        def fused_experts(self, fused_experts_input):
+            return fused_experts_input
+
+        def _maybe_apply_moe_offload_plan(self, fused_experts_input):
+            return fused_experts_input
+
+    runtime_args = ModuleType("vllm_ascend.ops.fused_moe.moe_runtime_args")
+    runtime_args.MoEFusedExpertsInput = SimpleNamespace
+    runtime_args.MoEOffloadParams = SimpleNamespace
+    runtime_args.MoERoutingParams = SimpleNamespace
+    runtime_args.MoEWeights = SimpleNamespace
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.ops.fused_moe.moe_runtime_args",
+        runtime_args,
+    )
+
+    fake_comm = SimpleNamespace(
+        MoECommMethod=FakeCommMethod,
+        build_token_dispatch_input=lambda **kwargs: kwargs,
+        build_mlp_compute_input=lambda **kwargs: kwargs,
+        FusedExpertsResult=SimpleNamespace,
+        setup_moe_comm_method=None,
+    )
+
+    patch_fused_moe._patch_moe_comm_method_runtime_hooks(fake_comm)
+
+    assert (
+        FakeCommMethod._maybe_apply_moe_offload_plan._ascend_moe_offload_patch_tag
+        == "vllm_moe_offload_ascend.moe_comm_method_runtime"
+    )
+
+
+def test_graph_compatible_unregistered_slot_layer_fails_closed():
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(graph_compatible_offload=True),
+        should_use_fixed_slot_plan_for_layer=lambda layer_id: layer_id == 7,
+        capture_safe_slot_weights=lambda **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to capture or replay"):
+        patch_fused_moe._graph_capture_slot_weights(runtime, layer_id=7)
+
+
+def test_graph_capture_stage_rejects_unregistered_fixed_slot_layer(monkeypatch):
+    import torch
+
+    from vllm_moe_offload_ascend.moe_offload import runtime as runtime_mod
+    from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
+    from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=1,
+            graph_compatible_offload=True,
+        )
+    )
+    monkeypatch.setattr(runtime_mod, "_runtime", runtime)
+    monkeypatch.setattr(runtime_mod, "_is_current_graph_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="unregistered fixed-slot MoE layer"):
+        moe_offload_stage_op._moe_offload_stage_impl(
+            torch.tensor([[0]], dtype=torch.int32),
+            layer_id=7,
+            num_logical_experts=4,
+            phase=0,
+        )
+
+
+def test_unpack_mlp_apply_result_supports_old_and_new_contracts():
+    output = object()
+    event = object()
+
+    assert _unpack_mlp_apply_result(output) == (output, None)
+    assert _unpack_mlp_apply_result((output, event)) == (output, event)
+    with pytest.raises(RuntimeError, match="unsupported tuple"):
+        _unpack_mlp_apply_result((output, event, object()))
 
 
 def test_kv_backstop_is_scoped_to_moe_offload_env(monkeypatch):
@@ -290,6 +521,23 @@ def test_register_aliases_plugin_modules_under_vllm_ascend_namespace(monkeypatch
     assert vllm_ascend.moe_offload is plugin_pkg
     assert get_moe_offload_runtime.__module__ == "vllm_moe_offload_ascend.moe_offload.runtime"
 
+@pytest.mark.parametrize(
+    "tool_path",
+    (
+        "tools/run_fixed_slot_smoke.py",
+        "tools/collect_moe_trace.py",
+        "tools/analyze_layered_strategy.py",
+        "tools/run_ascend_moe_profile_suite.py",
+        "tools/simulate_expert_slots.py",
+        "tools/measure_expert_transfer_breakdown.py",
+    ),
+)
+def test_tools_import_plugin_modules_without_ascend_alias(tool_path):
+    source = (Path(__file__).resolve().parents[1] / tool_path).read_text(encoding="utf-8")
+    assert "vllm_ascend.moe_offload" not in source
+    assert "vllm_moe_offload_ascend.moe_offload" in source
+
+
 
 def test_register_aliases_sew_custom_op_modules(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14")
@@ -390,8 +638,22 @@ def test_seam_forward_prefill_resident_uses_native_fused_moe(monkeypatch):
     expected = torch.empty_like(hidden_states)
     calls = []
 
-    def fake_moe_forward(hidden, logits, shared_experts_input, input_ids, layer_name):
-        calls.append(("moe_forward", layer_name, tuple(hidden.shape)))
+    def fake_moe_forward(
+        hidden,
+        logits,
+        shared_experts_input,
+        input_ids,
+        layer_name,
+        hidden_dim_unpadded,
+    ):
+        calls.append(
+            (
+                "moe_forward",
+                layer_name,
+                tuple(hidden.shape),
+                hidden_dim_unpadded,
+            )
+        )
         return expected
 
     def forbidden_op(*args, **kwargs):
@@ -428,11 +690,12 @@ def test_seam_forward_prefill_resident_uses_native_fused_moe(monkeypatch):
         shared_experts_input=None,
         input_ids=None,
         layer_name="ignored.layer.name",
+        hidden_dim_unpadded=0,
     )
 
     assert out is expected
     assert runtime.resident_checks == [3]
-    assert calls == [("moe_forward", "ignored.layer.name", (4, 16))]
+    assert calls == [("moe_forward", "ignored.layer.name", (4, 16), 0)]
     assert events == [
         {
             "name": "prefill_resident_native",
@@ -888,6 +1151,31 @@ def test_stage_op_large_topk_counter_does_not_keep_flat_ids():
 # M4: router fake/real dtype alignment
 # ---------------------------------------------------------------------------
 
+def test_moe_mlp_fake_honors_unpadded_output_width():
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe.moe_mlp_op import _moe_mlp_fake
+
+    hidden = torch.empty((4, 16), dtype=torch.bfloat16)
+    logits = torch.empty((4, 64), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.bfloat16)
+    topk_ids = torch.empty((4, 2), dtype=torch.int32)
+
+    out = _moe_mlp_fake(
+        hidden,
+        logits,
+        topk_weights,
+        topk_ids,
+        None,
+        None,
+        "model.layers.3.mlp.experts",
+        12,
+    )
+
+    assert out.shape == (4, 12)
+    assert out.dtype == hidden.dtype
+
+
 def test_moe_router_fake_returns_hidden_states_dtype_not_logits_dtype():
     """M4: the router fake op must proxy topk_weights as hidden_states.dtype
     (matching the real _native_select_experts cast), not router_logits.dtype.
@@ -995,3 +1283,13 @@ def test_seam_guard_returns_false_when_layer_has_no_layer_id(monkeypatch):
         "seam guard must return False for layers without layer_id to avoid "
         "cross-layer collision on key=-1"
     )
+
+def test_graph_tools_default_to_graph_mode_and_reject_forced_eager(monkeypatch):
+    from tools import collect_moe_trace, run_fixed_slot_smoke
+
+    for parser, args in ((collect_moe_trace.parse_args, ["tool", "--output", "/tmp/moe-trace.jsonl"]), (run_fixed_slot_smoke.parse_args, ["tool", "--output-dir", "/tmp/smoke"])):
+        monkeypatch.setattr(sys, "argv", args)
+        assert parser().enforce_eager is False
+        monkeypatch.setattr(sys, "argv", [*args, "--enforce-eager"])
+        with pytest.raises(SystemExit):
+            parser()

@@ -135,10 +135,21 @@ def _moe_offload_stage_impl(
         get_moe_offload_runtime,
     )
 
+    runtime = get_moe_offload_runtime()
+    layer_id = int(layer_id)
+
     # During capture we must not perform host sync / conditional H2D. In the
     # canonical flow the captured graph only reads the fixed slot tensors + the
     # fixed log2phy buffer; staging is a no-op here.
     if _is_current_graph_capturing():
+        if (
+            runtime.should_use_fixed_slot_plan_for_layer(layer_id)
+            and not runtime.is_layer_registered(layer_id)
+        ):
+            raise RuntimeError(
+                "ACLGraph capture reached an unregistered fixed-slot MoE layer "
+                f"{layer_id}; refusing native-weight fallback"
+            )
         if os.environ.get("SEW_SEAM_PROBE"):
             _PROBE_CALLS["capturing"] += 1
             print(
@@ -147,9 +158,6 @@ def _moe_offload_stage_impl(
                 flush=True,
             )
         return
-
-    runtime = get_moe_offload_runtime()
-    layer_id = int(layer_id)
 
     # Regime A (num_slots >= num_logical_experts): the log2phy mapping is STATIC
     # and was already filled for all experts before capture
@@ -188,7 +196,10 @@ def _moe_offload_stage_impl(
                 f"layer={layer_id} count={_PROBE_CALLS['eager_passthrough']}",
                 flush=True,
             )
-        return
+        raise RuntimeError(
+            f"fixed-slot MoE layer {layer_id} is not registered; refusing "
+            "native-weight fallback"
+        )
 
     # D2H read of the active logical expert set. This is the host decision that
     # ACLGraph cannot record — legal here only because this op runs eager.

@@ -112,7 +112,7 @@ def maybe_process_unquantized_cpu_first_weights(
 
     w13_weight = getattr(layer, "w13_weight")
     w2_weight = getattr(layer, "w2_weight")
-    if w13_weight.device.type != "cpu" or w2_weight.device.type != "cpu":
+    if not _can_process_cpu_first_weight_pair(w13_weight, w2_weight):
         return False
 
     slot_device = _current_npu_device_or_cpu()
@@ -143,6 +143,22 @@ def maybe_process_unquantized_cpu_first_weights(
 
 def is_cpu_first_layer(layer: torch.nn.Module) -> bool:
     return bool(getattr(layer, CPU_FIRST_MARKER, False))
+def _can_process_cpu_first_weight_pair(
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+) -> bool:
+    """Accept CPU weights and vLLM's temporary NPU loading-context weights.
+
+    ``process_weights_after_loading`` moves CPU parameters to the target
+    accelerator before invoking the quant method. The formatted copies still
+    return to CPU before fixed-slot host-store registration, so accepting NPU
+    here does not turn CPU-first loading into resident-weight loading.
+    """
+
+    w13_device = w13_weight.device.type
+    w2_device = w2_weight.device.type
+    return w13_device == w2_device and w13_device in {"cpu", "npu"}
+
 
 
 def _format_ascend_unquantized_weight(
@@ -227,3 +243,42 @@ def _layer_id(layer: torch.nn.Module) -> int:
         return int(getattr(layer, "layer_id", -1))
     except Exception:
         return -1
+
+
+def ensure_moe_layer_id(layer: torch.nn.Module) -> int:
+    """Restore the layer index for vLLM RoutedExperts containers.
+
+    Newer vLLM versions keep ``layer_name`` on RoutedExperts but expose the
+    ``layer_id`` property only on the outer MoERunner. The Ascend offload hook
+    receives RoutedExperts during weight creation and post-processing, so
+    cache the index there before CPU-first and fixed-slot decisions run.
+    """
+
+    layer_id = _layer_id(layer)
+    if layer_id >= 0:
+        return layer_id
+
+    layer_name = getattr(layer, "layer_name", "")
+    if layer_name:
+        try:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            layer_id = int(extract_layer_index(str(layer_name)))
+        except (AttributeError, TypeError, ValueError):
+            layer_id = -1
+        if layer_id >= 0:
+            setattr(layer, "layer_id", layer_id)
+            return layer_id
+
+    # Weight creation runs before Qwen's RoutedExperts container receives its
+    # path-derived layer_name. FusedMoE already assigns this stable index in its
+    # constructor, so use it to enable CPU-first allocation at that earlier
+    # lifecycle point.
+    try:
+        layer_id = int(getattr(layer, "moe_layer_id", -1))
+    except (TypeError, ValueError):
+        return -1
+    if layer_id < 0:
+        return -1
+    setattr(layer, "layer_id", layer_id)
+    return layer_id
