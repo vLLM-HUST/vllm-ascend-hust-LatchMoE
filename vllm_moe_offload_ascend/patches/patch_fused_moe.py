@@ -560,7 +560,7 @@ def _patch_adapt_patch_reinstall() -> None:
     def adapt_patch(*args, **kwargs):
         result = current(*args, **kwargs)
         try:
-            _install_runtime_module_patches()
+            _install_runtime_patches_when_ready()
             _patch_kv_cache_capacity_backstop()
         except Exception as exc:
             if _to_bool_env("SEW_PATCH_PROBE", "0"):

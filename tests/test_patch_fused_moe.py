@@ -79,6 +79,39 @@ def test_runtime_patch_install_registers_custom_ops_before_moe_modules(monkeypat
     ]
 
 
+def test_adapt_patch_retries_complete_ready_path(monkeypatch):
+    import vllm_ascend.utils as ascend_utils
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    events = []
+
+    def original_adapt_patch(*args, **kwargs):
+        events.append(("original", args, kwargs))
+        return "adapted"
+
+    monkeypatch.setattr(ascend_utils, "adapt_patch", original_adapt_patch)
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_install_runtime_patches_when_ready",
+        lambda: events.append("ready"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_patch_kv_cache_capacity_backstop",
+        lambda: events.append("kv_backstop"),
+    )
+
+    patch_fused_moe._patch_adapt_patch_reinstall()
+
+    assert ascend_utils.adapt_patch("worker", stage="late") == "adapted"
+    assert events == [
+        ("original", ("worker",), {"stage": "late"}),
+        "ready",
+        "kv_backstop",
+    ]
+
+
 def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
     import importlib
 
