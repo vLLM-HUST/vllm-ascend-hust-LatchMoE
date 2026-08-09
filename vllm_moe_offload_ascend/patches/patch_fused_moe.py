@@ -2553,6 +2553,7 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
         get_moe_offload_runtime,
     )
     from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import (
+        ensure_moe_layer_id,
         maybe_create_unquantized_cpu_first_weights,
         maybe_process_unquantized_cpu_first_weights,
     )
