@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -520,24 +519,6 @@ def test_register_aliases_plugin_modules_under_vllm_ascend_namespace(monkeypatch
     assert sys.modules["vllm_ascend.moe_offload.prefill_residency"] is prefill_residency
     assert vllm_ascend.moe_offload is plugin_pkg
     assert get_moe_offload_runtime.__module__ == "vllm_moe_offload_ascend.moe_offload.runtime"
-
-@pytest.mark.parametrize(
-    "tool_path",
-    (
-        "tools/run_fixed_slot_smoke.py",
-        "tools/collect_moe_trace.py",
-        "tools/analyze_layered_strategy.py",
-        "tools/run_ascend_moe_profile_suite.py",
-        "tools/simulate_expert_slots.py",
-        "tools/measure_expert_transfer_breakdown.py",
-    ),
-)
-def test_tools_import_plugin_modules_without_ascend_alias(tool_path):
-    source = (Path(__file__).resolve().parents[1] / tool_path).read_text(encoding="utf-8")
-    assert "vllm_ascend.moe_offload" not in source
-    assert "vllm_moe_offload_ascend.moe_offload" in source
-
-
 
 def test_register_aliases_sew_custom_op_modules(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14")

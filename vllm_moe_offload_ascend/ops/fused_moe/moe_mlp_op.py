@@ -73,6 +73,7 @@ def _moe_mlp_impl(
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     layer_name: str,
+    hidden_dim_unpadded: int = -1,
 ) -> torch.Tensor:
     """Run the routed-experts MLP using the router's precomputed topk.
 
@@ -135,9 +136,14 @@ def _moe_mlp_fake(
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     layer_name: str,
+    hidden_dim_unpadded: int = -1,
 ) -> torch.Tensor:
     # Routed output has the same shape/dtype as hidden_states (mirrors
     # _moe_forward_fake, moe_runner.py:114).
+    if hidden_dim_unpadded > 0:
+        return hidden_states.new_empty(
+            (*hidden_states.shape[:-1], hidden_dim_unpadded)
+        )
     return torch.empty_like(hidden_states)
 
 

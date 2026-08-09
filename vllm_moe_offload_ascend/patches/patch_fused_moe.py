@@ -2777,6 +2777,7 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         shared_experts_input,
         input_ids,
         layer_name,
+        hidden_dim_unpadded=None,
     ):
         decision = getattr(self, "_seam_active", None)
         if decision is None:

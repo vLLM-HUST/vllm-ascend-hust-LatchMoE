@@ -91,7 +91,11 @@ def _path_exists(path: str | Path) -> tuple[bool, str | None]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def validate_config(config: dict[str, Any]) -> list[str]:
+def validate_config(
+    config: dict[str, Any],
+    *,
+    check_resource_paths: bool = True,
+) -> list[str]:
     issues: list[str] = []
     required = {
         "benchmark",
@@ -119,7 +123,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     if dataset.get("synthetic_smoke_allowed") is not False:
         issues.append("dataset.synthetic_smoke_allowed must be false")
     dataset_path = dataset.get("local_path")
-    if dataset_path:
+    if check_resource_paths and dataset_path:
         exists, error = _path_exists(dataset_path)
         if not exists:
             detail = f" ({error})" if error else ""
@@ -128,7 +132,7 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     model = config.get("model") or {}
     for key in ("path", "tokenizer"):
         value = model.get(key)
-        if value:
+        if check_resource_paths and value:
             exists, error = _path_exists(value)
             if not exists:
                 detail = f" ({error})" if error else ""
