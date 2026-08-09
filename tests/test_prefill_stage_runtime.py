@@ -1048,6 +1048,44 @@ def test_capture_safe_slot_weights_locks_fixed_address_fingerprint():
         runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
 
 
+def test_begin_slot_compute_refuses_h2d_slot_until_ready_event_completes():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=1))
+    runtime.register_layer_for_fixed_slots(TinyLayer(), slot_device=torch.device("cpu"))
+    prepared = runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0,),
+        num_logical_experts=4,
+    )
+    slot = runtime._slot_banks[7].slots[prepared.mapping.active_slot_ids[0]]
+    slot.state = SlotState.LOADING
+    ready_event = TransferReadyEvent(object(), ((slot, slot.lease()),))
+
+    with pytest.raises(RuntimeError, match="not ready for compute"):
+        runtime.begin_slot_compute(prepared)
+
+    ready_event.mark_ready()
+    handle = runtime.begin_slot_compute(prepared)
+    assert handle is not None
+    runtime.end_slot_compute(handle)
+
+
+def test_staging_fails_closed_if_captured_slot_address_changes():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(enabled=True, num_slots=1, graph_compatible_offload=True)
+    )
+    runtime.register_layer_for_fixed_slots(TinyLayer(), slot_device=torch.device("cpu"))
+    assert runtime.capture_safe_slot_weights(layer_id=7) is not None
+
+    bank = runtime._slot_banks[7]
+    bank.w13_slots = bank.w13_slots.clone()
+    with pytest.raises(RuntimeError, match="address fingerprint changed"):
+        runtime.stage_fixed_slot_plan(
+            layer_id=7,
+            active_experts=(0,),
+            num_logical_experts=4,
+        )
+
+
 def test_stage_fixed_slot_plan_batches_decode_misses_async(monkeypatch):
     runtime = MoeOffloadRuntime(
         MoeOffloadConfig(

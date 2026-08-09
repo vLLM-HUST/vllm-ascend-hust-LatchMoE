@@ -37,6 +37,10 @@ from vllm_moe_offload_ascend.moe_offload.compute_bucket import (
 )
 from vllm_moe_offload_ascend.moe_offload.expert_key import ExpertKey
 from vllm_moe_offload_ascend.moe_offload.host_store import HostExpertStore
+from vllm_moe_offload_ascend.moe_offload.placement_plan import (
+    PlacementPlanProvider,
+    resolve_placement_plan,
+)
 from vllm_moe_offload_ascend.moe_offload.profile_io import append_jsonl
 from vllm_moe_offload_ascend.moe_offload.slot_bank import (
     ExpertSlotBank,
@@ -227,6 +231,33 @@ class MoeOffloadRuntime:
         self._prefill_route_stats_by_layer: dict[int, MoePrefillRouteStats] = {}
         self._active_slot_ids_by_layer: dict[int, tuple[int, ...]] = {}
         self._slot_compute_done_events: dict[tuple[int, int, int], object] = {}
+        self._placement_plan_provider: PlacementPlanProvider | None = None
+
+    def set_placement_plan_provider(
+        self,
+        provider: PlacementPlanProvider | None,
+    ) -> None:
+        """Install a policy-neutral placement-plan provider.
+
+        The provider has no access to slot storage and may only reorder the
+        experts already selected by the router. This preserves LatchMoE's
+        ownership of address-stable slot allocation and transfer lifecycle.
+        """
+        self._placement_plan_provider = provider
+
+    def _resolve_placement_plan(
+        self,
+        *,
+        layer_id: int,
+        active_experts: tuple[int, ...],
+        num_logical_experts: int,
+    ) -> tuple[int, ...]:
+        return resolve_placement_plan(
+            self._placement_plan_provider,
+            layer_id=int(layer_id),
+            routed_experts=active_experts,
+            num_logical_experts=int(num_logical_experts),
+        )
 
     def trace_routing(
         self,
@@ -2087,6 +2118,11 @@ class MoeOffloadRuntime:
                 "stage_fixed_slot_plan must run eager (outside graph capture); "
                 "it performs host decision + H2D staging"
             )
+        active_experts = self._resolve_placement_plan(
+            layer_id=int(layer_id),
+            active_experts=active_experts,
+            num_logical_experts=int(num_logical_experts),
+        )
         self._assert_locked_slot_addresses(int(layer_id))
         buf = self._log2phy_buffers[int(layer_id)]
         prepared = self.prepare_fixed_slot_plan_into_log2phy(
