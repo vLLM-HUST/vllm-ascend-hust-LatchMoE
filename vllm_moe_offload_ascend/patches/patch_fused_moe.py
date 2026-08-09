@@ -99,7 +99,11 @@ def _inject_sys_modules() -> None:
         setattr(_plugin_pkg, name, mod)
 
     try:
-        import vllm_ascend.ops.fused_moe as _ascend_fused_moe_pkg
+        _ascend_ops_pkg = importlib.import_module("vllm_ascend.ops")
+        setattr(vllm_ascend, "ops", _ascend_ops_pkg)
+        _ascend_fused_moe_pkg = importlib.import_module(
+            "vllm_ascend.ops.fused_moe"
+        )
         import vllm_moe_offload_ascend.ops.fused_moe as _plugin_ops_pkg
 
         _OPS_SUBMODULES = [
@@ -2779,19 +2783,25 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         layer_name,
         hidden_dim_unpadded=None,
     ):
+        def _native_moe_forward():
+            args = [
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                layer_name,
+            ]
+            if hidden_dim_unpadded is not None:
+                args.append(hidden_dim_unpadded)
+            return torch.ops.vllm.moe_forward(*args)
+
         decision = getattr(self, "_seam_active", None)
         if decision is None:
             decision = self._resolve_seam_per_layer_guards()
             self._seam_active = decision
 
         if not decision:
-            return torch.ops.vllm.moe_forward(
-                hidden_states,
-                router_logits,
-                shared_experts_input,
-                input_ids,
-                layer_name,
-            )
+            return _native_moe_forward()
 
         from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
         runtime = get_moe_offload_runtime()
@@ -2820,13 +2830,7 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
                 )
             )
             profile_start = perf_counter() if profile_enabled else 0.0
-            out = torch.ops.vllm.moe_forward(
-                hidden_states,
-                router_logits,
-                shared_experts_input,
-                input_ids,
-                layer_name,
-            )
+            out = _native_moe_forward()
             if profile_enabled:
                 runtime._record_profile_event(
                     "prefill_resident_native",
