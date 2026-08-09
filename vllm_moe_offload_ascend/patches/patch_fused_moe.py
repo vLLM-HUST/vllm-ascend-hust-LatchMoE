@@ -37,6 +37,13 @@ from collections.abc import Callable
 from typing import Any
 
 
+def _ascend_device_op_is_initializing() -> bool:
+    """Return whether vLLM-Ascend is in its device-op import cycle."""
+
+    module = sys.modules.get("vllm_ascend.device.device_op")
+    return module is not None and not hasattr(module, "DeviceOperator")
+
+
 # ---------------------------------------------------------------------------
 # Step 1 – sys.modules injection
 # ---------------------------------------------------------------------------
