@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+runtime_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 seam_root=""
 model=""
 device="0"
@@ -61,7 +61,7 @@ python "${runtime_root}/benchmark/scripts/collect_issue4_manifest.py" \
 npu-smi info > "${run_dir}/npu-smi-before.txt" 2>&1 || true
 
 smoke_command=(
-    python "${runtime_root}/tools/run_fixed_slot_smoke.py"
+    python "${runtime_root}/benchmark/scripts/run_fixed_slot_smoke.py"
     --config "${runtime_root}/benchmark/configs/sew_offload_v1.yaml"
     --mode fixed_slot_sync
     --model "$model"
