@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
@@ -35,10 +36,19 @@ def _command_output(command: list[str]) -> str | None:
 
 def _package_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
-    for name in ("torch", "torch_npu", "vllm", "vllm_ascend"):
+    distributions = {
+        "torch": "torch",
+        "torch_npu": "torch_npu",
+        "vllm": "vllm",
+        "vllm_ascend": "vllm-ascend",
+    }
+    for name, distribution in distributions.items():
         try:
             module = __import__(name)
-            versions[name] = getattr(module, "__version__", None)
+            module_version = getattr(module, "__version__", None)
+            versions[name] = module_version or version(distribution)
+        except PackageNotFoundError:
+            versions[name] = "distribution metadata unavailable"
         except Exception as exc:
             versions[name] = f"unavailable: {type(exc).__name__}"
     return versions
@@ -62,6 +72,12 @@ def main() -> None:
 
     command_file = Path(args.command_file)
     command = command_file.read_text(encoding="utf-8") if command_file.exists() else ""
+    smoke_command_path = run_dir / "smoke_command.txt"
+    smoke_command = (
+        smoke_command_path.read_text(encoding="utf-8")
+        if smoke_command_path.exists()
+        else ""
+    )
     tracked_env = {
         key: value
         for key, value in sorted(os.environ.items())
@@ -87,6 +103,7 @@ def main() -> None:
         "seam_commit": _git_revision(Path(args.seam_root)),
         "device": str(args.device),
         "command": command,
+        "smoke_command": smoke_command,
         "environment": tracked_env,
         "package_versions": _package_versions(),
         "npu_smi": _command_output(["npu-smi", "info"]),

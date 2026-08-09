@@ -11,4 +11,4 @@ benchmark/scripts/run_issue4_graph_repro.sh \
   --device 0
 ```
 
-The run directory contains the command, environment, both commit SHAs, NPU inventory, raw console output, generated tokens, H2D profile events, and `graph_verification.json`. The verifier fails if capture/replay evidence is absent or if it observes a seam guard failure, missing capture weights, or an uppercase fallback/bypass/full-weight/native path marker.
+The run directory contains the wrapper command, exact smoke subcommand, environment, both commit SHAs, NPU inventory, raw console output, generated tokens, H2D profile events, and `graph_verification.json`. The verifier fails if capture/replay evidence is absent or if it observes a seam guard failure, missing capture weights, or an uppercase fallback/bypass/full-weight/native path marker.
