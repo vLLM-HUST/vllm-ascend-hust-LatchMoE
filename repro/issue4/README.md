@@ -1,6 +1,6 @@
 # Issue #4 Reproduction
 
-LatchMoE keeps its runtime implementation in this repository. The Ascend fused-MoE hook is a separately checked out dependency, pinned by `seam.lock`; this repository does not contain a Git submodule and must not replace the runtime package with the hook repository.
+LatchMoE keeps its runtime implementation in this repository. The Ascend fused-MoE hook is a separately checked out dependency, pinned by `seam.lock`; this repository does not contain a Git submodule and must not replace the runtime package with the hook repository. Issue #4 uses the public `feature/latchmoe-offload-seam-v1-v021` seam because the evidence stack is pinned to vLLM 0.21.0 and CANN 9.0.0. The similarly named current-main branch is a separate compatibility line and is not interchangeable with this lock.
 
 Run the graph smoke from a clean LatchMoE checkout with the matching clean seam checkout:
 

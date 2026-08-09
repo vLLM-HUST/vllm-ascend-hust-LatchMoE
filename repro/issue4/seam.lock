@@ -1,7 +1,7 @@
 format=1
 seam_repo=https://github.com/vLLM-HUST/vllm-ascend-hust.git
-seam_branch=feature/latchmoe-offload-seam-v1
-seam_commit=4806367e
+seam_branch=feature/latchmoe-offload-seam-v1-v021
+seam_commit=4806367eeeb7d62b32078ae90cd929cc06d825fe
 vllm_ascend_base_commit=80610e44
 vllm_version=0.21.0
 cann_version=9.0.0
