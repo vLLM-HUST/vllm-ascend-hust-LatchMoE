@@ -246,11 +246,18 @@ def _moe_offload_stage_impl(
         and active_count > int(runtime.config.num_slots)
     )
     if b2_phase_match or b2_overflow_fallback:
+        route_stats_cache_enabled = str(
+            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         device_pair_planning = str(
             os.getenv("VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
         pair_offsets_by_expert: dict[int, tuple[int, ...]] | None = None
-        if token_counts_by_expert and not device_pair_planning:
+        if (
+            route_stats_cache_enabled
+            and token_counts_by_expert
+            and not device_pair_planning
+        ):
             flat_ids = (
                 flat_topk_id_list
                 if flat_topk_id_list is not None
@@ -268,12 +275,13 @@ def _moe_offload_stage_impl(
                 for expert_id, offsets in buckets.items()
                 if offsets
             }
-        runtime.cache_prefill_route_stats(
-            layer_id=layer_id,
-            topk_ids=topk_ids,
-            token_counts_by_expert=token_counts_by_expert,
-            pair_offsets_by_expert=pair_offsets_by_expert,
-        )
+        if route_stats_cache_enabled:
+            runtime.cache_prefill_route_stats(
+                layer_id=layer_id,
+                topk_ids=topk_ids,
+                token_counts_by_expert=token_counts_by_expert,
+                pair_offsets_by_expert=pair_offsets_by_expert,
+            )
         if os.environ.get("SEW_SEAM_PROBE") or os.environ.get("SEW_B2_PROBE"):
             _PROBE_CALLS["eager_passthrough"] += 1
             print(
@@ -282,6 +290,7 @@ def _moe_offload_stage_impl(
                 f"num_slots={runtime.config.num_slots} "
                 f"phase_match={int(b2_phase_match)} "
                 f"overflow_fallback={int(b2_overflow_fallback)} "
+                f"route_cache={int(route_stats_cache_enabled)} "
                 f"tokens={token_count_hint} "
                 f"max_num_seqs_hint={max_num_seqs_hint}",
                 flush=True,

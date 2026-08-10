@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
@@ -10,6 +11,7 @@ from vllm_moe_offload_ascend.moe_offload.cpu_first_loader import (
     ensure_moe_layer_id,
     maybe_create_unquantized_cpu_first_weights,
     maybe_process_unquantized_cpu_first_weights,
+    maybe_register_unquantized_fixed_slot_weights,
 )
 from vllm_moe_offload_ascend.moe_offload.host_store import ExpertWeightBundle, HostExpertStore
 from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
@@ -163,6 +165,63 @@ def test_cpu_first_process_formats_weights_and_registers_without_host_clone():
     assert bundle.w2.data_ptr() == layer.w2_weight[1].data_ptr()
 
 
+def test_normal_loading_registers_fixed_slots_and_retains_original_weights():
+    layer = TinyLayer()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.arange(4 * 3 * 2, dtype=torch.float32).reshape(4, 3, 2),
+        requires_grad=False,
+    )
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            cpu_first_load=False,
+            release_original_expert_weights=False,
+            pin_host_memory=False,
+        )
+    )
+
+    assert maybe_register_unquantized_fixed_slot_weights(
+        layer,
+        runtime=runtime,
+        slot_device=torch.device("cpu"),
+    )
+    assert runtime.is_layer_registered(7)
+    bundle = runtime._host_store.get(7, 1)
+    assert bundle.w13.data_ptr() != layer.w13_weight[1].data_ptr()
+    assert bundle.w2.data_ptr() != layer.w2_weight[1].data_ptr()
+    assert torch.equal(bundle.w13, layer.w13_weight[1])
+    assert torch.equal(bundle.w2, layer.w2_weight[1])
+    assert layer.w13_weight.shape == (4, 2, 3)
+    assert layer.w2_weight.shape == (4, 3, 2)
+
+
+def test_normal_loading_fixed_slot_registration_is_idempotent():
+    layer = TinyLayer()
+    layer.w13_weight = torch.nn.Parameter(torch.ones((4, 2, 3)), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.ones((4, 3, 2)), requires_grad=False)
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(enabled=True, num_slots=2, pin_host_memory=False)
+    )
+
+    assert maybe_register_unquantized_fixed_slot_weights(
+        layer,
+        runtime=runtime,
+        slot_device=torch.device("cpu"),
+    )
+    first_bank = runtime._slot_banks[7]
+    assert maybe_register_unquantized_fixed_slot_weights(
+        layer,
+        runtime=runtime,
+        slot_device=torch.device("cpu"),
+    )
+    assert runtime._slot_banks[7] is first_bank
+
+
 def test_host_store_clone_tensors_false_adopts_cpu_parameter_views():
     layer = TinyLayer()
     layer.w13_weight = torch.nn.Parameter(
@@ -196,12 +255,19 @@ def test_host_store_bundles_are_views_of_contiguous_layer_buffers():
 
     store.register_layer(layer, clone_tensors=True)
 
-    layer_buffer = store._layer_buffers[7]
+    layer_buffer = store.get_layer_buffer(7)
     bundle = store.get(7, 3)
     assert layer_buffer.w13.is_contiguous()
     assert layer_buffer.w2.is_contiguous()
     assert bundle.w13.data_ptr() == layer_buffer.w13[3].data_ptr()
     assert bundle.w2.data_ptr() == layer_buffer.w2[3].data_ptr()
+
+
+def test_host_store_get_layer_buffer_fails_closed_for_unknown_layer():
+    store = HostExpertStore()
+
+    with pytest.raises(KeyError, match="layer 99 is not registered"):
+        store.get_layer_buffer(99)
 
 
 def test_transfer_engine_builds_batch_view_for_contiguous_host_experts():

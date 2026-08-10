@@ -1126,6 +1126,8 @@ def test_device_wave_microbatch_planner_matches_exact_pair_coverage():
     plans = build_b2_device_wave_microbatch_plans(
         topk_ids,
         waves,
+        num_logical_experts=4,
+        active_experts=(0, 1, 2, 3),
         wave_pair_counts=(3, 3),
     )
     hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -1144,6 +1146,86 @@ def test_device_wave_microbatch_planner_matches_exact_pair_coverage():
         tuple(batch.restore_token_indices for batch in microbatches)
     )
     assert restored.sort().values.tolist() == [0, 0, 1, 1, 2, 2]
+
+
+@pytest.mark.parametrize(
+    ("active_experts", "expected_wave_count"),
+    (
+        (tuple(range(128)), 4),
+        (tuple(range(127)), 4),
+        (tuple(expert for expert in range(128) if expert != 126), 4),
+        ((0, 127), 1),
+    ),
+)
+def test_device_wave_planner_covers_expert_127_boundaries(
+    active_experts,
+    expected_wave_count,
+):
+    from vllm_moe_offload_ascend.moe_offload.phase_split import (
+        build_b2_device_wave_microbatch_plans,
+    )
+
+    waves = tuple(
+        tuple(active_experts[start : start + 32])
+        for start in range(0, len(active_experts), 32)
+    )
+    topk_ids = torch.tensor(active_experts, dtype=torch.long).reshape(-1, 1)
+    plans = build_b2_device_wave_microbatch_plans(
+        topk_ids,
+        waves,
+        num_logical_experts=128,
+        active_experts=active_experts,
+        wave_pair_counts=tuple(len(wave) for wave in waves),
+    )
+
+    assert len(plans) == expected_wave_count
+    offsets = torch.cat(tuple(plan.pair_offsets for plan in plans))
+    assert offsets.sort().values.tolist() == list(range(len(active_experts)))
+
+
+def test_device_wave_planner_rejects_wave_union_mismatch_before_gather():
+    from vllm_moe_offload_ascend.moe_offload.phase_split import (
+        build_b2_device_wave_microbatch_plans,
+    )
+
+    with pytest.raises(ValueError, match="waves do not match"):
+        build_b2_device_wave_microbatch_plans(
+            torch.tensor([[0], [127]], dtype=torch.long),
+            ((0,),),
+            num_logical_experts=128,
+            active_experts=(0, 127),
+            wave_pair_counts=(2,),
+        )
+
+
+def test_device_wave_planner_rejects_invalid_topk_without_index_error():
+    from vllm_moe_offload_ascend.moe_offload.phase_split import (
+        build_b2_device_wave_microbatch_plans,
+    )
+
+    with pytest.raises(ValueError, match="invalid or uncovered top-k IDs"):
+        build_b2_device_wave_microbatch_plans(
+            torch.tensor([[0], [128]], dtype=torch.long),
+            ((0,),),
+            num_logical_experts=128,
+            active_experts=(0,),
+            wave_pair_counts=None,
+        )
+
+
+def test_device_wave_planner_rejects_stale_per_wave_pair_counts():
+    from vllm_moe_offload_ascend.moe_offload.phase_split import (
+        build_b2_device_wave_microbatch_plans,
+    )
+
+    with pytest.raises(ValueError, match="do not match current top-k contents"):
+        build_b2_device_wave_microbatch_plans(
+            torch.tensor([[0], [0], [1]], dtype=torch.long),
+            ((0,), (1,)),
+            num_logical_experts=2,
+            active_experts=(0, 1),
+            wave_pair_counts=(1, 2),
+        )
 
 
 def test_device_scatter_descriptor_preserves_exact_scatter_result():

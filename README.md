@@ -156,7 +156,7 @@ git -C vllm-ascend-hust checkout 4806367eeeb7d62b32078ae90cd929cc06d825fe
 
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 cd vllm-ascend-hust-LatchMoE
-python3 -m pip install -e . --no-deps
+python -m pip install -e . --no-deps --no-build-isolation
 ```
 
 The plugin auto-registers through the `vllm.platform_plugins` entry point as
@@ -164,14 +164,16 @@ The plugin auto-registers through the `vllm.platform_plugins` entry point as
 include `moe_offload_ascend` in the list. To verify the installation:
 
 ```bash
-python3 - <<'PY'
-from importlib.metadata import entry_points
-eps = [ep for ep in entry_points(group="vllm.platform_plugins")
-       if ep.name == "moe_offload_ascend"]
-print(eps)
-raise SystemExit(0 if eps else 1)
-PY
+python -m vllm_moe_offload_ascend check
 ```
+
+The check is deliberately run by the same Python interpreter that will launch
+vLLM. It verifies the `vllm`, `vllm_ascend`, and plugin module locations, both
+required platform entry points, and any `VLLM_PLUGINS` filter. The editable
+install also provides the equivalent `latchmoe check` command.
+
+See the [Chinese installation and launch guide](docs/quickstart_zh.md) for the
+complete source-install, existing-stack, overlay, and troubleshooting flows.
 
 ---
 
@@ -197,7 +199,12 @@ export VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1
 # Serving-shape hint for low-concurrency serving
 export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=1
 
-vllm serve /path/to/Qwen3-30B-A3B --trust-remote-code
+# Canonical: the active Python owns both plugin discovery and vLLM startup.
+python -m vllm_moe_offload_ascend serve \
+  /path/to/Qwen3-30B-A3B --trust-remote-code
+
+# Equivalent console script created by pip install.
+latchmoe serve /path/to/Qwen3-30B-A3B --trust-remote-code
 ```
 
 A successful startup logs the following signals:

@@ -182,6 +182,15 @@ class HostExpertStore:
             return layer_bundles[normalized_expert_id]
         return self._weights[ExpertKey(normalized_layer_id, normalized_expert_id)]
 
+    def get_layer_buffer(self, layer_id: int) -> HostExpertLayerBuffer:
+        normalized_layer_id = int(layer_id)
+        try:
+            return self._layer_buffers[normalized_layer_id]
+        except KeyError as exc:
+            raise KeyError(
+                f"layer {normalized_layer_id} is not registered in the host expert store"
+            ) from exc
+
     def validate_complete_layers(self, expected_layer_ids: tuple[int, ...]) -> HostStoreCompletenessReport:
         normalized_layer_ids = tuple(int(layer_id) for layer_id in expected_layer_ids)
         blockers: list[str] = []

@@ -35,7 +35,9 @@ dataset:
   synthetic_smoke_allowed: false
 
 server:
-  command: vllm
+  # The installed launcher keeps the vLLM CLI and plugin metadata on the same
+  # Python interpreter and fails closed when either platform plugin is missing.
+  command: latchmoe
   host: 127.0.0.1
   port: 8026
   startup_timeout_s: 1200

@@ -126,7 +126,7 @@ def test_render_plan_for_single_unit():
     unit = plan["units"][0]
     assert unit["case"] == "sew_14gb_autoslots"
     assert unit["workload"] == "smoke"
-    assert unit["server_command"][:2] == ["vllm", "serve"]
+    assert unit["server_command"][:2] == ["latchmoe", "serve"]
     assert unit["client_command"][0] == "python"
     assert "--bucket" in unit["client_command"]
     assert "smoke" in unit["client_command"]

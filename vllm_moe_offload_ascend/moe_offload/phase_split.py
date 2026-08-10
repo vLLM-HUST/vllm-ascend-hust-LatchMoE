@@ -1280,6 +1280,8 @@ def build_b2_device_wave_microbatch_plans(
     topk_ids: "torch.Tensor",
     waves: tuple[tuple[int, ...], ...],
     *,
+    num_logical_experts: int,
+    active_experts: tuple[int, ...],
     physical_slot_by_expert: dict[int, int] | None = None,
     wave_pair_counts: tuple[int, ...] | None = None,
     include_logical_expert_ids: bool = False,
@@ -1294,14 +1296,64 @@ def build_b2_device_wave_microbatch_plans(
 
     normalized_waves = tuple(tuple(int(e) for e in wave) for wave in waves)
     if not normalized_waves:
+        if active_experts or int(topk_ids.numel()) != 0:
+            raise ValueError("B2 waves are empty but routed experts are present")
         return ()
+    logical_expert_count = int(num_logical_experts)
+    if logical_expert_count <= 0:
+        raise ValueError("num_logical_experts must be greater than 0")
+    normalized_active = tuple(sorted({int(e) for e in active_experts}))
+    invalid_active = tuple(
+        expert_id
+        for expert_id in normalized_active
+        if expert_id < 0 or expert_id >= logical_expert_count
+    )
+    if invalid_active:
+        raise ValueError(
+            "routed experts are outside the logical expert range: "
+            f"invalid={invalid_active} num_logical_experts={logical_expert_count}"
+        )
+    flattened_waves = tuple(expert_id for wave in normalized_waves for expert_id in wave)
+    invalid_wave_experts = tuple(
+        expert_id
+        for expert_id in flattened_waves
+        if expert_id < 0 or expert_id >= logical_expert_count
+    )
+    if invalid_wave_experts:
+        raise ValueError(
+            "wave experts are outside the logical expert range: "
+            f"invalid={invalid_wave_experts} num_logical_experts={logical_expert_count}"
+        )
+    if len(set(flattened_waves)) != len(flattened_waves):
+        raise ValueError("each active expert must appear in exactly one B2 wave")
+    wave_experts = set(flattened_waves)
+    active_expert_set = set(normalized_active)
+    if wave_experts != active_expert_set:
+        raise ValueError(
+            "B2 waves do not match the routed expert set: "
+            f"missing={tuple(sorted(active_expert_set - wave_experts))} "
+            f"extra={tuple(sorted(wave_experts - active_expert_set))}"
+        )
+    sizes = (
+        tuple(int(value) for value in wave_pair_counts)
+        if wave_pair_counts is not None
+        else None
+    )
+    if sizes is not None and len(sizes) != len(normalized_waves):
+        raise ValueError("wave_pair_counts must align with waves")
+    if sizes is not None and sum(sizes) != int(topk_ids.numel()):
+        raise ValueError(
+            "device pair planner requires waves to cover every routed pair: "
+            f"planned={sum(sizes)} routed={int(topk_ids.numel())}"
+        )
     top_k = int(topk_ids.shape[1]) if topk_ids.ndim > 1 else 1
     device = topk_ids.device
     dtype = topk_ids.dtype
-    max_expert = max((max(wave, default=-1) for wave in normalized_waves), default=-1)
-    num_logical_experts = int(max_expert + 1)
-    expert_to_wave = [-1] * num_logical_experts
-    expert_to_slot = [-1] * num_logical_experts
+    # The final entry is a sentinel for invalid top-k IDs. Masking through this
+    # entry makes the failure deterministic in Python instead of issuing an
+    # out-of-range GatherV3 on NPU.
+    expert_to_wave = [-1] * (logical_expert_count + 1)
+    expert_to_slot = [-1] * (logical_expert_count + 1)
     ready_slots = physical_slot_by_expert or {}
     for wave_index, wave in enumerate(normalized_waves):
         pure_hit = bool(ready_slots) and all(int(e) in ready_slots for e in wave)
@@ -1315,12 +1367,30 @@ def build_b2_device_wave_microbatch_plans(
     slot_map = torch.tensor(expert_to_slot, dtype=dtype, device=device)
     flat_ids = topk_ids.reshape(-1)
     flat_long = flat_ids.to(dtype=torch.long)
-    pair_wave_ids = wave_map.index_select(0, flat_long)
+    in_range = (flat_long >= 0) & (flat_long < logical_expert_count)
+    safe_flat_long = torch.where(
+        in_range,
+        flat_long,
+        torch.full_like(flat_long, logical_expert_count),
+    )
+    pair_wave_ids = wave_map.index_select(0, safe_flat_long)
     offsets_by_wave = tuple(
         torch.nonzero(pair_wave_ids == int(wave_index), as_tuple=False).reshape(-1)
         for wave_index in range(len(normalized_waves))
     )
     all_offsets = torch.cat(offsets_by_wave, dim=0)
+    actual_sizes = tuple(int(offsets.numel()) for offsets in offsets_by_wave)
+    if int(all_offsets.numel()) != int(topk_ids.numel()):
+        raise ValueError(
+            "device pair planner found invalid or uncovered top-k IDs: "
+            f"covered={int(all_offsets.numel())} routed={int(topk_ids.numel())} "
+            f"active_experts={normalized_active}"
+        )
+    if sizes is not None and actual_sizes != sizes:
+        raise ValueError(
+            "wave_pair_counts do not match current top-k contents: "
+            f"expected={sizes} actual={actual_sizes}"
+        )
     all_token_indices = torch.div(
         all_offsets,
         int(top_k),
@@ -1328,7 +1398,7 @@ def build_b2_device_wave_microbatch_plans(
     ).to(dtype=torch.long)
     all_physical_slots = slot_map.index_select(
         0,
-        flat_long.index_select(0, all_offsets),
+        safe_flat_long.index_select(0, all_offsets),
     )
     all_logical_ids = (
         flat_ids.index_select(0, all_offsets)
@@ -1336,18 +1406,8 @@ def build_b2_device_wave_microbatch_plans(
         else torch.empty(0, dtype=dtype, device=device)
     )
     empty_long = torch.empty(0, dtype=torch.long, device=device)
-    sizes = (
-        tuple(int(value) for value in wave_pair_counts)
-        if wave_pair_counts is not None
-        else tuple(int(offsets.numel()) for offsets in offsets_by_wave)
-    )
-    if len(sizes) != len(normalized_waves):
-        raise ValueError("wave_pair_counts must align with waves")
-    if sum(sizes) != int(topk_ids.numel()):
-        raise ValueError(
-            "device pair planner requires waves to cover every routed pair: "
-            f"planned={sum(sizes)} routed={int(topk_ids.numel())}"
-        )
+    if sizes is None:
+        sizes = actual_sizes
 
     plans: list[B2WaveMicrobatchPlan] = []
     cursor = 0

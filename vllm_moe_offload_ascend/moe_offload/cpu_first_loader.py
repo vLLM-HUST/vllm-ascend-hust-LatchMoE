@@ -135,14 +135,52 @@ def maybe_process_unquantized_cpu_first_weights(
     layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
     setattr(layer, CPU_FIRST_PROCESSED_MARKER, True)
 
-    runtime.register_layer_for_fixed_slots(layer, slot_device=slot_device)
-    if bool(getattr(getattr(runtime, "config", None), "release_original_expert_weights", False)):
+    maybe_register_unquantized_fixed_slot_weights(
+        layer,
+        runtime=runtime,
+        slot_device=slot_device,
+    )
+    return True
+
+
+def maybe_register_unquantized_fixed_slot_weights(
+    layer: torch.nn.Module,
+    *,
+    runtime: Any,
+    slot_device: torch.device | None = None,
+) -> bool:
+    """Register formatted unquantized weights for fixed-slot execution.
+
+    CPU-first loading performs formatting itself, while the normal loading path
+    delegates formatting to vLLM-Ascend. Both paths must converge here before
+    the first profile forward can execute the stage seam.
+    """
+
+    layer_id = ensure_moe_layer_id(layer)
+    if layer_id < 0 or not runtime.should_use_fixed_slot_plan_for_layer(layer_id):
+        return False
+    if not hasattr(layer, "w13_weight") or not hasattr(layer, "w2_weight"):
+        return False
+
+    if not runtime.is_layer_registered(layer_id):
+        if slot_device is None:
+            slot_device = getattr(layer, "w13_weight").device
+        runtime.register_layer_for_fixed_slots(layer, slot_device=slot_device)
+    if bool(
+        getattr(
+            getattr(runtime, "config", None),
+            "release_original_expert_weights",
+            False,
+        )
+    ):
         runtime.release_original_expert_weights_if_ready(layer)
     return True
 
 
 def is_cpu_first_layer(layer: torch.nn.Module) -> bool:
     return bool(getattr(layer, CPU_FIRST_MARKER, False))
+
+
 def _can_process_cpu_first_weight_pair(
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,

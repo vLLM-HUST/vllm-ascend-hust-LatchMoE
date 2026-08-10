@@ -439,6 +439,32 @@ def _opapi_supports_add_rms_norm_bias() -> bool:
     )
 
 
+def _patch_rms_norm_quant_fusion_cann_compat() -> bool:
+    """Skip only fusion patterns that require the unavailable custom op."""
+    try:
+        import importlib
+
+        fusion_pass = importlib.import_module(
+            "vllm_ascend.compilation.passes.norm_quant_fusion_pass"
+        )
+    except Exception:
+        return False
+
+    original = getattr(fusion_pass, "enable_custom_op", None)
+    if not callable(original):
+        return False
+    if getattr(original, "_latchmoe_cann_rmsnorm_compat", False):
+        return False
+
+    def _disable_unsupported_rmsnorm_patterns() -> bool:
+        return False
+
+    _disable_unsupported_rmsnorm_patterns._latchmoe_cann_rmsnorm_compat = True
+    _disable_unsupported_rmsnorm_patterns.__wrapped__ = original
+    fusion_pass.enable_custom_op = _disable_unsupported_rmsnorm_patterns
+    return True
+
+
 def _patch_rms_norm_bias_cann_compat() -> None:
     """Use the supported torch_npu RMSNorm path on older CANN runtimes.
 
@@ -447,46 +473,51 @@ def _patch_rms_norm_bias_cann_compat() -> None:
     """
     if _opapi_supports_add_rms_norm_bias():
         return
+    changed = _patch_rms_norm_quant_fusion_cann_compat()
     try:
         import importlib
 
         layernorm = importlib.import_module("vllm_ascend.ops.layernorm")
     except Exception:
-        return
+        layernorm = None
 
     cls = getattr(layernorm, "AscendRMSNorm", None)
     original = getattr(cls, "forward_oot", None)
-    if cls is None or not callable(original):
-        return
-    if getattr(original, "_latchmoe_cann_rmsnorm_compat", False):
-        return
+    if (
+        cls is not None
+        and callable(original)
+        and not getattr(original, "_latchmoe_cann_rmsnorm_compat", False)
+    ):
 
-    def _forward_oot(self, x, residual=None):
-        if residual is None:
-            return original(self, x, residual)
+        def _forward_oot(self, x, residual=None):
+            if residual is None:
+                return original(self, x, residual)
 
-        import torch
-        import torch_npu
+            import torch
+            import torch_npu
 
-        residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
-        x, _, residual = torch_npu.npu_add_rms_norm(
-            x,
-            residual,
-            self.weight,
-            self.variance_epsilon,
+            residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
+            x, _, residual = torch_npu.npu_add_rms_norm(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
+            if self.bias is not None:
+                x.add_(self.bias)
+            return x, residual
+
+        _forward_oot._latchmoe_cann_rmsnorm_compat = True
+        _forward_oot.__wrapped__ = original
+        cls.forward_oot = _forward_oot
+        changed = True
+
+    if changed:
+        print(
+            "LATCHMOE_CANN_COMPAT rmsnorm_bias=fallback "
+            "reason=missing_aclnnAddRmsNormBias",
+            flush=True,
         )
-        if self.bias is not None:
-            x.add_(self.bias)
-        return x, residual
-
-    _forward_oot._latchmoe_cann_rmsnorm_compat = True
-    _forward_oot.__wrapped__ = original
-    cls.forward_oot = _forward_oot
-    print(
-        "LATCHMOE_CANN_COMPAT rmsnorm_bias=fallback "
-        "reason=missing_aclnnAddRmsNormBias",
-        flush=True,
-    )
 
 
 def apply_patches() -> None:
@@ -498,12 +529,8 @@ def apply_patches() -> None:
     # modules are imported or aliased below.
     _patch_ascend_envs()
 
-    # Inject sys.modules FIRST so any subsequent lazy import in function
-    # bodies resolves to the plugin implementation.
-    _inject_sys_modules()
-
     _patch_adapt_patch_reinstall()
-    _install_runtime_module_patches()
+    _install_runtime_patches_when_ready()
 
     # CLI arg registration and engine args autoconfig must always run.
     _patch_platform_autoconfig()
@@ -610,6 +637,34 @@ def _install_runtime_module_patches() -> None:
 
 def _to_bool_env(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _b2_reference_full_tokens_enabled(*, async_stage: bool) -> bool:
+    enabled = _to_bool_env(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_TOKENS",
+        "0",
+    )
+    if enabled and async_stage:
+        raise RuntimeError(
+            "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_TOKENS=1 only "
+            "supports synchronous B2 staging; set "
+            "VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD=0"
+        )
+    return enabled
+
+
+def _b2_reference_full_layer_enabled(*, async_stage: bool) -> bool:
+    enabled = _to_bool_env(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER",
+        "0",
+    )
+    if enabled and async_stage:
+        raise RuntimeError(
+            "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER=1 only "
+            "supports synchronous staging; set "
+            "VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD=0"
+        )
+    return enabled
 
 
 
@@ -893,6 +948,9 @@ def _patch_ascend_envs() -> None:
         "VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT": lambda: int(
             os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT", "2")
         ),
+        "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE": lambda: _to_bool_env(
+            "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0"
+        ),
         "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": lambda: int(
             os.getenv("VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT", "0")
         ),
@@ -999,7 +1057,14 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         original_maybe_apply = cls._maybe_apply_moe_offload_plan
         cls._ascend_moe_offload_original_maybe_apply = original_maybe_apply
 
-    def _with_prepared_slot_weights(self, fused_experts_input, prepared_weights):
+    def _with_prepared_slot_weights(
+        self,
+        fused_experts_input,
+        prepared_weights,
+        *,
+        offload_enabled=None,
+        use_log2phy=True,
+    ):
         compute_handle = get_moe_offload_runtime().begin_slot_compute(
             prepared_weights
         )
@@ -1029,7 +1094,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 apply_router_weight_on_input=(
                     fused_experts_input.routing.apply_router_weight_on_input
                 ),
-                log2phy=prepared_weights.log2phy,
+                log2phy=(prepared_weights.log2phy if use_log2phy else None),
                 physical_expert_count=prepared_weights.physical_expert_count,
                 pertoken_scale=fused_experts_input.routing.pertoken_scale,
             ),
@@ -1037,8 +1102,13 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             activation=fused_experts_input.activation,
             need_trans=fused_experts_input.need_trans,
             dynamic_eplb=fused_experts_input.dynamic_eplb,
+            swiglu_limit=fused_experts_input.swiglu_limit,
             offload=MoEOffloadParams(
-                enabled=fused_experts_input.offload.enabled,
+                enabled=(
+                    fused_experts_input.offload.enabled
+                    if offload_enabled is None
+                    else bool(offload_enabled)
+                ),
                 profile_only=fused_experts_input.offload.profile_only,
                 layer_id=fused_experts_input.offload.layer_id,
                 num_logical_experts=fused_experts_input.offload.num_logical_experts,
@@ -1122,9 +1192,19 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         route_stats = runtime.consume_prefill_route_stats_record(
             layer_id=int(offload.layer_id),
             topk_ids=fused_experts_input.topk_ids,
-        )
+        ) if _to_bool_env(
+            "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0"
+        ) else None
         route_stats_cache_hit = route_stats is not None
-        if phase_is_prefill is None and route_stats is None:
+        max_num_seqs_hint = int(
+            getattr(runtime.config, "max_num_seqs_hint", 0) or 0
+        )
+        unknown_prefill_candidate = (
+            phase_is_prefill is None
+            and max_num_seqs_hint > 0
+            and int(fused_experts_input.topk_ids.shape[0]) > max_num_seqs_hint
+        )
+        if phase_is_prefill is None and route_stats is None and not unknown_prefill_candidate:
             return None
         token_counts = (
             dict(route_stats.token_counts_by_expert)
@@ -1144,7 +1224,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             active_expert_count=active_expert_count,
         )
         b2_overflow_handoff = (
-            route_stats is not None
+            (route_stats is not None or unknown_prefill_candidate)
             and active_expert_count > int(runtime.config.num_slots)
         )
         if not (b2_phase_match or b2_overflow_handoff):
@@ -1214,6 +1294,16 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             if control_profile
             else None
         )
+        if _b2_reference_full_layer_enabled(
+            async_stage=bool(runtime.config.async_load)
+        ):
+            return self._run_b2_full_layer_reference(
+                fused_experts_input=fused_experts_input,
+                before_dispatch_evt=before_dispatch_evt,
+                b2_total_start=b2_total_start,
+                forward_phase=forward_phase,
+                route_stats_cache_hit=route_stats_cache_hit,
+            )
         if token_counts is None:
             token_count_start = perf_counter()
             token_counts = count_routed_tokens_by_expert(fused_experts_input.topk_ids)
@@ -1225,13 +1315,21 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             expert_ids=unique_active,
         )
         readiness_ms = (perf_counter() - readiness_start) * 1000.0
+        reference_full_tokens_requested = _to_bool_env(
+            "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_TOKENS",
+            "0",
+        )
         wave_plan_start = perf_counter()
         wave_plan = plan_balanced_b2_waves(
             token_counts,
             num_slots,
-            slot_readiness=readiness,
-            fold_partial_hits_into_miss=not bool(
-                runtime.config.b2_avoid_mixed_wave_d2d
+            slot_readiness=(
+                {} if reference_full_tokens_requested else readiness
+            ),
+            fold_partial_hits_into_miss=(
+                True
+                if reference_full_tokens_requested
+                else not bool(runtime.config.b2_avoid_mixed_wave_d2d)
             ),
         )
         wave_plan_ms = (perf_counter() - wave_plan_start) * 1000.0
@@ -1261,24 +1359,39 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
 
         profile_start = b2_total_start
         accumulated = torch.zeros_like(fused_experts_input.hidden_states)
+        reference_accumulated = (
+            torch.zeros_like(
+                fused_experts_input.hidden_states,
+                dtype=torch.float32,
+            )
+            if reference_full_tokens_requested
+            else None
+        )
         last_group_list_type = None
         last_expert_tokens = None
+        last_before_gmm2_evt = None
         before_combine_evt = before_dispatch_evt
         wave_profiles = []
         masked_full_prompt_pairs = int(
             fused_experts_input.topk_ids.numel() * len(waves)
         )
         async_stage = bool(runtime.config.async_load) and len(waves) > 1
+        reference_full_tokens = _b2_reference_full_tokens_enabled(
+            async_stage=async_stage
+        )
+        async_schedule = None
         schedule_ms = 0.0
         initial_issue_ms = 0.0
         initial_stage_target = 0
         initial_stage_issued = 0
+        microbatch_materialize_ms = 0.0
         microbatch_materialize_end_time = None
         loop_start = None
         loop_ms = 0.0
         scatter_total_ms = 0.0
         pending_pair_outputs = []
         pending_direct_scatter_payloads = []
+        pending_full_token_outputs = []
         pending_restore_indices = []
         pair_index_ms = 0.0
         wave_microbatch_plan_ms = 0.0
@@ -1296,7 +1409,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             "VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING",
             "1",
         )
-        if not device_pair_planning:
+        if not reference_full_tokens and not device_pair_planning:
             pair_index = build_b2_routed_pair_index(
                 fused_experts_input.topk_ids,
                 fused_experts_input.topk_weights,
@@ -1308,10 +1421,14 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             )
         pair_index_ms = (perf_counter() - pair_index_start) * 1000.0
         wave_microbatch_plan_start = perf_counter()
-        if device_pair_planning:
+        if reference_full_tokens:
+            wave_microbatch_plans = None
+        elif device_pair_planning:
             wave_microbatch_plans = build_b2_device_wave_microbatch_plans(
                 fused_experts_input.topk_ids,
                 waves,
+                num_logical_experts=int(offload.num_logical_experts),
+                active_experts=unique_active,
                 physical_slot_by_expert=ready_slot_ids,
                 wave_pair_counts=tuple(
                     int(wave_plan.wave_tokens(wave)) for wave in waves
@@ -1743,6 +1860,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     continue
                 wave_result, restore_token_indices, pair_profile = wave_output
                 before_combine_evt = wave_result.before_combine_evt
+                last_before_gmm2_evt = wave_result.before_gmm2_evt
                 last_group_list_type = wave_result.group_list_type
                 last_expert_tokens = wave_result.expert_tokens
                 direct_scatter_payload = pair_profile.get(
@@ -1838,16 +1956,17 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 )
             loop_ms = (perf_counter() - loop_start) * 1000.0
         else:
-            microbatch_materialize_start = perf_counter()
-            wave_microbatches = materialize_b2_pair_microbatches_from_plans(
-                fused_experts_input.hidden_states,
-                fused_experts_input.topk_weights,
-                wave_microbatch_plans,
-            )
-            microbatch_materialize_ms = (
-                perf_counter() - microbatch_materialize_start
-            ) * 1000.0
-            microbatch_materialize_end_time = perf_counter()
+            if not reference_full_tokens:
+                microbatch_materialize_start = perf_counter()
+                wave_microbatches = materialize_b2_pair_microbatches_from_plans(
+                    fused_experts_input.hidden_states,
+                    fused_experts_input.topk_weights,
+                    wave_microbatch_plans,
+                )
+                microbatch_materialize_ms = (
+                    perf_counter() - microbatch_materialize_start
+                ) * 1000.0
+                microbatch_materialize_end_time = perf_counter()
             loop_start = perf_counter()
             for wave_index, wave in enumerate(waves):
                 hit_experts = tuple(
@@ -1879,13 +1998,19 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     expected_device_type=offload.expected_device_type
                 )
                 mlp_start = perf_counter()
-                wave_output = self._run_b2_pair_wave(
-                    fused_experts_input=fused_experts_input,
-                    prepared=prepared,
-                    wave=wave,
-                    microbatch_plan=wave_microbatch_plans[int(wave_index)],
-                    microbatch=wave_microbatches[int(wave_index)],
-                )
+                if reference_full_tokens:
+                    wave_output = self._run_b2_single_wave(
+                        fused_experts_input=fused_experts_input,
+                        prepared=prepared,
+                    )
+                else:
+                    wave_output = self._run_b2_pair_wave(
+                        fused_experts_input=fused_experts_input,
+                        prepared=prepared,
+                        wave=wave,
+                        microbatch_plan=wave_microbatch_plans[int(wave_index)],
+                        microbatch=wave_microbatches[int(wave_index)],
+                    )
                 mlp_ms = (perf_counter() - mlp_start) * 1000.0
                 if wave_output is None:
                     per_expert_tokens = {
@@ -1914,18 +2039,32 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         }
                     )
                     continue
-                wave_result, restore_token_indices, pair_profile = wave_output
+                if reference_full_tokens:
+                    wave_result = wave_output
+                    restore_token_indices = None
+                    pair_profile = {
+                        "pair_wave_ms": mlp_ms,
+                        "microbatch_ms": 0.0,
+                        "microbatch_source": "reference_full_tokens",
+                        "combine_mode": "token_combine",
+                        "scatter_mode": "full_token_add",
+                    }
+                else:
+                    wave_result, restore_token_indices, pair_profile = wave_output
                 per_expert_tokens = {
                     int(e): int(token_counts.get(int(e), 0))
                     for e in wave
                 }
                 before_combine_evt = wave_result.before_combine_evt
+                last_before_gmm2_evt = wave_result.before_gmm2_evt
                 last_group_list_type = wave_result.group_list_type
                 last_expert_tokens = wave_result.expert_tokens
                 direct_scatter_payload = pair_profile.get(
                     "direct_scatter_payload"
                 )
-                if direct_scatter_payload is None:
+                if reference_full_tokens:
+                    pending_full_token_outputs.append(wave_result.routed_out)
+                elif direct_scatter_payload is None:
                     pending_pair_outputs.append(wave_result.routed_out)
                     pending_restore_indices.append(restore_token_indices)
                 else:
@@ -1935,7 +2074,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 wave_profiles.append(
                     {
                         "experts": [int(e) for e in wave],
-                        "pairs": int(restore_token_indices.numel()),
+                        "pairs": (
+                            int(fused_experts_input.topk_ids.numel())
+                            if reference_full_tokens
+                            else int(restore_token_indices.numel())
+                        ),
                         "tokens": int(wave_plan.wave_tokens(wave)),
                         "per_expert_tokens": {
                             str(int(e)): int(v)
@@ -1980,6 +2123,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 tuple(pending_pair_outputs),
                 tuple(pending_restore_indices),
             )
+        for full_token_output in pending_full_token_outputs:
+            reference_accumulated.add_(full_token_output.to(torch.float32))
+        if reference_accumulated is not None:
+            accumulated.copy_(reference_accumulated.to(accumulated.dtype))
         scatter_total_ms = (perf_counter() - scatter_start) * 1000.0
         end_to_end_ms = (perf_counter() - b2_total_start) * 1000.0
         wave_summary = _summarize_b2_wave_profiles(
@@ -1994,12 +2141,30 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             payload = {
                 "n_tokens": int(fused_experts_input.hidden_states.shape[0]),
                 "n_active": int(len(unique_active)),
-                "n_pairs": int(wave_plan.total_pairs),
+                "n_pairs": int(
+                    masked_full_prompt_pairs
+                    if reference_full_tokens
+                    else wave_plan.total_pairs
+                ),
+                "logical_pairs": int(wave_plan.total_pairs),
                 "num_slots": int(num_slots),
                 "n_waves": int(len(waves)),
                 "masked_full_prompt_pairs": int(masked_full_prompt_pairs),
                 "work_conserving_saved_pairs": int(
-                    masked_full_prompt_pairs - wave_plan.total_pairs
+                    0
+                    if reference_full_tokens
+                    else masked_full_prompt_pairs - wave_plan.total_pairs
+                ),
+                "execution_mode": (
+                    "reference_full_tokens"
+                    if reference_full_tokens
+                    else "pair_microbatch"
+                ),
+                "wave_membership_uses_slot_readiness": bool(
+                    not reference_full_tokens
+                ),
+                "wave_accumulation_dtype": (
+                    "float32" if reference_full_tokens else str(accumulated.dtype)
                 ),
                 "wave_token_summary": {
                     "min": int(min_wave_tokens),
@@ -2028,7 +2193,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 "route_stats_cache_hit": bool(route_stats_cache_hit),
                 "pair_index_cache_hit": bool(pair_index_cache_hit),
                 "pair_planner_mode": (
-                    "npu_device" if device_pair_planning else "host_offsets"
+                    "not_used_reference_full_tokens"
+                    if reference_full_tokens
+                    else "npu_device" if device_pair_planning else "host_offsets"
                 ),
                 "forward_phase": str(forward_phase),
                 "wave_summary": wave_summary,
@@ -2049,9 +2216,185 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         return FusedExpertsResult(
             routed_out=accumulated,
             before_dispatch_evt=before_dispatch_evt,
+            before_gmm2_evt=last_before_gmm2_evt,
             before_combine_evt=before_combine_evt,
             group_list_type=last_group_list_type,
             expert_tokens=last_expert_tokens,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+        )
+
+    def _run_b2_full_layer_reference(
+        self,
+        *,
+        fused_experts_input,
+        before_dispatch_evt,
+        b2_total_start,
+        forward_phase,
+        route_stats_cache_hit,
+    ):
+        runtime = get_moe_offload_runtime()
+        offload = fused_experts_input.offload
+        prepared, stage_payload = runtime.prepare_full_layer_prefill_plan(
+            layer_id=offload.layer_id,
+            num_logical_experts=offload.num_logical_experts,
+            device=fused_experts_input.topk_ids.device,
+            step_id=offload.step_id,
+        )
+        prepared.validate_backend_ready(
+            expected_device_type=offload.expected_device_type
+        )
+        native_input = self._with_prepared_slot_weights(
+            fused_experts_input,
+            prepared,
+            offload_enabled=False,
+            use_log2phy=False,
+        )
+        compare_original = bool(
+            _to_bool_env(
+                "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ORIGINAL",
+                "0",
+            )
+            and int(fused_experts_input.hidden_states.shape[0]) <= 64
+        )
+        original_result = None
+        try:
+            if compare_original:
+                original_input = MoEFusedExpertsInput(
+                    hidden_states=fused_experts_input.hidden_states,
+                    topk_weights=fused_experts_input.topk_weights,
+                    topk_ids=fused_experts_input.topk_ids,
+                    weights=fused_experts_input.weights,
+                    routing=fused_experts_input.routing,
+                    quant=fused_experts_input.quant,
+                    activation=fused_experts_input.activation,
+                    need_trans=fused_experts_input.need_trans,
+                    dynamic_eplb=fused_experts_input.dynamic_eplb,
+                    swiglu_limit=fused_experts_input.swiglu_limit,
+                    offload=MoEOffloadParams(
+                        enabled=False,
+                        profile_only=fused_experts_input.offload.profile_only,
+                        layer_id=fused_experts_input.offload.layer_id,
+                        num_logical_experts=(
+                            fused_experts_input.offload.num_logical_experts
+                        ),
+                        expected_device_type=(
+                            fused_experts_input.offload.expected_device_type
+                        ),
+                        step_id=fused_experts_input.offload.step_id,
+                    ),
+                )
+                original_result = original_fused_experts(self, original_input)
+                original_routed_out = original_result.routed_out.clone()
+            result = original_fused_experts(self, native_input)
+            torch.npu.synchronize()
+            if compare_original:
+                import torch_npu
+
+                original_w1 = fused_experts_input.weights.w1
+                original_w2 = fused_experts_input.weights.w2
+                host_buffer = runtime._host_store.get_layer_buffer(
+                    int(offload.layer_id)
+                )
+                sampled_experts = tuple(
+                    expert_id
+                    for expert_id in (0, 1, 63, 127)
+                    if expert_id < int(offload.num_logical_experts)
+                )
+                original_bank_w1_equal = all(
+                    bool(torch.equal(original_w1[expert_id], prepared.w1[expert_id]))
+                    for expert_id in sampled_experts
+                )
+                original_bank_w2_equal = all(
+                    bool(torch.equal(original_w2[expert_id], prepared.w2[expert_id]))
+                    for expert_id in sampled_experts
+                )
+                host_bank_w1_equal = all(
+                    bool(
+                        torch.equal(
+                            host_buffer.w13[expert_id],
+                            prepared.w1[expert_id].cpu(),
+                        )
+                    )
+                    for expert_id in sampled_experts
+                )
+                host_bank_w2_equal = all(
+                    bool(
+                        torch.equal(
+                            host_buffer.w2[expert_id],
+                            prepared.w2[expert_id].cpu(),
+                        )
+                    )
+                    for expert_id in sampled_experts
+                )
+                output_diff = (
+                    original_routed_out.float() - result.routed_out.float()
+                ).abs()
+                print(
+                    "SEW_FULL_LAYER_COMPARE "
+                    f"layer={int(offload.layer_id)} "
+                    f"tokens={int(fused_experts_input.hidden_states.shape[0])} "
+                    f"sampled_experts={sampled_experts} "
+                    f"original_bank_w1_equal={original_bank_w1_equal} "
+                    f"original_bank_w2_equal={original_bank_w2_equal} "
+                    f"host_bank_w1_equal={host_bank_w1_equal} "
+                    f"host_bank_w2_equal={host_bank_w2_equal} "
+                    f"original_w1_format={torch_npu.get_npu_format(original_w1)} "
+                    f"bank_w1_format={torch_npu.get_npu_format(prepared.w1)} "
+                    f"original_w2_format={torch_npu.get_npu_format(original_w2)} "
+                    f"bank_w2_format={torch_npu.get_npu_format(prepared.w2)} "
+                    f"original_w1_stride={tuple(original_w1.stride())} "
+                    f"bank_w1_stride={tuple(prepared.w1.stride())} "
+                    f"original_w2_stride={tuple(original_w2.stride())} "
+                    f"bank_w2_stride={tuple(prepared.w2.stride())} "
+                    f"output_equal={bool(torch.equal(original_routed_out, result.routed_out))} "
+                    f"output_max_abs={float(output_diff.max().item())} "
+                    f"output_mean_abs={float(output_diff.mean().item())}",
+                    flush=True,
+                )
+        finally:
+            compute_handle = getattr(
+                self,
+                "_ascend_moe_offload_slot_compute_handle",
+                None,
+            )
+            if hasattr(self, "_ascend_moe_offload_slot_compute_handle"):
+                delattr(self, "_ascend_moe_offload_slot_compute_handle")
+            runtime.end_slot_compute(compute_handle)
+        end_to_end_ms = (perf_counter() - b2_total_start) * 1000.0
+        if _os.environ.get("SEW_B2_PROBE") or _os.environ.get("SEW_OFFLOAD_PROBE"):
+            print(
+                f"SEW_B2 branch=REFERENCE_FULL_LAYER layer={offload.layer_id} "
+                f"n_tokens={int(fused_experts_input.hidden_states.shape[0])} "
+                f"physical_experts={prepared.physical_expert_count} "
+                f"h2d_bytes={stage_payload['h2d_bytes']}",
+                flush=True,
+            )
+        if (
+            runtime.config.gmm_profile_path
+            or _os.getenv("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
+            or _os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
+        ):
+            runtime._record_profile_event(
+                "b2_reference_full_layer_prefill",
+                layer_id=offload.layer_id,
+                start=b2_total_start,
+                payload={
+                    **stage_payload,
+                    "n_tokens": int(fused_experts_input.hidden_states.shape[0]),
+                    "top_k": int(fused_experts_input.topk_ids.shape[-1]),
+                    "forward_phase": str(forward_phase),
+                    "route_stats_cache_hit": bool(route_stats_cache_hit),
+                    "end_to_end_ms": round(end_to_end_ms, 3),
+                },
+            )
+        return FusedExpertsResult(
+            routed_out=result.routed_out,
+            before_dispatch_evt=before_dispatch_evt,
+            before_gmm2_evt=result.before_gmm2_evt,
+            before_combine_evt=result.before_combine_evt,
+            group_list_type=result.group_list_type,
+            expert_tokens=result.expert_tokens,
+            swiglu_limit=getattr(result, "swiglu_limit", 0.0),
         )
 
     def _run_b2_pair_wave(
@@ -2150,6 +2493,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             activation=fused_experts_input.activation,
             need_trans=fused_experts_input.need_trans,
             dynamic_eplb=fused_experts_input.dynamic_eplb,
+            swiglu_limit=fused_experts_input.swiglu_limit,
             offload=fused_experts_input.offload,
         )
         build_input_ms = (perf_counter() - build_input_start) * 1000.0
@@ -2174,7 +2518,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             )
             build_mlp_input_ms = (perf_counter() - build_mlp_input_start) * 1000.0
             gmm_start = perf_counter()
-            mlp_output = self._apply_mlp(mlp_compute_input)
+            mlp_output, before_gmm2_evt = _unpack_mlp_apply_result(
+                self._apply_mlp(mlp_compute_input)
+            )
             gmm_ms = (perf_counter() - gmm_start) * 1000.0
             before_combine_evt = torch.npu.current_stream().record_event()
             direct_scatter_payload = None
@@ -2240,9 +2586,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             FusedExpertsResult(
                 routed_out=routed_out,
                 before_dispatch_evt=before_combine_evt,
+                before_gmm2_evt=before_gmm2_evt,
                 before_combine_evt=before_combine_evt,
                 group_list_type=token_dispatch_output.group_list_type,
                 expert_tokens=token_dispatch_output.group_list,
+                swiglu_limit=fused_experts_input.swiglu_limit,
             ),
             microbatch.restore_token_indices,
             {
@@ -2310,6 +2658,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             activation=fused_experts_input.activation,
             need_trans=fused_experts_input.need_trans,
             dynamic_eplb=fused_experts_input.dynamic_eplb,
+            swiglu_limit=fused_experts_input.swiglu_limit,
             offload=fused_experts_input.offload,
         )
 
@@ -2325,7 +2674,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 token_dispatch_output=token_dispatch_output,
                 use_fusion_ops=self.use_fusion_ops,
             )
-            mlp_output = self._apply_mlp(mlp_compute_input)
+            mlp_output, before_gmm2_evt = _unpack_mlp_apply_result(
+                self._apply_mlp(mlp_compute_input)
+            )
             before_combine_evt = torch.npu.current_stream().record_event()
             routed_out = self.token_dispatcher.token_combine(
                 hidden_states=mlp_output,
@@ -2336,9 +2687,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_combine_evt,
+            before_gmm2_evt=before_gmm2_evt,
             before_combine_evt=before_combine_evt,
             group_list_type=token_dispatch_output.group_list_type,
             expert_tokens=token_dispatch_output.group_list,
+            swiglu_limit=fused_experts_input.swiglu_limit,
         )
 
     def fused_experts(self, fused_experts_input):
@@ -2407,6 +2760,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
     cls._maybe_apply_moe_offload_plan = _maybe_apply_moe_offload_plan
     cls._maybe_run_b2_wave_prefill = _maybe_run_b2_wave_prefill
     cls._run_b2_wave_prefill = _run_b2_wave_prefill
+    cls._run_b2_full_layer_reference = _run_b2_full_layer_reference
     cls._run_b2_pair_wave = _run_b2_pair_wave
     cls._run_b2_single_wave = _run_b2_single_wave
     cls.fused_experts = fused_experts
@@ -2549,6 +2903,8 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
 
     import threading
 
+    import torch
+
     from vllm_moe_offload_ascend.moe_offload.runtime import (
         get_moe_offload_runtime,
     )
@@ -2556,6 +2912,7 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
         ensure_moe_layer_id,
         maybe_create_unquantized_cpu_first_weights,
         maybe_process_unquantized_cpu_first_weights,
+        maybe_register_unquantized_fixed_slot_weights,
     )
     from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
 
@@ -2622,6 +2979,39 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
         if layer_id is not None:
             injected = moe_seam_inject.peek_injected_topk(int(layer_id))
             if injected is not None:
+                hidden_states = kwargs.get("hidden_states")
+                if hidden_states is None and args:
+                    hidden_states = args[0]
+                if (
+                    _to_bool_env(
+                        "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER",
+                        "0",
+                    )
+                    and hidden_states is not None
+                    and int(hidden_states.shape[0]) <= 64
+                ):
+                    native_weights, native_ids = original_select_experts(
+                        *args,
+                        **kwargs,
+                    )
+                    injected_weights, injected_ids = injected
+                    id_mismatch_count = int(
+                        torch.count_nonzero(native_ids != injected_ids).item()
+                    )
+                    weight_diff = (
+                        native_weights.float() - injected_weights.float()
+                    ).abs()
+                    print(
+                        "SEW_ROUTER_COMPARE "
+                        f"layer={int(layer_id)} "
+                        f"tokens={int(hidden_states.shape[0])} "
+                        f"ids_equal={bool(torch.equal(native_ids, injected_ids))} "
+                        f"id_mismatch_count={id_mismatch_count} "
+                        f"weights_equal={bool(torch.equal(native_weights, injected_weights))} "
+                        f"weight_max_abs={float(weight_diff.max().item())} "
+                        f"weight_mean_abs={float(weight_diff.mean().item())}",
+                        flush=True,
+                    )
                 return injected
         topk_weights, topk_ids = original_select_experts(*args, **kwargs)
         if layer_id is not None:
@@ -2632,8 +3022,6 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                 and runtime.should_use_fixed_slot_plan_for_layer(int(layer_id))
                 and num_logical_experts > 0
             ):
-                import torch
-
                 torch.ops.vllm.moe_offload_stage(
                     topk_ids,
                     int(layer_id),
@@ -2664,12 +3052,16 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
         if handled:
             return None
         result = original_process_weights(self, layer)
+        registered = maybe_register_unquantized_fixed_slot_weights(
+            layer,
+            runtime=runtime,
+        )
         layer_id = int(getattr(layer, "layer_id", -1))
         if layer_id < 0:
             return result  # no layer_id → cannot identify slot bank; skip staging
         if (
             runtime.should_use_fixed_slot_plan_for_layer(layer_id)
-            and runtime.is_layer_registered(layer_id)
+            and registered
         ):
             buf = runtime.log2phy_buffer(layer_id)
             num_logical_experts = (
@@ -2784,13 +3176,26 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         layer_name,
         hidden_dim_unpadded=None,
     ):
-        def _native_moe_forward():
+        def _native_moe_forward(
+            *,
+            native_hidden_states=None,
+            native_router_logits=None,
+            native_layer_name=None,
+        ):
             args = [
-                hidden_states,
-                router_logits,
+                (
+                    hidden_states
+                    if native_hidden_states is None
+                    else native_hidden_states
+                ),
+                (
+                    router_logits
+                    if native_router_logits is None
+                    else native_router_logits
+                ),
                 shared_experts_input,
                 input_ids,
-                layer_name,
+                layer_name if native_layer_name is None else native_layer_name,
             ]
             if hidden_dim_unpadded is not None:
                 args.append(hidden_dim_unpadded)
@@ -2844,6 +3249,39 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
                 )
             return out
 
+        if layer_name == "from_forward_context":
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+                get_layer_from_name,
+            )
+
+            indexed_layer = get_layer_from_name(layer_name)
+            expected_layer = get_layer_from_name(self.layer_name)
+            if indexed_layer is not expected_layer:
+                raise RuntimeError(
+                    "MoE seam forward-context order mismatch: "
+                    f"expected {self.layer_name!r}, got "
+                    f"layer_id={getattr(indexed_layer, 'layer_id', '?')}"
+                )
+
+        compare_layer_boundary = bool(
+            _to_bool_env(
+                "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_LAYER_BOUNDARY",
+                "0",
+            )
+            and int(hidden_states.shape[0]) <= 64
+            and runtime.should_use_fixed_slot_plan_for_layer(
+                int(self._seam_layer_id)
+            )
+        )
+        native_routed_out = None
+        if compare_layer_boundary:
+            with runtime.suspend_fixed_slot_execution():
+                native_routed_out = _native_moe_forward(
+                    native_hidden_states=hidden_states.clone(),
+                    native_router_logits=router_logits.clone(),
+                    native_layer_name=self.layer_name,
+                ).clone()
+
         real_name = self.layer_name
         topk_weights, topk_ids = torch.ops.vllm.moe_router_indirect(
             hidden_states,
@@ -2856,7 +3294,7 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             self._seam_num_logical_experts,
             phase_int,
         )
-        return torch.ops.vllm.moe_mlp(
+        routed_out = torch.ops.vllm.moe_mlp(
             hidden_states,
             router_logits,
             topk_weights,
@@ -2865,6 +3303,18 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             input_ids,
             real_name,
         )
+        if native_routed_out is not None:
+            output_diff = (native_routed_out.float() - routed_out.float()).abs()
+            print(
+                "SEW_LAYER_BOUNDARY_COMPARE "
+                f"layer={int(self._seam_layer_id)} "
+                f"tokens={int(hidden_states.shape[0])} "
+                f"output_equal={bool(torch.equal(native_routed_out, routed_out))} "
+                f"output_max_abs={float(output_diff.max().item())} "
+                f"output_mean_abs={float(output_diff.mean().item())}",
+                flush=True,
+            )
+        return routed_out
 
     def _resolve_seam_per_layer_guards(self) -> bool:
         from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
@@ -2960,7 +3410,7 @@ def _patch_platform_splitting_ops() -> None:
         @classmethod  # type: ignore[misc]
         def _patched(cls, vllm_config):
             original_fn(cls, vllm_config)
-            _install_runtime_module_patches()
+            _install_runtime_patches_when_ready()
             if not _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "0"):
                 return
             compilation_config = getattr(vllm_config, "compilation_config", None)

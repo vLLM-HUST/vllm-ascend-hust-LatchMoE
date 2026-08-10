@@ -48,6 +48,24 @@ def test_slot_bank_lookup_expert_id_tracks_resident_index():
     assert bank.lookup_expert_id(9) is None
 
 
+def test_suspend_fixed_slot_execution_is_nested_and_exception_safe():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+
+    assert runtime.should_use_fixed_slot_plan_for_layer(7) is True
+    with runtime.suspend_fixed_slot_execution():
+        assert runtime.should_use_fixed_slot_plan_for_layer(7) is False
+        with runtime.suspend_fixed_slot_execution():
+            assert runtime.should_use_fixed_slot_plan_for_layer(7) is False
+        assert runtime.should_use_fixed_slot_plan_for_layer(7) is False
+    assert runtime.should_use_fixed_slot_plan_for_layer(7) is True
+
+    with pytest.raises(RuntimeError, match="diagnostic failure"):
+        with runtime.suspend_fixed_slot_execution():
+            assert runtime.should_use_fixed_slot_plan_for_layer(7) is False
+            raise RuntimeError("diagnostic failure")
+    assert runtime.should_use_fixed_slot_plan_for_layer(7) is True
+
+
 def test_transfer_ready_event_binds_slot_owner_and_generation():
     bank = ExpertSlotBank(
         1,
@@ -141,6 +159,112 @@ def test_memory_ledger_counts_prefill_stage_banks_and_mapping_buffers():
         + after.prefill_stage_bank_bytes
         + after.prefill_stage_mapping_bytes
     )
+
+
+def test_full_layer_prefill_plan_uses_identity_mapping_and_all_experts():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    prepared, payload = runtime.prepare_full_layer_prefill_plan(
+        layer_id=7,
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+
+    assert prepared.physical_expert_count == 4
+    assert prepared.log2phy.tolist() == [0, 1, 2, 3]
+    assert prepared.mapping.active_experts == (0, 1, 2, 3)
+    assert prepared.mapping.active_slot_ids == (0, 1, 2, 3)
+    assert prepared.mapping.slot_to_expert == (0, 1, 2, 3)
+    assert torch.equal(prepared.w1, layer.w13_weight)
+    assert torch.equal(prepared.w2, layer.w2_weight)
+    assert payload["num_logical_experts"] == 4
+    assert payload["physical_expert_count"] == 4
+    assert payload["pool_reused"] is False
+
+
+def test_full_layer_prefill_plan_reuses_layout_pool_across_layers():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    first_layer = TinyLayer()
+    second_layer = TinyLayer()
+    second_layer.layer_id = 8
+    with torch.no_grad():
+        second_layer.w13_weight.add_(1000)
+        second_layer.w2_weight.add_(2000)
+    runtime.register_layer_for_fixed_slots(
+        first_layer,
+        slot_device=torch.device("cpu"),
+    )
+    runtime.register_layer_for_fixed_slots(
+        second_layer,
+        slot_device=torch.device("cpu"),
+    )
+
+    first, first_payload = runtime.prepare_full_layer_prefill_plan(
+        layer_id=7,
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+    bank_w1_ptr = first.w1.data_ptr()
+    mapping_ptr = first.log2phy.data_ptr()
+    second, second_payload = runtime.prepare_full_layer_prefill_plan(
+        layer_id=8,
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+
+    assert first_payload["pool_reused"] is False
+    assert second_payload["pool_reused"] is True
+    assert second.w1.data_ptr() == bank_w1_ptr
+    assert second.log2phy.data_ptr() == mapping_ptr
+    assert torch.equal(second.w1, second_layer.w13_weight)
+    assert torch.equal(second.w2, second_layer.w2_weight)
+    assert len(runtime._full_layer_prefill_pool) == 1
+
+
+def test_memory_ledger_counts_shared_full_layer_prefill_storage_once():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    before = runtime.memory_ledger()
+
+    prepared, _ = runtime.prepare_full_layer_prefill_plan(
+        layer_id=7,
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+    after = runtime.memory_ledger()
+
+    assert after is not before
+    assert after.full_layer_prefill_bank_count == 1
+    assert after.full_layer_prefill_bank_bytes == (
+        prepared.w1.numel() * prepared.w1.element_size()
+        + prepared.w2.numel() * prepared.w2.element_size()
+    )
+    assert after.full_layer_prefill_mapping_bytes == (
+        prepared.log2phy.numel() * prepared.log2phy.element_size()
+    )
+    assert after.total_npu_slot_bytes == (
+        after.slot_bank_bytes
+        + after.prefill_stage_bank_bytes
+        + after.prefill_stage_mapping_bytes
+        + after.full_layer_prefill_bank_bytes
+        + after.full_layer_prefill_mapping_bytes
+    )
+
+
+def test_full_layer_prefill_plan_rejects_host_expert_count_mismatch():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    with pytest.raises(RuntimeError, match="host expert count.*4, expected 5"):
+        runtime.prepare_full_layer_prefill_plan(
+            layer_id=7,
+            num_logical_experts=5,
+            device=torch.device("cpu"),
+        )
 
 
 def test_prefill_stage_plan_uses_dedicated_buffer_and_log2phy_mapping():
@@ -1476,7 +1600,7 @@ def test_prefill_route_stats_cache_consumes_matching_topk_once():
     ) is None
 
 
-def test_prefill_route_stats_cache_does_not_depend_on_data_ptr():
+def test_prefill_route_stats_cache_rejects_different_storage_same_layout():
     runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
     topk_ids = torch.tensor([[1, 2], [2, 3]], dtype=torch.int32)
     same_layout = topk_ids.clone()
@@ -1491,7 +1615,24 @@ def test_prefill_route_stats_cache_does_not_depend_on_data_ptr():
     assert runtime.consume_prefill_route_stats(
         layer_id=7,
         topk_ids=same_layout,
-    ) == {1: 1, 2: 2, 3: 1}
+    ) is None
+
+
+def test_prefill_route_stats_cache_rejects_mutated_tensor_version():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    topk_ids = torch.tensor([[1, 2], [2, 3]], dtype=torch.int32)
+
+    runtime.cache_prefill_route_stats(
+        layer_id=7,
+        topk_ids=topk_ids,
+        token_counts_by_expert={1: 1, 2: 2, 3: 1},
+    )
+    topk_ids.copy_(torch.tensor([[0, 1], [1, 0]], dtype=torch.int32))
+
+    assert runtime.consume_prefill_route_stats(
+        layer_id=7,
+        topk_ids=topk_ids,
+    ) is None
 
 
 def test_prefill_route_stats_cache_rejects_stale_topk_shape():

@@ -15,12 +15,15 @@
 # limitations under the License.
 #
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from itertools import count
 import logging
 import os
 from pathlib import Path
+import threading
 from time import perf_counter
 
 import torch
@@ -68,6 +71,9 @@ class MoeOffloadMemoryLedger:
     prefill_stage_bank_count: int = 0
     prefill_stage_bank_bytes: int = 0
     prefill_stage_mapping_bytes: int = 0
+    full_layer_prefill_bank_count: int = 0
+    full_layer_prefill_bank_bytes: int = 0
+    full_layer_prefill_mapping_bytes: int = 0
 
     @property
     def original_expert_weights_retained(self) -> bool:
@@ -81,6 +87,8 @@ class MoeOffloadMemoryLedger:
             + self.slot_bank_bytes
             + self.prefill_stage_bank_bytes
             + self.prefill_stage_mapping_bytes
+            + self.full_layer_prefill_bank_bytes
+            + self.full_layer_prefill_mapping_bytes
         )
 
     @property
@@ -89,6 +97,8 @@ class MoeOffloadMemoryLedger:
             self.slot_bank_bytes
             + self.prefill_stage_bank_bytes
             + self.prefill_stage_mapping_bytes
+            + self.full_layer_prefill_bank_bytes
+            + self.full_layer_prefill_mapping_bytes
         )
 
     def to_jsonable(self) -> dict[str, int | bool]:
@@ -101,6 +111,15 @@ class MoeOffloadMemoryLedger:
             "prefill_stage_bank_count": int(self.prefill_stage_bank_count),
             "prefill_stage_bank_bytes": int(self.prefill_stage_bank_bytes),
             "prefill_stage_mapping_bytes": int(self.prefill_stage_mapping_bytes),
+            "full_layer_prefill_bank_count": int(
+                self.full_layer_prefill_bank_count
+            ),
+            "full_layer_prefill_bank_bytes": int(
+                self.full_layer_prefill_bank_bytes
+            ),
+            "full_layer_prefill_mapping_bytes": int(
+                self.full_layer_prefill_mapping_bytes
+            ),
             "total_npu_slot_bytes": int(self.total_npu_slot_bytes),
             "original_expert_weights_retained": self.original_expert_weights_retained,
             "total_managed_bytes": int(self.total_managed_bytes),
@@ -212,6 +231,12 @@ class MoeOffloadRuntime:
             tuple[tuple[object, ...], int], object
         ] = {}
         self._prefill_stage_log2phy_buffers: dict[int, list[torch.Tensor]] = {}
+        self._full_layer_prefill_pool: dict[
+            tuple[object, ...], ExpertSlotBank
+        ] = {}
+        self._full_layer_prefill_log2phy_buffers: dict[
+            tuple[object, ...], torch.Tensor
+        ] = {}
         self._original_expert_weight_bytes_by_layer: dict[int, int] = {}
         self._expert_weight_bytes_by_layer: dict[int, int] = {}
         self._slot_expert_weight_bytes_by_layer: dict[int, int] = {}
@@ -232,6 +257,7 @@ class MoeOffloadRuntime:
         self._active_slot_ids_by_layer: dict[int, tuple[int, ...]] = {}
         self._slot_compute_done_events: dict[tuple[int, int, int], object] = {}
         self._placement_plan_provider: PlacementPlanProvider | None = None
+        self._fixed_slot_execution_state = threading.local()
 
     def set_placement_plan_provider(
         self,
@@ -297,6 +323,8 @@ class MoeOffloadRuntime:
             tuple(int(stride) for stride in topk_ids.stride()),
             int(topk_ids.storage_offset()),
             int(topk_ids.numel()),
+            int(topk_ids.data_ptr()),
+            int(getattr(topk_ids, "_version", 0)),
         )
 
     def cache_prefill_route_stats(
@@ -877,7 +905,28 @@ class MoeOffloadRuntime:
     def is_resident_layer(self, layer_id: int) -> bool:
         return self.config.tiered_residency.is_resident_layer(int(layer_id))
 
+    @contextmanager
+    def suspend_fixed_slot_execution(self) -> Iterator[None]:
+        """Temporarily force the current thread through the native MoE path."""
+        state = self._fixed_slot_execution_state
+        depth = int(getattr(state, "suspend_depth", 0))
+        state.suspend_depth = depth + 1
+        try:
+            yield
+        finally:
+            if depth == 0:
+                try:
+                    del state.suspend_depth
+                except AttributeError:
+                    pass
+            else:
+                state.suspend_depth = depth
+
     def should_use_fixed_slot_plan_for_layer(self, layer_id: int) -> bool:
+        if int(
+            getattr(self._fixed_slot_execution_state, "suspend_depth", 0)
+        ) > 0:
+            return False
         if not self.should_use_fixed_slots:
             return False
         return not self.is_resident_layer(int(layer_id))
@@ -969,6 +1018,13 @@ class MoeOffloadRuntime:
             for buffers in self._prefill_stage_log2phy_buffers.values()
             for buffer in buffers
         }
+        unique_full_layer_banks = {
+            id(bank): bank for bank in self._full_layer_prefill_pool.values()
+        }
+        unique_full_layer_mappings = {
+            int(buffer.data_ptr()): buffer
+            for buffer in self._full_layer_prefill_log2phy_buffers.values()
+        }
         ledger = MoeOffloadMemoryLedger(
             registered_layers=len(self._slot_banks),
             host_experts=len(self._host_store),
@@ -982,6 +1038,14 @@ class MoeOffloadRuntime:
             prefill_stage_mapping_bytes=sum(
                 _tensor_nbytes(buffer)
                 for buffer in unique_stage_mappings.values()
+            ),
+            full_layer_prefill_bank_count=len(unique_full_layer_banks),
+            full_layer_prefill_bank_bytes=sum(
+                bank.total_bytes for bank in unique_full_layer_banks.values()
+            ),
+            full_layer_prefill_mapping_bytes=sum(
+                _tensor_nbytes(buffer)
+                for buffer in unique_full_layer_mappings.values()
             ),
         )
         self._memory_ledger_cache = ledger
@@ -1909,6 +1973,109 @@ class MoeOffloadRuntime:
             }
         return prepared, ready_event, payload
 
+    def prepare_full_layer_prefill_plan(
+        self,
+        *,
+        layer_id: int,
+        num_logical_experts: int,
+        device: torch.device,
+        step_id: int | None = None,
+    ) -> tuple[PreparedSlotWeights, dict[str, object]]:
+        """Synchronously stage one complete expert layer into a shared NPU bank.
+
+        This is a correctness reference for capacity-overflow prefill. It keeps
+        the native top-k shape intact and reuses one layout-scoped bank across
+        serial MoE layers, so only one complete layer is resident transiently.
+        """
+        if not self.should_use_fixed_slots:
+            raise RuntimeError(
+                "full-layer prefill plan requested while fixed slots are disabled"
+            )
+
+        layer_id = int(layer_id)
+        num_logical_experts = int(num_logical_experts)
+        if self.is_resident_layer(layer_id):
+            raise RuntimeError(
+                f"full-layer prefill plan must not run on resident layer {layer_id}"
+            )
+        if num_logical_experts <= 0:
+            raise ValueError("num_logical_experts must be greater than 0")
+
+        template_bank = self._slot_banks.get(layer_id)
+        if template_bank is None:
+            raise RuntimeError(
+                f"layer {layer_id} is not registered for fixed-slot execution"
+            )
+        layer_buffer = self._host_store.get_layer_buffer(layer_id)
+        if int(layer_buffer.num_experts) != num_logical_experts:
+            raise RuntimeError(
+                f"host expert count for layer {layer_id} is "
+                f"{layer_buffer.num_experts}, expected {num_logical_experts}"
+            )
+
+        pool_key = self._full_layer_prefill_pool_key(
+            template_bank,
+            num_logical_experts=num_logical_experts,
+        )
+        pool_reused = pool_key in self._full_layer_prefill_pool
+        bank = self._get_full_layer_prefill_bank(
+            layer_id=layer_id,
+            template_bank=template_bank,
+            num_logical_experts=num_logical_experts,
+            pool_key=pool_key,
+        )
+        log2phy = self._get_full_layer_prefill_log2phy_buffer(
+            pool_key=pool_key,
+            num_logical_experts=num_logical_experts,
+            device=device,
+        )
+        step_id = (
+            int(step_id)
+            if step_id is not None and int(step_id) >= 0
+            else int(next(self._step_counter))
+        )
+
+        for expert_id in range(num_logical_experts):
+            bank.assign_transient_slot(
+                expert_id,
+                ExpertKey(layer_id, expert_id),
+                step_id=step_id,
+            )
+
+        stage_start = perf_counter()
+        try:
+            bank.w13_slots.copy_(layer_buffer.w13, non_blocking=False)
+            bank.w2_slots.copy_(layer_buffer.w2, non_blocking=False)
+        except Exception:
+            for slot_id in range(num_logical_experts):
+                bank.clear_slot(slot_id, force=True)
+            raise
+        for slot_id in range(num_logical_experts):
+            bank.mark_ready(slot_id)
+        stage_ms = (perf_counter() - stage_start) * 1000.0
+
+        all_experts = tuple(range(num_logical_experts))
+        mapping = ExpertSlotMapping(
+            layer_id=layer_id,
+            active_experts=all_experts,
+            logical_to_physical=log2phy,
+            slot_to_expert=all_experts,
+            active_slot_ids=all_experts,
+        )
+        prepared = PreparedSlotWeights.from_slot_bank(
+            slot_bank=bank,
+            mapping=mapping,
+        )
+        payload = {
+            "execution_mode": "reference_full_layer",
+            "num_logical_experts": num_logical_experts,
+            "physical_expert_count": int(prepared.physical_expert_count),
+            "h2d_bytes": int(layer_buffer.total_bytes),
+            "stage_ms": round(stage_ms, 3),
+            "pool_reused": bool(pool_reused),
+        }
+        return prepared, payload
+
     def wait_prefill_stage_plan(self, ready_event) -> None:
         self._wait_transfer_event(ready_event)
 
@@ -1973,6 +2140,86 @@ class MoeOffloadRuntime:
                 },
             )
         return banks[int(buffer_index)]
+
+    def _full_layer_prefill_pool_key(
+        self,
+        template_bank: ExpertSlotBank,
+        *,
+        num_logical_experts: int,
+    ) -> tuple[object, ...]:
+        return (
+            str(template_bank.w13_slots.device),
+            str(template_bank.w13_slots.dtype),
+            int(num_logical_experts),
+            tuple(int(dim) for dim in template_bank.w13_slots.shape[1:]),
+            tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
+            tuple(int(stride) for stride in template_bank.w13_slots[0].stride()),
+            tuple(int(stride) for stride in template_bank.w2_slots[0].stride()),
+        )
+
+    def _get_full_layer_prefill_bank(
+        self,
+        *,
+        layer_id: int,
+        template_bank: ExpertSlotBank,
+        num_logical_experts: int,
+        pool_key: tuple[object, ...],
+    ) -> ExpertSlotBank:
+        bank = self._full_layer_prefill_pool.get(pool_key)
+        if bank is not None:
+            return bank
+
+        allocation_start = perf_counter()
+        hbm_before = self._npu_hbm_snapshot(template_bank.w13_slots.device)
+        bank = ExpertSlotBank(
+            int(num_logical_experts),
+            tuple(int(dim) for dim in template_bank.w13_slots.shape[1:]),
+            tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
+            dtype=template_bank.w13_slots.dtype,
+            device=template_bank.w13_slots.device,
+        )
+        self._full_layer_prefill_pool[pool_key] = bank
+        self._invalidate_memory_ledger_cache()
+        hbm_after = self._npu_hbm_snapshot(template_bank.w13_slots.device)
+        self._record_profile_event(
+            "full_layer_prefill_bank_allocate",
+            layer_id=int(layer_id),
+            start=allocation_start,
+            payload={
+                "bank_bytes": int(bank.total_bytes),
+                "physical_expert_count": int(num_logical_experts),
+                "hbm_before": hbm_before,
+                "hbm_after": hbm_after,
+            },
+        )
+        return bank
+
+    def _get_full_layer_prefill_log2phy_buffer(
+        self,
+        *,
+        pool_key: tuple[object, ...],
+        num_logical_experts: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buffer = self._full_layer_prefill_log2phy_buffers.get(pool_key)
+        if buffer is None:
+            buffer = torch.arange(
+                int(num_logical_experts),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._full_layer_prefill_log2phy_buffers[pool_key] = buffer
+            self._invalidate_memory_ledger_cache()
+        if int(buffer.numel()) != int(num_logical_experts):
+            raise RuntimeError(
+                "full-layer prefill identity mapping size changed for a shared layout"
+            )
+        if buffer.device != device:
+            raise RuntimeError(
+                f"full-layer prefill identity mapping is on {buffer.device}, "
+                f"expected {device}"
+            )
+        return buffer
 
     def _prefill_stage_pool_key(
         self,

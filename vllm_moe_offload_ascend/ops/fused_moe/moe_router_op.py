@@ -173,10 +173,9 @@ direct_register_custom_op(
 # (fused_moe.py:690-711), computes ``num_logical_experts`` the SAME way
 # (get_moe_num_logical_experts), and delegates to the explicit-scalar core.
 #
-# IMPORTANT (index safety): pass the REAL layer name string here, never the
-# "from_forward_context" sentinel -- a real-name lookup does a direct dict read
-# with NO moe_layer_index increment, so replacing one moe_forward with three
-# indirect ops stays index-consistent.
+# IMPORTANT (index safety): pass the REAL layer name string here. The top-level
+# seam entry consumes the "from_forward_context" sentinel exactly once; router
+# and MLP then use direct real-name lookups without incrementing the index again.
 # ---------------------------------------------------------------------------
 def _moe_router_indirect_impl(
     hidden_states: torch.Tensor,

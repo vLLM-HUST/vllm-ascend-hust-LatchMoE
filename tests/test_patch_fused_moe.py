@@ -159,6 +159,42 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
     assert FakeRMSNorm().forward_oot("x") == ("original", "x", None)
 
 
+def test_cann_rmsnorm_fallback_disables_unsupported_fusion_patterns(monkeypatch):
+    import importlib
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    fake_layernorm = ModuleType("vllm_ascend.ops.layernorm")
+    fake_fusion_pass = ModuleType(
+        "vllm_ascend.compilation.passes.norm_quant_fusion_pass"
+    )
+    fake_fusion_pass.enable_custom_op = lambda: True
+    original_import_module = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == "vllm_ascend.ops.layernorm":
+            return fake_layernorm
+        if name == "vllm_ascend.compilation.passes.norm_quant_fusion_pass":
+            return fake_fusion_pass
+        return original_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_opapi_supports_add_rms_norm_bias",
+        lambda: False,
+    )
+
+    patch_fused_moe._patch_rms_norm_bias_cann_compat()
+
+    assert fake_fusion_pass.enable_custom_op() is False
+    assert getattr(
+        fake_fusion_pass.enable_custom_op,
+        "_latchmoe_cann_rmsnorm_compat",
+        False,
+    )
+
+
 def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
     import vllm_ascend.platform as platform
     from vllm.config.compilation import CUDAGraphMode
@@ -171,6 +207,12 @@ def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
             return None
 
     monkeypatch.setattr(platform, "NPUPlatform", FakeNPUPlatform)
+    compat_calls = []
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_patch_rms_norm_bias_cann_compat",
+        lambda: compat_calls.append("rmsnorm_compat"),
+    )
     monkeypatch.setattr(patch_fused_moe, "_install_runtime_module_patches", lambda: None)
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "1")
 
@@ -184,6 +226,7 @@ def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
 
     FakeNPUPlatform.check_and_update_config(config)
 
+    assert compat_calls == ["rmsnorm_compat"]
     assert "vllm::moe_offload_stage" in config.compilation_config.splitting_ops
 
 
@@ -493,6 +536,111 @@ def test_b2_profile_details_can_be_enabled(monkeypatch):
     assert "profile_details" not in payload
 
 
+def test_b2_reference_full_tokens_is_disabled_by_default(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_reference_full_tokens_enabled,
+    )
+
+    monkeypatch.delenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_TOKENS",
+        raising=False,
+    )
+
+    assert _b2_reference_full_tokens_enabled(async_stage=False) is False
+
+
+def test_b2_reference_full_tokens_accepts_sync_staging(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_reference_full_tokens_enabled,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_TOKENS",
+        "1",
+    )
+
+    assert _b2_reference_full_tokens_enabled(async_stage=False) is True
+
+
+def test_b2_reference_full_tokens_rejects_async_staging(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_reference_full_tokens_enabled,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_TOKENS",
+        "1",
+    )
+
+    with pytest.raises(RuntimeError, match="only supports synchronous B2 staging"):
+        _b2_reference_full_tokens_enabled(async_stage=True)
+
+
+def test_b2_reference_full_layer_is_disabled_by_default(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_reference_full_layer_enabled,
+    )
+
+    monkeypatch.delenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER",
+        raising=False,
+    )
+
+    assert _b2_reference_full_layer_enabled(async_stage=False) is False
+
+
+def test_b2_reference_full_layer_accepts_sync_staging(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_reference_full_layer_enabled,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER",
+        "1",
+    )
+
+    assert _b2_reference_full_layer_enabled(async_stage=False) is True
+
+
+def test_b2_reference_full_layer_rejects_async_staging(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_reference_full_layer_enabled,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER",
+        "1",
+    )
+
+    with pytest.raises(RuntimeError, match="only supports synchronous staging"):
+        _b2_reference_full_layer_enabled(async_stage=True)
+
+
+def test_b2_profile_details_accepts_sync_execution_without_schedule(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _attach_b2_profile_details,
+    )
+
+    class Jsonable:
+        def to_jsonable(self):
+            return {"waves": [[1, 2]]}
+
+    monkeypatch.setenv("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", "1")
+    payload = _attach_b2_profile_details(
+        {},
+        wave_plan=Jsonable(),
+        async_schedule=None,
+        async_stage=False,
+        wave_profiles=[{"experts": [1, 2], "stage_mode": "sync_slot_cache"}],
+    )
+
+    assert payload["wave_plan"] == {"waves": [[1, 2]]}
+    assert payload["async_schedule"] is None
+    assert payload["waves"] == [
+        {"experts": [1, 2], "stage_mode": "sync_slot_cache"}
+    ]
+
+
 def test_estimate_b2_wave_h2d_bytes_uses_cached_layer_bytes():
     from vllm_moe_offload_ascend.patches.patch_fused_moe import (
         _estimate_b2_wave_h2d_bytes,
@@ -718,6 +866,168 @@ def test_seam_forward_prefill_resident_uses_native_fused_moe(monkeypatch):
             "start_type": "float",
         }
     ]
+
+
+def test_seam_forward_compares_native_layer_boundary_without_changing_result(
+    monkeypatch,
+    capsys,
+):
+    import torch
+
+    from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
+    from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    class FakeRunner:
+        _ascend_moe_offload_seam_patch = False
+
+        def _select_forward(self):
+            raise AssertionError("original select_forward should not be used")
+
+    fake_fused_moe = SimpleNamespace(AscendMoERunner=FakeRunner)
+    patch_fused_moe._patch_ascend_moe_runner(fake_fused_moe)
+
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=8,
+            offload_stage_seam=True,
+        )
+    )
+    vllm_moe_offload_ascend.register()
+    import vllm_ascend.moe_offload.runtime as runtime_mod
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "get_moe_offload_runtime",
+        lambda: runtime,
+    )
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_LAYER_BOUNDARY",
+        "1",
+    )
+
+    runner = FakeRunner()
+    runner._seam_active = True
+    runner._seam_layer_id = 3
+    runner._seam_num_logical_experts = 128
+    runner.layer_name = "model.layers.3.mlp.experts"
+
+    expected_layer = object()
+    lookup_names = []
+
+    def fake_get_layer_from_name(name):
+        lookup_names.append(name)
+        return expected_layer
+
+    monkeypatch.setattr(
+        moe_runner,
+        "get_layer_from_name",
+        fake_get_layer_from_name,
+    )
+
+    hidden_states = torch.zeros((4, 16), dtype=torch.float32)
+    router_logits = torch.zeros((4, 128), dtype=torch.float32)
+    native_out = torch.ones_like(hidden_states)
+    offload_out = torch.full_like(hidden_states, 3.0)
+    calls = []
+    native_inputs = []
+
+    def fake_moe_forward(*args):
+        native_inputs.append((args[0], args[1], args[4]))
+        calls.append(
+            (
+                "native",
+                runtime.should_use_fixed_slot_plan_for_layer(3),
+            )
+        )
+        return native_out
+
+    def fake_router(*args):
+        calls.append(
+            (
+                "router",
+                runtime.should_use_fixed_slot_plan_for_layer(3),
+            )
+        )
+        return (
+            torch.ones((4, 2), dtype=torch.float32),
+            torch.zeros((4, 2), dtype=torch.int32),
+        )
+
+    def fake_stage(*args):
+        calls.append(
+            (
+                "stage",
+                runtime.should_use_fixed_slot_plan_for_layer(3),
+            )
+        )
+
+    def fake_mlp(*args):
+        calls.append(
+            (
+                "mlp",
+                runtime.should_use_fixed_slot_plan_for_layer(3),
+            )
+        )
+        return offload_out
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "moe_forward",
+        fake_moe_forward,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "moe_router_indirect",
+        fake_router,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "moe_offload_stage",
+        fake_stage,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "moe_mlp",
+        fake_mlp,
+        raising=False,
+    )
+
+    result = runner._seam_forward_entry(
+        hidden_states,
+        router_logits,
+        shared_experts_input=None,
+        input_ids=None,
+        layer_name="from_forward_context",
+    )
+
+    assert result is offload_out
+    assert lookup_names == [
+        "from_forward_context",
+        "model.layers.3.mlp.experts",
+    ]
+    native_hidden_states, native_router_logits, native_layer_name = native_inputs[0]
+    assert native_hidden_states is not hidden_states
+    assert native_router_logits is not router_logits
+    assert torch.equal(native_hidden_states, hidden_states)
+    assert torch.equal(native_router_logits, router_logits)
+    assert native_layer_name == "model.layers.3.mlp.experts"
+    assert calls == [
+        ("native", False),
+        ("router", True),
+        ("stage", True),
+        ("mlp", True),
+    ]
+    output = capsys.readouterr().out
+    assert "SEW_LAYER_BOUNDARY_COMPARE layer=3 tokens=4" in output
+    assert "output_equal=False" in output
+    assert "output_max_abs=2.0" in output
+    assert runtime.should_use_fixed_slot_plan_for_layer(3) is True
 
 
 def test_b2_prefill_skips_resident_layer_before_route_stats(monkeypatch):
@@ -949,14 +1259,7 @@ def test_stage_op_defers_capacity_overflow_to_b2_without_phase_hint(monkeypatch)
     )
 
     assert runtime.stage_calls == 0
-    assert runtime.cached is not None
-    assert runtime.cached["layer_id"] == 7
-    assert runtime.cached["token_counts_by_expert"] == {
-        0: 1,
-        1: 1,
-        2: 1,
-        3: 1,
-    }
+    assert runtime.cached is None
 
 
 def test_stage_op_does_not_defer_decode_overflow_without_shape_hint(monkeypatch):
@@ -1069,12 +1372,13 @@ def test_stage_op_confirmed_decode_overflow_defers_to_exact_pair_waves(monkeypat
     )
 
     assert runtime.stage_calls == 0
-    assert runtime.cached is not None
+    assert runtime.cached is None
 
 
 def test_stage_op_confirmed_prefill_overflow_defers_to_b2(monkeypatch):
     """Counterpart to the decode case: a CONFIRMED prefill that overflows slots
-    is the legitimate B2 wave handoff and must cache route-stats, not stage once.
+    is the legitimate B2 wave handoff and may cache route-stats when explicitly
+    enabled, instead of staging the whole working set once.
     """
     import torch
 
@@ -1112,6 +1416,7 @@ def test_stage_op_confirmed_prefill_overflow_defers_to_b2(monkeypatch):
             raise AssertionError("prefill overflow must hand off to B2, not stage once")
 
     runtime = FakeRuntime()
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "1")
     monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
     monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
 

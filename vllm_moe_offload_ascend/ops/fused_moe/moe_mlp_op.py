@@ -77,8 +77,9 @@ def _moe_mlp_impl(
 ) -> torch.Tensor:
     """Run the routed-experts MLP using the router's precomputed topk.
 
-    Pass the REAL layer name (never the "from_forward_context" sentinel) so the
-    lookup does not increment moe_layer_index (index safety in the three-op seam).
+    Pass the REAL layer name so this lookup does not increment moe_layer_index.
+    The top-level seam entry consumes the sentinel exactly once before invoking
+    the router and MLP pieces.
     """
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
         get_layer_from_name,

@@ -260,7 +260,7 @@ def _format_arg(value: Any, config: dict[str, Any]) -> str:
 
 def build_server_command(config: dict[str, Any], case: dict[str, Any]) -> list[str]:
     server = config["server"]
-    command = [str(server.get("command", "vllm"))]
+    command = [str(server.get("command", "latchmoe"))]
     command.extend(_format_arg(arg, config) for arg in server.get("common_args", []))
     command.extend(str(arg) for arg in case.get("server_args", []))
     return command

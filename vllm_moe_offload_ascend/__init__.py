@@ -20,16 +20,8 @@ monkey-patches the hook points in vllm_ascend so the real MoE offload
 logic is active instead of the null stubs.
 """
 
-_REGISTERED = False
-
-
 def register() -> None:
     """Entry point called by vllm's platform plugin system at startup."""
-    global _REGISTERED
-    if _REGISTERED:
-        return
-
     from vllm_moe_offload_ascend.patches.patch_fused_moe import apply_patches
 
     apply_patches()
-    _REGISTERED = True

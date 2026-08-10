@@ -3,22 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 import vllm_moe_offload_ascend as plugin
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-@pytest.fixture(autouse=True)
-def reset_plugin_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(plugin, "_REGISTERED", False)
-
-
 def test_platform_plugin_entry_point_is_declared() -> None:
     config = (REPO_ROOT / "pyproject.toml").read_text()
 
+    assert '[project.scripts]' in config
+    assert 'latchmoe = "vllm_moe_offload_ascend.launcher:main"' in config
     assert '[project.entry-points."vllm.platform_plugins"]' in config
     assert (
         'moe_offload_ascend = "vllm_moe_offload_ascend:register"' in config
@@ -45,7 +39,7 @@ def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
     assert environment["VLLM_ASCEND_MOE_OFFLOAD_GB"] == "${offload_gb}"
 
 
-def test_register_applies_patches_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_register_retries_idempotent_patch_path(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "vllm_moe_offload_ascend.patches.patch_fused_moe.apply_patches",
@@ -55,12 +49,14 @@ def test_register_applies_patches_once(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin.register()
     plugin.register()
 
-    assert calls == ["patched"]
-    assert plugin._REGISTERED is True
+    assert calls == ["patched", "patched"]
 
 
-def test_failed_registration_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_registration_can_be_retried(monkeypatch) -> None:
+    calls: list[str] = []
+
     def fail() -> None:
+        calls.append("failed")
         raise RuntimeError("missing vllm-ascend hook")
 
     monkeypatch.setattr(
@@ -68,7 +64,17 @@ def test_failed_registration_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> 
         fail,
     )
 
-    with pytest.raises(RuntimeError, match="missing vllm-ascend hook"):
+    try:
         plugin.register()
+    except RuntimeError as exc:
+        assert str(exc) == "missing vllm-ascend hook"
+    else:
+        raise AssertionError("registration failure must propagate")
 
-    assert plugin._REGISTERED is False
+    monkeypatch.setattr(
+        "vllm_moe_offload_ascend.patches.patch_fused_moe.apply_patches",
+        lambda: calls.append("retried"),
+    )
+    plugin.register()
+
+    assert calls == ["failed", "retried"]
