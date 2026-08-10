@@ -4,7 +4,7 @@ TECTONIC ?= tectonic
 
 all: main.pdf
 
-main.pdf: main.tex references.bib usenix-2020-09.sty
+main.pdf: main.tex sections/00_intro.tex references.bib usenix-2020-09.sty
 	$(TECTONIC) --keep-logs --keep-intermediates main.tex
 
 clean:

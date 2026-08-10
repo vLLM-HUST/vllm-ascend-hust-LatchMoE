@@ -38,63 +38,7 @@ graph-mode online comparisons against matched graph-compatible baselines before
 making a performance claim.
 \end{abstract}
 
-\section{Introduction}
-
-Mixture-of-experts models activate only a small subset of their parameters for
-each token, but all experts must remain available for routing.  This mismatch
-between sparse computation and dense capacity makes expert weights a dominant
-memory cost.  Parallel systems distribute experts across devices
-\cite{deepspeedmoe}, while single-device systems can instead retain inactive
-experts in host memory and transfer them on demand \cite{moeinfinity}.  The
-latter approach reduces device-memory demand but adds a transfer decision to
-the latency-critical serving loop.
-
-Modern serving engines amortize host launch overhead by capturing repeated
-decode work into an accelerator graph.  Expert offloading breaks a hidden
-assumption of this optimization: the tensors referenced by a replayed graph
-must have stable addresses even when routing changes which expert is needed.
-A direct implementation either copies weights into changing allocations inside
-the captured region or disables capture.  The first choice invalidates replay
-semantics; the second returns decode to a host-dispatched execution path.
-
-The key observation behind \system is that expert \emph{identity} may change
-without changing the addresses consumed by the captured kernels.  We allocate
-a fixed bank of expert slots and expose a logical-to-physical mapping to the
-MoE computation.  Routing changes update the mapping and stage weights at a
-replay boundary; captured kernels continue to read the same slot tensors.
-This separation turns dynamic residency into metadata and transfer work around
-an otherwise stable graph.
-
-Address stability alone is insufficient.  A transfer must not overwrite a slot
-still used by in-flight compute, and a prompt can activate more experts than
-the bank can hold.  \system therefore pairs the slot bank with a checked
-lifecycle and capacity-bounded wave prefill.  Events establish when a slot may
-be reused, while wave execution limits the simultaneous working set and can
-overlap staging for the next wave.
-
-We implement \system as a vLLM platform plugin with a narrow set of
-vLLM-Ascend hook points.  The repository also contains a server-based benchmark
-that records time to first token (TTFT), time per output token (TPOT),
-throughput, graph events, HBM use, and transfer events under one artifact
-  contract.  The benchmark is graph-only and rejects forced eager execution
-  and eager fallback before launch.
-
-This paper makes three contributions:
-
-\begin{itemize}
-  \item It identifies address instability, rather than expert sparsity alone,
-    as the systems mismatch between offloading and graph replay.
-  \item It introduces an address-stable expert data plane with replay-boundary
-    staging, compute-protected slot reuse, and capacity-bounded wave prefill.
-  \item It defines a reproducible evaluation contract that separates graph
-    correctness, memory feasibility, transfer behavior, and service metrics.
-\end{itemize}
-
-The remainder of the paper describes the mismatch and design requirements
-(\S\ref{sec:background}), presents the data plane and lifecycle
-(\S\ref{sec:design}), discusses implementation (\S\ref{sec:implementation}),
-and reports current evidence and the submission evaluation plan
-(\S\ref{sec:evaluation}).
+\input{sections/00_intro}
 
 \section{Background and Problem}
 \label{sec:background}

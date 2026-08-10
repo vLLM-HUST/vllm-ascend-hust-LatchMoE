@@ -1,8 +1,9 @@
-@inproceedings{vllm,
-  author = {Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  title = {Efficient Memory Management for Large Language Model Serving with {PagedAttention}},
-  booktitle = {Proceedings of the 29th Symposium on Operating Systems Principles},
-  year = {2023}
+@article{shazeer2017moe,
+  author = {Noam Shazeer and Azalia Mirhoseini and Krzysztof Maziarz and Andy Davis and Quoc V. Le and Geoffrey E. Hinton and Jeff Dean},
+  title = {Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer},
+  journal = {arXiv preprint arXiv:1701.06538},
+  year = {2017},
+  doi = {10.48550/arXiv.1701.06538}
 }
 
 @article{switch,
@@ -14,18 +15,44 @@
   year = {2022}
 }
 
+@article{glam,
+  author = {Nan Du and Yanping Huang and Andrew M. Dai and Simon Tong and Dmitry Lepikhin and Yuanzhong Xu and Maxim Krikun and Yanqi Zhou and Adams Wei Yu and Orhan Firat and Barret Zoph and Liam Fedus and Maarten Bosma and Zongwei Zhou and Tao Wang and Yu Emma Wang and Kellie Webster and Marie Pellat and Kevin Robinson and Kathleen Meier-Hellstern and Toju Duke and Lucas Dixon and Kun Zhang and Quoc V. Le and Yonghui Wu and Zhifeng Chen and Claire Cui},
+  title = {{GLaM}: Efficient Scaling of Language Models with Mixture-of-Experts},
+  journal = {arXiv preprint arXiv:2112.06905},
+  year = {2021},
+  doi = {10.48550/arXiv.2112.06905}
+}
+
+@article{mixtral,
+  author = {Albert Q. Jiang and Alexandre Sablayrolles and Antoine Roux and Arthur Mensch and Blanche Savary and Chris Bamford and Devendra Singh Chaplot and Diego de las Casas and Emma Bou Hanna and Florian Bressand and Gianna Lengyel and Guillaume Bour and Guillaume Lample and Lelio Renard Lavaud and Lucile Saulnier and Marie-Anne Lachaux and Pierre Stock and Sandeep Subramanian and Sophia Yang and Szymon Antoniak and Teven Le Scao and Theophile Gervet and Thibaut Lavril and Thomas Wang and Timothee Lacroix and William El Sayed},
+  title = {Mixtral of Experts},
+  journal = {arXiv preprint arXiv:2401.04088},
+  year = {2024},
+  doi = {10.48550/arXiv.2401.04088}
+}
+
+@inproceedings{deepseekmoe,
+  author = {Damai Dai and Chengqi Deng and Chenggang Zhao and Ruijian Xu and Huazuo Gao and Deli Chen and Jiashi Li and Wangding Zeng and Xingkai Yu and Yongle Wu and Zhenda Xie and Y. K. Li and Panpan Huang and Fuli Luo and Chong Ruan and Zhifang Sui and Wenfeng Liang},
+  title = {{DeepSeekMoE}: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models},
+  booktitle = {Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics},
+  year = {2024},
+  doi = {10.18653/v1/2024.acl-long.70}
+}
+
+@inproceedings{vllm,
+  author = {Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
+  title = {Efficient Memory Management for Large Language Model Serving with {PagedAttention}},
+  booktitle = {Proceedings of the 29th Symposium on Operating Systems Principles},
+  year = {2023},
+  doi = {10.1145/3600006.3613165}
+}
+
 @article{deepspeedmoe,
   author = {Samyam Rajbhandari and Conglong Li and Zhewei Yao and Minjia Zhang and Reza Yazdani Aminabadi and Ammar Ahmad Awan and Jeff Rasley and Yuxiong He},
   title = {{DeepSpeed-MoE}: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation {AI} Scale},
   journal = {arXiv preprint arXiv:2201.05596},
-  year = {2022}
-}
-
-@article{moeinfinity,
-  author = {Leyang Xue and Yao Fu and Zhan Lu and Luo Mai and Mahesh Marina},
-  title = {{MoE-Infinity}: Offloading-Efficient {MoE} Model Serving},
-  journal = {arXiv preprint arXiv:2401.14361},
-  year = {2024}
+  year = {2022},
+  doi = {10.48550/arXiv.2201.05596}
 }
 
 @inproceedings{flexgen,
@@ -33,4 +60,83 @@
   title = {{FlexGen}: High-Throughput Generative Inference of Large Language Models with a Single {GPU}},
   booktitle = {Proceedings of the 40th International Conference on Machine Learning},
   year = {2023}
+}
+
+@article{fastmoeoffload,
+  author = {Artyom Eliseev and Denis Mazur},
+  title = {Fast Inference of Mixture-of-Experts Language Models with Offloading},
+  journal = {arXiv preprint arXiv:2312.17238},
+  year = {2023},
+  doi = {10.48550/arXiv.2312.17238}
+}
+
+@article{moeinfinity,
+  author = {Leyang Xue and Yao Fu and Zhan Lu and Luo Mai and Mahesh Marina},
+  title = {{MoE-Infinity}: Efficient {MoE} Inference on Personal Machines with Sparsity-Aware Expert Cache},
+  journal = {arXiv preprint arXiv:2401.14361},
+  year = {2024},
+  doi = {10.48550/arXiv.2401.14361}
+}
+
+@inproceedings{pregated,
+  author = {Ranggi Hwang and Jianyu Wei and Shijie Cao and Chang Ho Hwang and Xiaohu Tang and Ting Cao and Mao Yang},
+  title = {Pre-gated {MoE}: An Algorithm-System Co-Design for Fast and Scalable Mixture-of-Expert Inference},
+  booktitle = {Proceedings of the 51st Annual International Symposium on Computer Architecture},
+  year = {2024},
+  doi = {10.1109/ISCA59077.2024.00078}
+}
+
+@inproceedings{swapmoe,
+  author = {Rui Kong and Yuanchun Li and Qingtian Feng and Weijun Wang and Xiaozhou Ye and Ye Ouyang and Linghe Kong and Yunxin Liu},
+  title = {{SwapMoE}: Serving Off-the-Shelf {MoE}-Based Large Language Models with Tunable Memory Budget},
+  booktitle = {Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics},
+  year = {2024},
+  doi = {10.18653/v1/2024.acl-long.363}
+}
+
+@article{promoe,
+  author = {Xiaoniu Song and Zihang Zhong and Rong Chen and Haibo Chen},
+  title = {{ProMoE}: Fast {MoE}-Based {LLM} Serving Using Proactive Caching},
+  journal = {arXiv preprint arXiv:2410.22134},
+  year = {2024},
+  doi = {10.48550/arXiv.2410.22134}
+}
+
+@article{hobbit,
+  author = {Peng Tang and Jiacheng Liu and Xiaofeng Hou and Yifei Pu and Jing Wang and Pheng-Ann Heng and Chao Li and Minyi Guo},
+  title = {{HOBBIT}: A Mixed Precision Expert Offloading System for Fast {MoE} Inference},
+  journal = {arXiv preprint arXiv:2411.01433},
+  year = {2024},
+  doi = {10.48550/arXiv.2411.01433}
+}
+
+@article{finemoe,
+  author = {Hanfei Yu and Xingqi Cui and Hong Zhang and Hao Wang and Hao Wang},
+  title = {Taming Latency-Memory Trade-Off in {MoE}-Based {LLM} Serving via Fine-Grained Expert Offloading},
+  journal = {arXiv preprint arXiv:2502.05370},
+  year = {2025},
+  doi = {10.48550/arXiv.2502.05370}
+}
+
+@inproceedings{commitmoe,
+  author = {Han Li and Jingwei Sun and Junqing Lin and Guangzhong Sun},
+  title = {{CommitMoE}: Efficient Fallback-Free {MoE} Inference with Offloading Under {GPU} Memory Constraints},
+  booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  year = {2026},
+  doi = {10.1609/aaai.v40i27.39454}
+}
+
+@inproceedings{nimble,
+  author = {Haichen Shen and Jared Roesch and Zhi Chen and Wei Chen and Yong Wu and Mu Li and Vin Sharma and Zachary Tatlock and Yida Wang},
+  title = {Nimble: Efficiently Compiling Dynamic Neural Networks for Model Inference},
+  booktitle = {Proceedings of Machine Learning and Systems},
+  year = {2021}
+}
+
+@article{flashinfer,
+  author = {Zihao Ye and Lequn Chen and Ruihang Lai and Wuwei Lin and Yineng Zhang and Stephanie W. Wang and Tianqi Chen and Baris Kasikci and Vinod Grover and Arvind Krishnamurthy and Luis Ceze},
+  title = {{FlashInfer}: Efficient and Customizable Attention Engine for {LLM} Inference Serving},
+  journal = {arXiv preprint arXiv:2501.01005},
+  year = {2025},
+  doi = {10.48550/arXiv.2501.01005}
 }

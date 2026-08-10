@@ -1,0 +1,96 @@
+\section{Introduction}
+\label{sec:intro}
+
+Mixture-of-experts (MoE) models increase parameter capacity while activating
+only a small subset of experts for each token
+\cite{shazeer2017moe,switch,glam,mixtral,deepseekmoe}.  Sparse activation
+reduces the arithmetic performed per token, but it does not remove the need to
+make every routed expert available.  Consequently, expert weights can dominate
+the memory footprint of an MoE deployment.  Distributed systems spread this
+capacity across accelerators \cite{deepspeedmoe}, while heterogeneous inference
+systems coordinate model storage across device and host memory \cite{flexgen}.
+For a memory-constrained single accelerator, expert offloading applies the
+latter idea specifically to MoE layers: the runtime keeps a bounded set of
+experts in high-bandwidth memory (HBM) and fetches non-resident experts from
+host memory as routing demands them \cite{fastmoeoffload,moeinfinity}.  This
+exchange makes otherwise infeasible model capacity accessible, but it also
+places cache lookup, weight movement, and replacement on the serving path.
+
+Prior systems reduce this data-movement cost through expert prediction,
+prefetching, caching, mixed precision, and finer-grained offloading
+\cite{pregated,swapmoe,promoe,hobbit,finemoe,commitmoe}.  These mechanisms
+improve which experts are moved and when they arrive, yet routing-driven cache
+misses still change the correspondence between logical experts and physical
+weight storage.  A separate line of compiler and serving work addresses model
+dynamism and graph-compatible scheduling \cite{nimble,vllm,flashinfer}.
+Accelerator graph replay amortizes repeated host dispatch, but the replayed
+region assumes a repeatable operator topology and stable graph-visible storage
+bindings.  Expert replacement violates this assumption even when tensor shapes
+and kernel choices remain unchanged: the same logical expert may occupy a
+different allocation at the next decoding step.  Eager execution can resolve
+the new placement before every kernel launch, whereas excluding the entire MoE
+path from capture reintroduces fine-grained host orchestration.  Data-movement
+optimizations alone therefore do not provide a replay-stable interface for
+dynamic expert residency.
+
+Our goal is to preserve graph replay while allowing the resident expert set to
+change within a fixed HBM budget.  The key observation is that expert
+\emph{identity} may change without changing the addresses consumed by captured
+kernels.  A captured MoE computation does not need each logical expert to keep
+its original allocation; it needs fixed physical storage containing the right
+weights and a consistent logical-to-physical mapping at replay time.  This
+observation turns dynamic residency into an inter-replay state transition:
+weight contents and mapping values may be updated at an explicit replay
+boundary, while the slot tensors and mapping buffers visible to the graph keep
+their addresses.  It also separates the data plane that enforces residency
+from the control policy that prioritizes expert placement.
+
+Realizing this separation raises three challenges.  First, the fused MoE
+operator hides the routing decision inside an opaque computation, leaving no
+graph-visible boundary at which data-dependent staging can legally execute;
+exposing such a boundary must not change routing or the tensors passed between
+captured regions.  Second, asynchronous transfers and expert computation share
+the same bounded slot bank.  A new load must not overwrite a slot used by
+in-flight compute, and a mapping must not expose a new owner before its transfer
+has completed.  Third, a prefill or mixed batch can activate more experts than
+the slot bank can hold simultaneously.  Full residency would violate the HBM
+budget, while dropping routed experts or approximating their outputs would
+change model semantics.  The runtime must therefore execute an oversized
+working set exactly in capacity-bounded phases while retaining opportunities
+to overlap transfer and computation.
+
+We present \system, a graph-compatible expert-offloading data plane for
+vLLM-Ascend.  \system decomposes the opaque MoE forward path into a captured
+router, an eager staging seam, and a captured expert MLP.  At the seam, it reads
+the active expert set, applies a placement plan, loads misses into a
+preallocated slot bank, and updates a persistent logical-to-physical mapping in
+place; the captured MLP continues to consume the same slot and metadata
+addresses.  Each slot carries an owner and version, and transfer and compute
+events protect that ownership until all users of the version have completed.
+When an active set exceeds capacity, \system partitions routed token-expert
+pairs into exact waves, stages and computes one bounded wave at a time, and
+restores outputs to their original token positions.  Multiple staging buffers
+permit the next wave's transfers to overlap the current wave's compute.  An
+HBM- and KV-aware startup configuration selects resident layers and slot
+capacity, while a policy-neutral placement-plan interface allows external
+controllers to reuse the same data plane.
+
+In summary, this paper makes four contributions:
+
+\begin{itemize}
+  \item We characterize the address-binding conflict between dynamic expert
+    residency and accelerator graph replay, and derive the requirements for a
+    replay-stable offloading data plane (\S\ref{sec:background}).
+  \item We design \system's three-stage decomposition with a captured router,
+    eager staging seam, and captured MLP, together with fixed-slot expert
+    virtualization.  These mechanisms move
+    data-dependent placement outside captured regions while preserving stable
+    graph-visible addresses (\S\S\ref{sec:design}--\ref{sec:implementation}).
+  \item We introduce a versioned, compute-protected slot lifecycle and exact
+    capacity-bounded wave execution for working sets that exceed slot capacity
+    (\S\S\ref{sec:design}--\ref{sec:implementation}).
+  \item We implement \system as a vLLM-Ascend platform plugin and define a
+    graph-only evaluation methodology that records graph execution, HBM use,
+    expert transfers, and service metrics while rejecting eager fallback as a
+    successful run (\S\ref{sec:evaluation}).
+\end{itemize}
