@@ -129,7 +129,7 @@ tests/              host-side unit tests
 - vLLM 0.21.0 and the **hook-enabled vllm-ascend fork**
   ([`vLLM-HUST/vllm-ascend-hust`, branch
   `feature/latchmoe-offload-seam-v1-v021`](https://github.com/vLLM-HUST/vllm-ascend-hust/tree/feature/latchmoe-offload-seam-v1-v021),
-  commit [`4806367`](https://github.com/vLLM-HUST/vllm-ascend-hust/commit/4806367eeeb7d62b32078ae90cd929cc06d825fe));
+  commit `5ff2666e7dc8e98c546592a381946525d1069198`);
   the Issue #4 dependency contract is pinned in
   [`repro/issue4/seam.lock`](repro/issue4/seam.lock), and stock vllm-ascend does
   not contain the MoE offload hook seam
@@ -152,7 +152,7 @@ the same environment:
 ```bash
 git clone --branch feature/latchmoe-offload-seam-v1-v021 \
   https://github.com/vLLM-HUST/vllm-ascend-hust.git
-git -C vllm-ascend-hust checkout 4806367eeeb7d62b32078ae90cd929cc06d825fe
+git -C vllm-ascend-hust checkout 5ff2666e7dc8e98c546592a381946525d1069198
 
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 cd vllm-ascend-hust-LatchMoE

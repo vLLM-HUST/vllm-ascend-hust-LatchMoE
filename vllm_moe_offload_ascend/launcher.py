@@ -225,6 +225,10 @@ def _validate_seam_abi(root: str, abi: str) -> tuple[str, ...]:
             "swiglu_limit",
         ),
         "vllm_ascend/utils.py": ("def adapt_patch",),
+        "vllm_ascend/platform.py": (
+            "_LATCHMOE_STAGE_SEAM_ENV",
+            "vllm::moe_offload_stage",
+        ),
     }
     errors: list[str] = []
     checkout = Path(root)
@@ -424,6 +428,14 @@ def _print_report(report: EnvironmentReport, *, as_json: bool = False) -> None:
 
 
 def _run_vllm_cli(argv: Sequence[str]) -> int:
+    # Import EngineArgs to completion before retrying plugin registration. vLLM
+    # platform discovery may call the plugin while this module is still being
+    # defined, which makes EngineArgs and NPUPlatform monkey-patches best-effort
+    # on the first pass.
+    from vllm.engine.arg_utils import EngineArgs as _EngineArgs  # noqa: F401
+    from vllm_moe_offload_ascend import register
+
+    register()
     from vllm.entrypoints.cli.main import main as vllm_main
 
     original_argv = sys.argv

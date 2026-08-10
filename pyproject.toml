@@ -29,6 +29,12 @@ latchmoe = "vllm_moe_offload_ascend.launcher:main"
 [project.entry-points."vllm.platform_plugins"]
 moe_offload_ascend = "vllm_moe_offload_ascend:register"
 
+# Platform discovery can run while vLLM and vLLM-Ascend are only partially
+# imported. The general-plugin retry runs from EngineArgs after those modules
+# have settled, making direct `vllm serve` startup deterministic as well.
+[project.entry-points."vllm.general_plugins"]
+moe_offload_ascend = "vllm_moe_offload_ascend:register"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_moe_offload_ascend*"]

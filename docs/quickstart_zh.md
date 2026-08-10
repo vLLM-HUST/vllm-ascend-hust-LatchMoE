@@ -28,7 +28,7 @@ latchmoe serve <model> [vLLM 参数...]
 - hook-enabled `vllm-ascend-hust`：
   `feature/latchmoe-offload-seam-v1-v021`；
 - 当前复现锁定的 seam commit：
-  `4806367eeeb7d62b32078ae90cd929cc06d825fe`；
+  `5ff2666e7dc8e98c546592a381946525d1069198`；
 - Python 3.10 或更高版本。
 
 不要在已经验证的 Ascend 环境中执行 `pip install vllm` 或
@@ -61,7 +61,7 @@ git clone --branch feature/latchmoe-offload-seam-v1-v021 \
   https://github.com/vLLM-HUST/vllm-ascend-hust.git
 
 git -C vllm-ascend-hust checkout \
-  4806367eeeb7d62b32078ae90cd929cc06d825fe
+  5ff2666e7dc8e98c546592a381946525d1069198
 
 python -m pip install \
   --no-deps \

@@ -14,6 +14,7 @@ def test_platform_plugin_entry_point_is_declared() -> None:
     assert '[project.scripts]' in config
     assert 'latchmoe = "vllm_moe_offload_ascend.launcher:main"' in config
     assert '[project.entry-points."vllm.platform_plugins"]' in config
+    assert '[project.entry-points."vllm.general_plugins"]' in config
     assert (
         'moe_offload_ascend = "vllm_moe_offload_ascend:register"' in config
     )

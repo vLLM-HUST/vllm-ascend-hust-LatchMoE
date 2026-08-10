@@ -222,7 +222,7 @@ def test_bundled_compatibility_lock_declares_current_seam_contract():
 
     lock = launcher._read_key_value_file(lock_path)
 
-    assert lock["seam_commit"] == "4806367eeeb7d62b32078ae90cd929cc06d825fe"
+    assert lock["seam_commit"] == "5ff2666e7dc8e98c546592a381946525d1069198"
     assert lock["seam_abi"] == "1"
     assert lock["vllm_version"] == "0.21.0"
 
@@ -249,6 +249,20 @@ def test_launcher_delegates_to_vllm_after_check(monkeypatch):
 
     assert launcher.main(["serve", "/models/qwen"]) == 0
     assert delegated == [["serve", "/models/qwen"]]
+
+
+def test_vllm_cli_retry_registers_after_engine_args_import(monkeypatch):
+    import vllm_moe_offload_ascend as plugin
+
+    events = []
+    monkeypatch.setattr(plugin, "register", lambda: events.append("register"))
+    monkeypatch.setattr(
+        "vllm.entrypoints.cli.main.main",
+        lambda: events.append("main") or 0,
+    )
+
+    assert launcher._run_vllm_cli(["serve", "/models/qwen"]) == 0
+    assert events[-2:] == ["register", "main"]
 
 
 def test_launcher_fails_closed_before_delegation(monkeypatch):

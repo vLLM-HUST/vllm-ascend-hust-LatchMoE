@@ -6,6 +6,7 @@ import pytest
 import vllm_moe_offload_ascend
 from vllm_moe_offload_ascend.patches.patch_fused_moe import (
     _ascend_device_op_is_initializing,
+    _ensure_moe_offload_splitting_op,
     _install_runtime_patches_when_ready,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
@@ -228,6 +229,94 @@ def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
 
     assert compat_calls == ["rmsnorm_compat"]
     assert "vllm::moe_offload_stage" in config.compilation_config.splitting_ops
+
+
+def test_engine_args_final_config_retries_stage_seam_patch(monkeypatch):
+    import vllm.engine.arg_utils as arg_utils
+    from vllm.config.compilation import CUDAGraphMode
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    events = []
+
+    class FakeEngineArgs:
+        def create_engine_config(self):
+            events.append("create")
+            return SimpleNamespace(
+                compilation_config=SimpleNamespace(
+                    cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+                    splitting_ops=[],
+                )
+            )
+
+    monkeypatch.setattr(arg_utils, "EngineArgs", FakeEngineArgs)
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_patch_platform_splitting_ops",
+        lambda: events.append("retry_platform"),
+    )
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "1")
+
+    # The function imports apply_moe_offload_defaults locally, so expose a fake
+    # autoconfig module with the same API to keep this a lifecycle-only test.
+    import vllm_moe_offload_ascend.moe_offload.autoconfig as autoconfig
+
+    monkeypatch.setattr(
+        autoconfig,
+        "apply_moe_offload_defaults",
+        lambda _args: events.append("defaults"),
+    )
+    patch_fused_moe._patch_engine_args_autoconfig()
+
+    config = FakeEngineArgs().create_engine_config()
+
+    assert events == ["defaults", "retry_platform", "create"]
+    assert "vllm::moe_offload_stage" in config.compilation_config.splitting_ops
+
+
+def test_stage_seam_fails_closed_for_full_only_graph(monkeypatch):
+    from vllm.config.compilation import CUDAGraphMode
+
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "1")
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            splitting_ops=[],
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="requires PIECEWISE ACLGraph"):
+        _ensure_moe_offload_splitting_op(config, fail_closed=True)
+
+
+def test_stage_custom_op_is_a_top_level_splitting_graph():
+    import torch
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from vllm.compilation.backends import split_graph
+    import vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op  # noqa: F401
+
+    def model(x):
+        routed = x + 1
+        torch.ops.vllm.moe_offload_stage(routed, 0, 128, 0)
+        return routed * 2
+
+    graph = make_fx(model, tracing_mode="fake")(
+        torch.ones(2, dtype=torch.int64)
+    )
+    _split_graph_module, split_items = split_graph(
+        graph,
+        ["vllm::moe_offload_stage"],
+    )
+    splitting_items = [item for item in split_items if item.is_splitting_graph]
+
+    assert len(splitting_items) == 1
+    call_targets = [
+        node.target
+        for node in splitting_items[0].graph.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert torch.ops.vllm.moe_offload_stage.default in call_targets
 
 
 def test_comm_hook_resolves_contracts_from_new_runtime_args(monkeypatch):

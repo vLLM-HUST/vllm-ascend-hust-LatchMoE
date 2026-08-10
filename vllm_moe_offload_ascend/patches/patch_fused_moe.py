@@ -3411,29 +3411,79 @@ def _patch_platform_splitting_ops() -> None:
         def _patched(cls, vllm_config):
             original_fn(cls, vllm_config)
             _install_runtime_patches_when_ready()
-            if not _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "0"):
-                return
-            compilation_config = getattr(vllm_config, "compilation_config", None)
-            if compilation_config is None:
-                return
-            try:
-                from vllm.config.compilation import CUDAGraphMode
-
-                if not compilation_config.cudagraph_mode.requires_piecewise_compilation():
-                    return
-            except Exception:
-                return
-            splitting_ops = getattr(compilation_config, "splitting_ops", None)
-            if splitting_ops is None:
-                compilation_config.splitting_ops = []
-                splitting_ops = compilation_config.splitting_ops
-            if "vllm::moe_offload_stage" not in splitting_ops:
-                splitting_ops.append("vllm::moe_offload_stage")
+            _ensure_moe_offload_splitting_op(vllm_config)
 
         _patched.__func__._ascend_moe_offload_splitting_ops_patch = True
         _platform.NPUPlatform.check_and_update_config = _patched
     except Exception:
         pass
+
+
+def _ensure_moe_offload_splitting_op(
+    vllm_config: Any,
+    *,
+    fail_closed: bool = False,
+) -> bool:
+    """Put the eager staging seam in the final piecewise graph config.
+
+    Platform-plugin discovery can invoke ``register()`` while
+    ``vllm_ascend.platform`` is only partially initialized. In that import
+    order, installing the NPUPlatform wrapper is best-effort and may not take
+    effect. This helper is also called at EngineArgs' final config boundary,
+    after all platform defaults have settled, so a graph-enabled SEW launch
+    cannot silently capture the dynamic staging logic.
+    """
+
+    if not _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "0"):
+        return False
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        if fail_closed:
+            raise RuntimeError(
+                "LatchMoE SEW graph mode requires vLLM compilation_config"
+            )
+        return False
+
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    try:
+        requires_piecewise = bool(
+            cudagraph_mode is not None
+            and cudagraph_mode.requires_piecewise_compilation()
+        )
+        has_full_graph = bool(
+            cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
+        )
+    except Exception as exc:
+        if fail_closed:
+            raise RuntimeError(
+                "LatchMoE could not validate the final ACLGraph mode"
+            ) from exc
+        return False
+
+    if not requires_piecewise:
+        if fail_closed and has_full_graph:
+            raise RuntimeError(
+                "LatchMoE SEW offload requires PIECEWISE ACLGraph so "
+                "vllm::moe_offload_stage executes eagerly during replay; "
+                f"got cudagraph_mode={cudagraph_mode}"
+            )
+        return False
+
+    splitting_ops = getattr(compilation_config, "splitting_ops", None)
+    if splitting_ops is None:
+        compilation_config.splitting_ops = []
+        splitting_ops = compilation_config.splitting_ops
+    if "vllm::moe_offload_stage" not in splitting_ops:
+        splitting_ops.append("vllm::moe_offload_stage")
+
+    present = "vllm::moe_offload_stage" in splitting_ops
+    if fail_closed and not present:
+        raise RuntimeError(
+            "LatchMoE refused Graph startup because the final splitting_ops "
+            "does not contain vllm::moe_offload_stage"
+        )
+    return present
 
 
 def _patch_engine_args_autoconfig() -> None:
@@ -3449,7 +3499,22 @@ def _patch_engine_args_autoconfig() -> None:
 
         def _patched(self, *args, **kwargs):
             apply_moe_offload_defaults(self)
-            return _original(self, *args, **kwargs)
+            # Retry after EngineArgs and the active platform have finished
+            # importing. This is the real vllm serve import order that the early
+            # platform-plugin hook could previously miss.
+            _patch_platform_splitting_ops()
+            vllm_config = _original(self, *args, **kwargs)
+            stage_present = _ensure_moe_offload_splitting_op(
+                vllm_config,
+                fail_closed=True,
+            )
+            if stage_present:
+                print(
+                    "LATCHMOE_GRAPH_CONFIG "
+                    "splitting_op=vllm::moe_offload_stage status=enabled",
+                    flush=True,
+                )
+            return vllm_config
 
         _patched._ascend_moe_offload_autoconfig_patch = True
         EngineArgs.create_engine_config = _patched

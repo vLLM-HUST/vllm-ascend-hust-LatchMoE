@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import statistics
 import sys
@@ -62,6 +63,30 @@ def _count_output_tokens(text: str, chunk_count: int, tokenizer: Any | None) -> 
     return int(len(tokenizer.encode(text, add_special_tokens=False)))
 
 
+def _build_payload(model: str, request_record: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": str(request_record["prompt"])}],
+        "max_tokens": int(request_record["max_output_tokens"]),
+        "stream": True,
+        "temperature": float(request_record.get("temperature", 0.0)),
+        "top_p": float(request_record.get("top_p", 1.0)),
+        "return_token_ids": True,
+    }
+    if request_record.get("seed") is not None:
+        payload["seed"] = int(request_record["seed"])
+    if request_record.get("top_k") is not None:
+        payload["top_k"] = int(request_record["top_k"])
+    return payload
+
+
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
 async def stream_request(
     session: Any,
     *,
@@ -70,18 +95,12 @@ async def stream_request(
     request_record: dict[str, Any],
     tokenizer: Any | None,
 ) -> dict[str, Any]:
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": str(request_record["prompt"])}],
-        "max_tokens": int(request_record["max_output_tokens"]),
-        "stream": True,
-        "temperature": float(request_record.get("temperature", 0.0)),
-        "top_p": float(request_record.get("top_p", 1.0)),
-    }
+    payload = _build_payload(model, request_record)
     request_id = str(request_record.get("request_id", ""))
     ttft = None
     chunk_count = 0
     text_parts: list[str] = []
+    output_token_ids: list[int] = []
     t0 = time.perf_counter()
     status = 0
     error = ""
@@ -110,7 +129,13 @@ async def stream_request(
                     obj = json.loads(chunk)
                 except json.JSONDecodeError:
                     continue
-                delta = obj["choices"][0]["delta"].get("content", "")
+                choice = obj["choices"][0]
+                delta_token_ids = choice.get("token_ids") or []
+                if delta_token_ids:
+                    output_token_ids.extend(int(token_id) for token_id in delta_token_ids)
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                delta = choice["delta"].get("content", "")
                 if delta:
                     if ttft is None:
                         ttft = time.perf_counter() - t0
@@ -121,7 +146,11 @@ async def stream_request(
 
     total = time.perf_counter() - t0
     text = "".join(text_parts)
-    out_tokens = _count_output_tokens(text, chunk_count, tokenizer)
+    out_tokens = (
+        len(output_token_ids)
+        if output_token_ids
+        else _count_output_tokens(text, chunk_count, tokenizer)
+    )
     return {
         "request_id": request_id,
         "status": status,
@@ -132,6 +161,12 @@ async def stream_request(
         "chunks": chunk_count,
         "prompt_tokens": request_record.get("prompt_tokens"),
         "output_chars": len(text),
+        "seed": request_record.get("seed"),
+        "output_token_ids": output_token_ids,
+        "output_token_ids_sha256": (
+            _sha256_json(output_token_ids) if output_token_ids else None
+        ),
+        "output_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
     }
 
 
