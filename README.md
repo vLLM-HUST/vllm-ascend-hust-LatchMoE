@@ -207,6 +207,12 @@ python -m vllm_moe_offload_ascend serve \
 latchmoe serve /path/to/Qwen3-30B-A3B --trust-remote-code
 ```
 
+SEW AutoConfig releases the original NPU copies of offloaded expert weights
+after the host store and fixed-slot banks are ready. Set
+`VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS=0` only for retained-
+weight diagnostics; that mode exercises staging but does not reclaim the
+target expert-weight HBM.
+
 When the SEW dataplane is enabled, Graph serving uses pure `PIECEWISE`
 ACLGraph. LatchMoE forces this mode because routing-dependent expert staging
 must execute eagerly between captured pieces on every decode step. `FULL`,
@@ -247,6 +253,7 @@ All configuration is environment-variable based. The main knobs:
 | `VLLM_ASCEND_MOE_OFFLOAD_SLOT_HBM_FRACTION` | `0.12` | Max fraction of physical HBM usable by the slot bank |
 | `VLLM_ASCEND_MOE_OFFLOAD_KV_RESERVE_SEQS` | `4` | Sequences of KV cache reserved by AutoConfig |
 | `VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD` | `0` | Materialize offloaded experts directly in host memory at load time (avoids startup HBM peak) |
+| `VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS` | `1` with SEW | Release full NPU copies after fixed-slot initialization; set `0` only for retained-weight diagnostics |
 | `VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY` | `0` | Collect routing traces without actual offloading |
 | `VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH` | unset | Offload/stage profile JSONL output path |
 

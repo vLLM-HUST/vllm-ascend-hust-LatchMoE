@@ -112,6 +112,19 @@ def test_sew_cases_do_not_mix_native_prefetch_flags():
             assert server_args.isdisjoint(sew_bench.NATIVE_OFFLOAD_FLAGS), case["name"]
 
 
+def test_sew_cases_release_original_expert_weights():
+    sew_bench = load_sew_bench()
+    config = sew_bench.load_config()
+
+    for case in config["cases"]:
+        env = case.get("env", {})
+        if env.get("VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE") == "1":
+            assert (
+                env.get("VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS")
+                == "1"
+            ), case["name"]
+
+
 def test_render_plan_for_single_unit():
     sew_bench = load_sew_bench()
     config = sew_bench.load_config()

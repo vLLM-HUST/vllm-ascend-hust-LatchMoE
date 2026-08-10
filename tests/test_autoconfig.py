@@ -401,8 +401,32 @@ def test_apply_defaults_sew_dataplane_skips_native_prefetch(monkeypatch):
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH"] == "1"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT"] == "2"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE"] == "0"
+    assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS"] == "1"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME"] == "0"
     assert engine_args._ascend_moe_offload_sew_dataplane is True
+
+
+def test_apply_defaults_sew_dataplane_preserves_release_override(monkeypatch):
+    monkeypatch.setenv(MOE_OFFLOAD_GB_ENV, "14")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS", "0")
+    engine_args = type(
+        "EngineArgsStub",
+        (),
+        {
+            "_ascend_moe_offload_model_config": QWEN3_MOE_CONFIG,
+            "offload_backend": "auto",
+            "offload_group_size": 0,
+            "offload_num_in_group": 1,
+            "offload_prefetch_step": 0,
+            "offload_params": set(),
+            "cpu_offload_gb": 0,
+            "cpu_offload_params": set(),
+        },
+    )()
+
+    assert apply_moe_offload_defaults(engine_args) is True
+    assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS"] == "0"
 
 
 def test_apply_defaults_sew_dataplane_uses_prefill_profile_for_residency(

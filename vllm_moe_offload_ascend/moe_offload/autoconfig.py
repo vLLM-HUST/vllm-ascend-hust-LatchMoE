@@ -94,6 +94,9 @@ _SEW_DATAPLANE_ENV_VARS = {
     "VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING": "1",
     # Correctness-first default. Enable only for the explicit cache matrix.
     "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE": "0",
+    # SEW is a pure fixed-slot path, so the full NPU expert copies are unused
+    # after the host store and slot banks have been initialized.
+    "VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS": "1",
 }
 
 

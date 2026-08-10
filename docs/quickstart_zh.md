@@ -181,6 +181,11 @@ python -m vllm_moe_offload_ascend serve \
   --max-num-seqs 1
 ```
 
+SEW AutoConfig 默认会在 host store 和 fixed-slot bank 就绪后释放 offloaded
+expert 的原始 NPU 副本。只有在排查“保留完整权重”路径时才显式设置
+`VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS=0`；该模式仍会执行
+staging，但不会回收目标 expert 权重占用的 HBM。
+
 ### 专家调试 override
 
 通常不需要显式指定 slot 数量。只有在复现实验或排查 AutoConfig 时才设置：
