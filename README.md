@@ -129,7 +129,7 @@ tests/              host-side unit tests
 - vLLM 0.21.0 and the **hook-enabled vllm-ascend fork**
   ([`vLLM-HUST/vllm-ascend-hust`, branch
   `feature/latchmoe-offload-seam-v1-v021`](https://github.com/vLLM-HUST/vllm-ascend-hust/tree/feature/latchmoe-offload-seam-v1-v021),
-  commit `5ff2666e7dc8e98c546592a381946525d1069198`);
+  commit `fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25`);
   the Issue #4 dependency contract is pinned in
   [`repro/issue4/seam.lock`](repro/issue4/seam.lock), and stock vllm-ascend does
   not contain the MoE offload hook seam
@@ -152,7 +152,7 @@ the same environment:
 ```bash
 git clone --branch feature/latchmoe-offload-seam-v1-v021 \
   https://github.com/vLLM-HUST/vllm-ascend-hust.git
-git -C vllm-ascend-hust checkout 5ff2666e7dc8e98c546592a381946525d1069198
+git -C vllm-ascend-hust checkout fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25
 
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 cd vllm-ascend-hust-LatchMoE
@@ -207,11 +207,20 @@ python -m vllm_moe_offload_ascend serve \
 latchmoe serve /path/to/Qwen3-30B-A3B --trust-remote-code
 ```
 
+When the SEW dataplane is enabled, Graph serving uses pure `PIECEWISE`
+ACLGraph. LatchMoE forces this mode because routing-dependent expert staging
+must execute eagerly between captured pieces on every decode step. `FULL`,
+`FULL_DECODE_ONLY`, and `FULL_AND_PIECEWISE` are unsafe for expert offload: a
+FULL decode graph would capture the staging seam as a no-op and replay stale
+slot mappings. `--enforce-eager` remains supported and keeps graph mode at
+`NONE`.
+
 A successful startup logs the following signals:
 
 ```text
 moe_offload_ascend -> vllm_moe_offload_ascend:register
 Enabled Ascend MoE offload autoconfig from VLLM_ASCEND_MOE_OFFLOAD_GB
+LATCHMOE_GRAPH_CONFIG cudagraph_mode=PIECEWISE splitting_op=vllm::moe_offload_stage status=enabled
 ```
 
 To disable, unset `VLLM_ASCEND_MOE_OFFLOAD_GB` or uninstall the plugin;

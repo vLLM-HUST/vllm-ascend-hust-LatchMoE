@@ -2,6 +2,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from vllm.config.compilation import CUDAGraphMode
 
 import vllm_moe_offload_ascend
 from vllm_moe_offload_ascend.patches.patch_fused_moe import (
@@ -196,9 +197,8 @@ def test_cann_rmsnorm_fallback_disables_unsupported_fusion_patterns(monkeypatch)
     )
 
 
-def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
+def test_stage_seam_registers_for_piecewise_cudagraph(monkeypatch):
     import vllm_ascend.platform as platform
-    from vllm.config.compilation import CUDAGraphMode
 
     from vllm_moe_offload_ascend.patches import patch_fused_moe
 
@@ -220,7 +220,7 @@ def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
     patch_fused_moe._patch_platform_splitting_ops()
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(
-            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
             splitting_ops=[],
         )
     )
@@ -233,7 +233,6 @@ def test_stage_seam_registers_for_full_and_piecewise_cudagraph(monkeypatch):
 
 def test_engine_args_final_config_retries_stage_seam_patch(monkeypatch):
     import vllm.engine.arg_utils as arg_utils
-    from vllm.config.compilation import CUDAGraphMode
 
     from vllm_moe_offload_ascend.patches import patch_fused_moe
 
@@ -244,7 +243,7 @@ def test_engine_args_final_config_retries_stage_seam_patch(monkeypatch):
             events.append("create")
             return SimpleNamespace(
                 compilation_config=SimpleNamespace(
-                    cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE,
                     splitting_ops=[],
                 )
             )
@@ -274,18 +273,23 @@ def test_engine_args_final_config_retries_stage_seam_patch(monkeypatch):
     assert "vllm::moe_offload_stage" in config.compilation_config.splitting_ops
 
 
-def test_stage_seam_fails_closed_for_full_only_graph(monkeypatch):
-    from vllm.config.compilation import CUDAGraphMode
-
+@pytest.mark.parametrize(
+    "cudagraph_mode",
+    [CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE],
+)
+def test_stage_seam_fails_closed_for_any_full_graph(
+    monkeypatch,
+    cudagraph_mode,
+):
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "1")
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(
-            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_mode=cudagraph_mode,
             splitting_ops=[],
         )
     )
 
-    with pytest.raises(RuntimeError, match="requires PIECEWISE ACLGraph"):
+    with pytest.raises(RuntimeError, match="requires PIECEWISE-only ACLGraph"):
         _ensure_moe_offload_splitting_op(config, fail_closed=True)
 
 

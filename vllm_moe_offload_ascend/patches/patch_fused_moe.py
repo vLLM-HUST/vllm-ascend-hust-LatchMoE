@@ -3461,13 +3461,16 @@ def _ensure_moe_offload_splitting_op(
             ) from exc
         return False
 
-    if not requires_piecewise:
-        if fail_closed and has_full_graph:
+    if has_full_graph:
+        if fail_closed:
             raise RuntimeError(
-                "LatchMoE SEW offload requires PIECEWISE ACLGraph so "
+                "LatchMoE SEW offload requires PIECEWISE-only ACLGraph so "
                 "vllm::moe_offload_stage executes eagerly during replay; "
                 f"got cudagraph_mode={cudagraph_mode}"
             )
+        return False
+
+    if not requires_piecewise:
         return False
 
     splitting_ops = getattr(compilation_config, "splitting_ops", None)
@@ -3511,6 +3514,7 @@ def _patch_engine_args_autoconfig() -> None:
             if stage_present:
                 print(
                     "LATCHMOE_GRAPH_CONFIG "
+                    "cudagraph_mode=PIECEWISE "
                     "splitting_op=vllm::moe_offload_stage status=enabled",
                     flush=True,
                 )

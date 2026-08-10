@@ -222,7 +222,7 @@ def test_bundled_compatibility_lock_declares_current_seam_contract():
 
     lock = launcher._read_key_value_file(lock_path)
 
-    assert lock["seam_commit"] == "5ff2666e7dc8e98c546592a381946525d1069198"
+    assert lock["seam_commit"] == "fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25"
     assert lock["seam_abi"] == "1"
     assert lock["vllm_version"] == "0.21.0"
 

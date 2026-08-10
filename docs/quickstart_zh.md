@@ -28,7 +28,7 @@ latchmoe serve <model> [vLLM 参数...]
 - hook-enabled `vllm-ascend-hust`：
   `feature/latchmoe-offload-seam-v1-v021`；
 - 当前复现锁定的 seam commit：
-  `5ff2666e7dc8e98c546592a381946525d1069198`；
+  `fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25`；
 - Python 3.10 或更高版本。
 
 不要在已经验证的 Ascend 环境中执行 `pip install vllm` 或
@@ -61,7 +61,7 @@ git clone --branch feature/latchmoe-offload-seam-v1-v021 \
   https://github.com/vLLM-HUST/vllm-ascend-hust.git
 
 git -C vllm-ascend-hust checkout \
-  5ff2666e7dc8e98c546592a381946525d1069198
+  fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25
 
 python -m pip install \
   --no-deps \
@@ -205,6 +205,11 @@ python -m vllm_moe_offload_ascend serve \
 
 LatchMoE 的 expert slot/Host Store 与 vLLM 原生 offloader 是两条不同的数据路径。
 
+启用 SEW dataplane 后，Graph 服务会自动使用纯 `PIECEWISE` ACLGraph。不要手动改成
+`FULL`、`FULL_DECODE_ONLY` 或 `FULL_AND_PIECEWISE`：这些模式会把 decode 外层整体
+捕获，使依赖实时路由的 expert staging 在 replay 时不再执行，进而复用陈旧的 slot
+映射。使用 `--enforce-eager` 时仍保持 `NONE`，不会被自动开启 Graph。
+
 ### CPU-first expert loading（实验）
 
 ```bash
@@ -224,6 +229,7 @@ moe_offload_ascend -> vllm_moe_offload_ascend:register
 ascend -> vllm_ascend:register
 Platform plugin ascend is activated
 Enabled Ascend MoE offload autoconfig from VLLM_ASCEND_MOE_OFFLOAD_GB
+LATCHMOE_GRAPH_CONFIG cudagraph_mode=PIECEWISE splitting_op=vllm::moe_offload_stage status=enabled
 ```
 
 `check` 通过只证明安装和自动发现契约正确，不证明模型加载、NPU Offload 或
