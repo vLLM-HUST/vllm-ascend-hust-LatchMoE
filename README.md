@@ -126,9 +126,13 @@ tests/              host-side unit tests
 ## Requirements
 
 - Ascend 910B-class NPU with a working CANN / torch-npu environment
-- vLLM and the **hook-enabled vllm-ascend fork**
-  ([`Li-changwu/vllm-ascend-hust`, branch `moe-offload-hooks`](https://github.com/Li-changwu/vllm-ascend-hust/tree/moe-offload-hooks));
-  stock vllm-ascend does not contain the MoE offload hook seam
+- vLLM 0.21.0 and the **hook-enabled vllm-ascend fork**
+  ([`vLLM-HUST/vllm-ascend-hust`, branch
+  `feature/latchmoe-offload-seam-v1-v021`](https://github.com/vLLM-HUST/vllm-ascend-hust/tree/feature/latchmoe-offload-seam-v1-v021),
+  commit [`4806367`](https://github.com/vLLM-HUST/vllm-ascend-hust/commit/4806367eeeb7d62b32078ae90cd929cc06d825fe));
+  the Issue #4 dependency contract is pinned in
+  [`repro/issue4/seam.lock`](repro/issue4/seam.lock), and stock vllm-ascend does
+  not contain the MoE offload hook seam
 - Python ≥ 3.10
 - Validated configuration: Qwen3-30B-A3B (unquantized MoE), BF16, TP1,
   single NPU, low-concurrency serving (`max_num_seqs=1`)
@@ -140,12 +144,18 @@ tests/              host-side unit tests
 
 ## Installation
 
-Install vLLM and the hook-enabled vllm-ascend fork into one Python
-environment first, then install this plugin into the same environment:
+Install vLLM 0.21.0 and the hook-enabled vllm-ascend fork into one Python
+environment first. For the Issue #4 reproduction stack, check out the exact
+seam commit recorded in `repro/issue4/seam.lock`, then install LatchMoE into
+the same environment:
 
 ```bash
-git clone https://github.com/Li-changwu/vllm-moe-offload-ascend
-cd vllm-moe-offload-ascend
+git clone --branch feature/latchmoe-offload-seam-v1-v021 \
+  https://github.com/vLLM-HUST/vllm-ascend-hust.git
+git -C vllm-ascend-hust checkout 4806367eeeb7d62b32078ae90cd929cc06d825fe
+
+git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
+cd vllm-ascend-hust-LatchMoE
 python3 -m pip install -e . --no-deps
 ```
 
