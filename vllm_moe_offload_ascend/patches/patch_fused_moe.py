@@ -1311,7 +1311,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             token_count_ms = (perf_counter() - token_count_start) * 1000.0
         unique_active = tuple(sorted(token_counts))
         readiness_start = perf_counter()
-        readiness, ready_slot_ids = runtime.slot_readiness_and_ready_slot_ids_for_experts(
+        readiness, _ = runtime.slot_readiness_and_ready_slot_ids_for_experts(
             layer_id=offload.layer_id,
             expert_ids=unique_active,
         )
@@ -1433,7 +1433,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 waves,
                 num_logical_experts=int(offload.num_logical_experts),
                 active_experts=unique_active,
-                physical_slot_by_expert=ready_slot_ids,
+                physical_slot_by_expert={},
                 wave_pair_counts=tuple(
                     int(wave_plan.wave_tokens(wave)) for wave in waves
                 ),
@@ -1443,7 +1443,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             wave_microbatch_plans = build_b2_wave_microbatch_plans(
                 pair_index,
                 waves,
-                physical_slot_by_expert=ready_slot_ids,
+                physical_slot_by_expert={},
                 preserve_pair_order=False,
                 include_logical_expert_ids=False,
                 include_topk_positions=False,
@@ -1471,7 +1471,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 )
             async_schedule = plan_b2_prefill_async_schedule(
                 waves,
-                slot_readiness=readiness,
+                # Every B2 prefill wave uses a canonical temporary bank. Actual
+                # readiness still controls D2D versus H2D inside staging, but no
+                # wave may bypass staging through readiness-dependent main slots.
+                slot_readiness={},
                 prefetch_depth=runtime.config.effective_prefill_prefetch_depth,
                 buffer_count=runtime.config.effective_prefill_buffer_count,
                 h2d_bytes_by_wave=wave_h2d_bytes_by_index,
@@ -1514,32 +1517,13 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     if not bool(readiness.get(int(expert_id), False))
                 )
                 stage_start = perf_counter()
-                if not miss_experts:
-                    buffer_index = None
-                    prepared = runtime.prepare_ready_slot_plan(
-                        layer_id=offload.layer_id,
-                        active_experts=wave,
-                        num_logical_experts=offload.num_logical_experts,
-                        device=device,
-                        build_log2phy=False,
-                    )
-                    ready_event = None
-                    stage_payload = {
-                        "buffer_index": None,
-                        "hit_experts": list(hit_experts),
-                        "miss_experts": [],
-                        "h2d_bytes": 0,
-                        "d2d_bytes": 0,
-                        "stage_mode": "main_slot_hit",
-                        "log2phy_built": False,
-                    }
-                else:
-                    buffer_index = (
-                        int(force_buffer_index)
-                        if force_buffer_index is not None
-                        else int(wave_index % 2)
-                    )
-                    prepared, ready_event, stage_payload = runtime.prepare_prefill_stage_plan(
+                buffer_index = (
+                    int(force_buffer_index)
+                    if force_buffer_index is not None
+                    else int(wave_index % prefill_buffer_count)
+                )
+                prepared, ready_event, stage_payload = (
+                    runtime.prepare_prefill_stage_plan(
                         layer_id=offload.layer_id,
                         active_experts=wave,
                         num_logical_experts=offload.num_logical_experts,
@@ -1550,6 +1534,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         build_log2phy=False,
                         known_miss=not bool(hit_experts),
                     )
+                )
                 stage_issue_ms = (perf_counter() - stage_start) * 1000.0
                 stage_issue_sequence += 1
                 issue_end_time = perf_counter()
@@ -1992,12 +1977,24 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     for expert_id in miss_experts
                 )
                 stage_start = perf_counter()
-                prepared = runtime.prepare_fixed_slot_plan(
-                    layer_id=offload.layer_id,
-                    active_experts=wave,
-                    num_logical_experts=offload.num_logical_experts,
-                    device=device,
+                prepared, ready_event, stage_payload = (
+                    runtime.prepare_prefill_stage_plan(
+                        layer_id=offload.layer_id,
+                        active_experts=wave,
+                        num_logical_experts=offload.num_logical_experts,
+                        device=device,
+                        buffer_index=int(
+                            wave_index
+                            % runtime.config.effective_prefill_buffer_count
+                        ),
+                        async_load=False,
+                        build_log2phy=bool(reference_full_tokens),
+                        known_miss=not bool(hit_experts),
+                    )
                 )
+                runtime.wait_prefill_stage_plan(ready_event)
+                h2d_bytes = int(stage_payload.get("h2d_bytes", h2d_bytes))
+                d2d_bytes = int(stage_payload.get("d2d_bytes", 0))
                 stage_ms = (perf_counter() - stage_start) * 1000.0
                 prepared.validate_backend_ready(
                     expected_device_type=offload.expected_device_type
@@ -2015,6 +2012,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         wave=wave,
                         microbatch_plan=wave_microbatch_plans[int(wave_index)],
                         microbatch=wave_microbatches[int(wave_index)],
+                        use_wave_plan_physical_ids=True,
                     )
                 mlp_ms = (perf_counter() - mlp_start) * 1000.0
                 if wave_output is None:
@@ -2036,11 +2034,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                             "hits": len(hit_experts),
                             "misses": len(miss_experts),
                             "h2d_bytes": int(h2d_bytes),
-                            "d2d_bytes": 0,
+                            "d2d_bytes": int(d2d_bytes),
                             "stage_ms": round(stage_ms, 3),
                             "mlp_ms": round(mlp_ms, 3),
                             "microbatch_source": "wave_plan",
-                            "stage_mode": "sync_slot_cache",
+                            "stage_mode": "sync_temp_bank",
                         }
                     )
                     continue
@@ -2095,7 +2093,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         "hits": len(hit_experts),
                         "misses": len(miss_experts),
                         "h2d_bytes": int(h2d_bytes),
-                        "d2d_bytes": 0,
+                        "d2d_bytes": int(d2d_bytes),
                         "stage_ms": round(stage_ms, 3),
                         "mlp_ms": round(mlp_ms, 3),
                         "pair_wave_ms": round(pair_profile.get("pair_wave_ms", mlp_ms), 3),
@@ -2110,7 +2108,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         "scatter_mode": str(
                             pair_profile.get("scatter_mode", "layer_batch")
                         ),
-                        "stage_mode": "sync_slot_cache",
+                        "stage_mode": "sync_temp_bank",
                     }
                 )
             loop_ms = (perf_counter() - loop_start) * 1000.0

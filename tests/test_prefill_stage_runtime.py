@@ -296,6 +296,39 @@ def test_prefill_stage_plan_uses_dedicated_buffer_and_log2phy_mapping():
     assert torch.equal(prepared.w2[1], layer.w2_weight[1])
 
 
+def test_prefill_stage_plan_canonicalizes_all_hit_wave_into_temp_slots():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    main = runtime.prepare_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(3, 1),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+
+    prepared, ready_event, payload = runtime.prepare_prefill_stage_plan(
+        layer_id=7,
+        active_experts=(1, 3),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+        buffer_index=0,
+        async_load=False,
+        build_log2phy=False,
+    )
+
+    assert ready_event is None
+    assert payload["hit_experts"] == [1, 3]
+    assert payload["miss_experts"] == []
+    assert payload["h2d_bytes"] == 0
+    assert payload["d2d_bytes"] > 0
+    assert prepared.w1.data_ptr() != main.w1.data_ptr()
+    assert torch.equal(prepared.w1[0], layer.w13_weight[1])
+    assert torch.equal(prepared.w1[1], layer.w13_weight[3])
+    assert torch.equal(prepared.w2[0], layer.w2_weight[1])
+    assert torch.equal(prepared.w2[1], layer.w2_weight[3])
+
+
 def test_prefill_stage_plan_double_buffers_do_not_share_storage():
     runtime = MoeOffloadRuntime(
         MoeOffloadConfig(
