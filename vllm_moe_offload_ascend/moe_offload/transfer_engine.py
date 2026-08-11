@@ -33,10 +33,28 @@ class TransferReadyEvent:
     event: object | None
     leases: tuple[tuple[ExpertSlot, SlotLease], ...]
     completed: bool = False
+    consumer_wait_installed: bool = False
+
+    def install_consumer_dependency(self, consumer_stream) -> None:
+        """Order the copy before one consumer stream, then publish READY."""
+
+        if self.completed:
+            return
+        self._validate_loading_leases()
+        if self.event is not None:
+            consumer_stream.wait_event(self.event)
+        self.consumer_wait_installed = True
+        self.mark_ready()
 
     def mark_ready(self) -> None:
         if self.completed:
             return
+        self._validate_loading_leases()
+        for slot, _ in self.leases:
+            slot.state = SlotState.READY
+        self.completed = True
+
+    def _validate_loading_leases(self) -> None:
         for slot, lease in self.leases:
             if not slot.matches_lease(lease):
                 raise RuntimeError(
@@ -49,9 +67,6 @@ class TransferReadyEvent:
                     f"H2D completion for slot {slot.slot_id} requires loading state, "
                     f"found {slot.state.value}"
                 )
-        for slot, _ in self.leases:
-            slot.state = SlotState.READY
-        self.completed = True
 
 
 class TransferEngine:

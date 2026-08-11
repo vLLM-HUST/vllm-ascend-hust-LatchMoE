@@ -92,6 +92,55 @@ def test_transfer_ready_event_binds_slot_owner_and_generation():
     assert replacement.expert_key == ExpertKey(7, 1)
 
 
+def test_transfer_ready_event_publishes_only_after_consumer_wait():
+    bank = ExpertSlotBank(
+        1,
+        (1, 1),
+        (1, 1),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    slot = bank.assign_slot(0, ExpertKey(7, 0), step_id=1)
+    event = object()
+    ready = TransferReadyEvent(event, ((slot, slot.lease()),))
+    calls = []
+
+    class ConsumerStream:
+        def wait_event(self, observed_event):
+            assert observed_event is event
+            assert slot.state == SlotState.LOADING
+            assert ready.completed is False
+            calls.append("wait")
+
+    ready.install_consumer_dependency(ConsumerStream())
+
+    assert calls == ["wait"]
+    assert ready.consumer_wait_installed is True
+    assert ready.completed is True
+    assert slot.state == SlotState.READY
+
+
+def test_transfer_ready_event_rejects_stale_lease_before_consumer_wait():
+    bank = ExpertSlotBank(
+        1,
+        (1, 1),
+        (1, 1),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    slot = bank.assign_slot(0, ExpertKey(7, 0), step_id=1)
+    ready = TransferReadyEvent(object(), ((slot, slot.lease()),))
+    bank.clear_slot(0)
+    bank.assign_slot(0, ExpertKey(7, 1), step_id=2)
+
+    class ConsumerStream:
+        def wait_event(self, _event):
+            raise AssertionError("stale transfer must fail before stream handoff")
+
+    with pytest.raises(RuntimeError, match="stale H2D completion"):
+        ready.install_consumer_dependency(ConsumerStream())
+
+
 def test_memory_ledger_is_cached_and_invalidated_on_structural_changes():
     runtime = MoeOffloadRuntime(
         MoeOffloadConfig(
@@ -1224,6 +1273,62 @@ def test_begin_slot_compute_refuses_h2d_slot_until_ready_event_completes():
     handle = runtime.begin_slot_compute(prepared)
     assert handle is not None
     runtime.end_slot_compute(handle)
+
+
+def test_decode_waits_before_publishing_async_slot_mapping(monkeypatch):
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+            async_load=True,
+        )
+    )
+    runtime.register_layer_for_fixed_slots(
+        TinyLayer(),
+        slot_device=torch.device("cpu"),
+    )
+    pending_loads = []
+    observed = []
+
+    def fake_load_many_async(
+        loads,
+        *,
+        wait_event=None,
+        record_event=True,
+        validate_layout=True,
+    ):
+        assert wait_event is None
+        assert record_event is True
+        assert validate_layout is False
+        pending_loads.extend(loads)
+        for bundle, slot in loads:
+            slot.w13.copy_(bundle.w13)
+            slot.w2.copy_(bundle.w2)
+            slot.state = SlotState.LOADING
+        return "decode-ready"
+
+    def wait_before_publish(ready_event):
+        assert ready_event == "decode-ready"
+        observed.append(runtime.log2phy_buffer(7).tolist())
+        for _, slot in pending_loads:
+            slot.state = SlotState.READY
+
+    monkeypatch.setattr(
+        runtime._transfer_engine,
+        "load_many_async",
+        fake_load_many_async,
+    )
+    monkeypatch.setattr(runtime, "_wait_transfer_event", wait_before_publish)
+
+    prepared = runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(1, 2),
+        num_logical_experts=4,
+    )
+
+    assert observed == [[-1, -1, -1, -1]]
+    assert prepared.log2phy.tolist() == [-1, 0, 1, -1]
 
 
 def test_staging_fails_closed_if_captured_slot_address_changes():

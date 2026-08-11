@@ -39,6 +39,9 @@ If the model or dataset lives elsewhere, edit
 `benchmark/configs/sew_offload_v1.yaml` before preparing workloads. For formal
 experiments in this project, use only an explicitly reserved and idle physical
 NPU5 or NPU6. This repository is graph-only and rejects forced eager cases.
+The benchmark launcher pins `VLLM_ENGINE_ENABLE_PREFIX_CACHING=0` and passes
+`--no-enable-prefix-caching`; prefix-cache reuse is outside the LatchMoE
+qualification scope.
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=5

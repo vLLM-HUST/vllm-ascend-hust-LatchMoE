@@ -20,8 +20,31 @@ monkey-patches the hook points in vllm_ascend so the real MoE offload
 logic is active instead of the null stubs.
 """
 
+import os
+
+
+_COMPAT_ONLY_ENV = "VLLM_ASCEND_MOE_OFFLOAD_COMPAT_ONLY"
+
+
+def _compat_only_enabled() -> bool:
+    return os.getenv(_COMPAT_ONLY_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def register() -> None:
     """Entry point called by vllm's platform plugin system at startup."""
+    if _compat_only_enabled():
+        from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+            apply_cann_compat_patches,
+        )
+
+        apply_cann_compat_patches()
+        return
+
     from vllm_moe_offload_ascend.patches.patch_fused_moe import apply_patches
 
     apply_patches()

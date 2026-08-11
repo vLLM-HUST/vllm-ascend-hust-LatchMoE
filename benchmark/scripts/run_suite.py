@@ -166,6 +166,10 @@ def _managed_env(
             "VLLM_ENGINE_MAX_NUM_SEQS": str(shape["max_num_seqs"]),
             "VLLM_ENGINE_GPU_MEM_UTIL": str(shape["gpu_memory_utilization"]),
             "VLLM_ENGINE_DTYPE": str(model["dtype"]),
+            # Prefix-cache hits are outside LatchMoE's correctness contract.
+            # Pin the managed launcher to the full-prefill path even when the
+            # dev-hub default or the caller's shell enables cache reuse.
+            "VLLM_ENGINE_ENABLE_PREFIX_CACHING": "0",
             "VLLM_ENGINE_ENFORCE_EAGER": "0",
             "VLLM_ENGINE_EXTRA_ARGS_JSON": json.dumps(
                 ["--trust-remote-code", *[str(item) for item in case.get("server_args", [])]]

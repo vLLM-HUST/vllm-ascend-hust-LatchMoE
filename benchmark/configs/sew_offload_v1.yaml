@@ -64,6 +64,7 @@ server:
     - "{max_num_batched_tokens}"
     - --gpu-memory-utilization
     - "{gpu_memory_utilization}"
+    - --no-enable-prefix-caching
 
 client:
   endpoint: /v1/chat/completions
