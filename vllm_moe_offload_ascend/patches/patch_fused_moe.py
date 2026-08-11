@@ -34,6 +34,7 @@ import ctypes
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 
@@ -1358,7 +1359,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             )
 
         profile_start = b2_total_start
-        accumulated = torch.zeros_like(fused_experts_input.hidden_states)
+        accumulated = torch.zeros_like(
+            fused_experts_input.hidden_states,
+            dtype=torch.float32,
+        )
         reference_accumulated = (
             torch.zeros_like(
                 fused_experts_input.hidden_states,
@@ -1389,10 +1393,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         loop_start = None
         loop_ms = 0.0
         scatter_total_ms = 0.0
-        pending_pair_outputs = []
-        pending_direct_scatter_payloads = []
-        pending_full_token_outputs = []
-        pending_restore_indices = []
+        pending_pair_outputs = {}
+        pending_direct_scatter_payloads = {}
+        pending_full_token_outputs = {}
+        pending_restore_indices = {}
         pair_index_ms = 0.0
         wave_microbatch_plan_ms = 0.0
         pair_index_cache_hit = pair_offsets_by_expert is not None
@@ -1867,11 +1871,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     "direct_scatter_payload"
                 )
                 if direct_scatter_payload is None:
-                    pending_pair_outputs.append(wave_result.routed_out)
-                    pending_restore_indices.append(restore_token_indices)
+                    pending_pair_outputs[int(wave_index)] = wave_result.routed_out
+                    pending_restore_indices[int(wave_index)] = restore_token_indices
                 else:
-                    pending_direct_scatter_payloads.append(
-                        direct_scatter_payload
+                    pending_direct_scatter_payloads[int(wave_index)] = replace(
+                        direct_scatter_payload,
+                        wave_index=int(wave_index),
                     )
                 wave_profiles.append(
                     {
@@ -2063,13 +2068,14 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     "direct_scatter_payload"
                 )
                 if reference_full_tokens:
-                    pending_full_token_outputs.append(wave_result.routed_out)
+                    pending_full_token_outputs[int(wave_index)] = wave_result.routed_out
                 elif direct_scatter_payload is None:
-                    pending_pair_outputs.append(wave_result.routed_out)
-                    pending_restore_indices.append(restore_token_indices)
+                    pending_pair_outputs[int(wave_index)] = wave_result.routed_out
+                    pending_restore_indices[int(wave_index)] = restore_token_indices
                 else:
-                    pending_direct_scatter_payloads.append(
-                        direct_scatter_payload
+                    pending_direct_scatter_payloads[int(wave_index)] = replace(
+                        direct_scatter_payload,
+                        wave_index=int(wave_index),
                     )
                 wave_profiles.append(
                     {
@@ -2115,18 +2121,26 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         if pending_direct_scatter_payloads:
             direct_scatter_add_b2_permuted_outputs(
                 accumulated,
-                tuple(pending_direct_scatter_payloads),
+                tuple(
+                    payload
+                    for _, payload in sorted(
+                        pending_direct_scatter_payloads.items()
+                    )
+                ),
             )
         if pending_pair_outputs:
+            pair_wave_indices = sorted(pending_pair_outputs)
             scatter_add_b2_pair_outputs(
                 accumulated,
-                tuple(pending_pair_outputs),
-                tuple(pending_restore_indices),
+                tuple(pending_pair_outputs[index] for index in pair_wave_indices),
+                tuple(pending_restore_indices[index] for index in pair_wave_indices),
             )
-        for full_token_output in pending_full_token_outputs:
+        for _, full_token_output in sorted(pending_full_token_outputs.items()):
             reference_accumulated.add_(full_token_output.to(torch.float32))
         if reference_accumulated is not None:
             accumulated.copy_(reference_accumulated.to(accumulated.dtype))
+        wave_accumulation_dtype = str(accumulated.dtype)
+        accumulated = accumulated.to(fused_experts_input.hidden_states.dtype)
         scatter_total_ms = (perf_counter() - scatter_start) * 1000.0
         end_to_end_ms = (perf_counter() - b2_total_start) * 1000.0
         wave_summary = _summarize_b2_wave_profiles(
@@ -2160,12 +2174,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     if reference_full_tokens
                     else "pair_microbatch"
                 ),
-                "wave_membership_uses_slot_readiness": bool(
-                    not reference_full_tokens
-                ),
-                "wave_accumulation_dtype": (
-                    "float32" if reference_full_tokens else str(accumulated.dtype)
-                ),
+                "wave_membership_uses_slot_readiness": False,
+                "wave_accumulation_dtype": wave_accumulation_dtype,
                 "wave_token_summary": {
                     "min": int(min_wave_tokens),
                     "max": int(max_wave_tokens),

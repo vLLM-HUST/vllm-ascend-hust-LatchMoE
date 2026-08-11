@@ -284,6 +284,7 @@ class B2DirectScatterPayload:
     topk_weights: "torch.Tensor"
     restore_token_indices: "torch.Tensor"
     device_descriptor: "B2DeviceScatterDescriptor | None" = None
+    wave_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -486,12 +487,14 @@ def plan_balanced_b2_waves(
     slot_readiness: dict[int, bool] | None = None,
     fold_partial_hits_into_miss: bool = True,
 ) -> B2WavePlan:
-    """Plan capacity-bounded waves, balanced by routed token count.
+    """Plan canonical capacity-bounded waves by routed token count.
 
-    Experts already present in slots are scheduled first so hit waves can start
-    computing before miss-heavy waves in future async variants. Within the hit
-    and miss groups, First-Fit Decreasing by routed pair count avoids packing
-    several hot experts into one long-tail wave.
+    Wave membership must not depend on which experts happen to be resident in
+    the slot cache. Otherwise equivalent requests can execute different GMM
+    groups and reduction orders as cache state changes. Readiness remains an
+    input for transfer and compute scheduling after this canonical plan is
+    built. ``slot_readiness`` and ``fold_partial_hits_into_miss`` are retained
+    for API compatibility but deliberately do not affect the returned waves.
     """
     if num_slots <= 0:
         raise ValueError(f"num_slots must be greater than 0, got {num_slots}")
@@ -504,7 +507,6 @@ def plan_balanced_b2_waves(
     if not active:
         return B2WavePlan(waves=(), token_counts_by_expert={})
 
-    readiness = slot_readiness or {}
     def _pack(expert_ids: list[int]) -> list[list[int]]:
         if not expert_ids:
             return []
@@ -533,79 +535,10 @@ def plan_balanced_b2_waves(
                 bin_loads[best_idx] += active[int(expert_id)]
         return bins
 
-    hit_experts = [
-        int(expert_id)
-        for expert_id in active
-        if readiness.get(int(expert_id), False)
-    ]
-    miss_experts = [
-        int(expert_id)
-        for expert_id in active
-        if not readiness.get(int(expert_id), False)
-    ]
-
-    hit_bins = _pack(hit_experts)
-    miss_bins = _pack(miss_experts)
-
-    # Preserve full hit-only waves: these can compute directly from the main slot
-    # cache and are useful cover for async miss-wave staging. Partial hit waves can
-    # either stay hit-only (avoids D2D copies from the main bank into a temp bank)
-    # or be folded into miss waves (fewer waves, but mixed staged waves copy READY
-    # experts device-to-device).
-    full_hit_bins: list[list[int]] = []
-    partial_hit_experts: list[int] = []
-    for wave in hit_bins:
-        if len(wave) >= num_slots:
-            full_hit_bins.append(wave)
-        else:
-            partial_hit_experts.extend(int(expert_id) for expert_id in wave)
-
-    if fold_partial_hits_into_miss and miss_bins and partial_hit_experts:
-        miss_loads = [sum(active[int(expert_id)] for expert_id in wave) for wave in miss_bins]
-        remaining_hit_experts = sorted(
-            partial_hit_experts,
-            key=lambda expert_id: (-active[int(expert_id)], int(expert_id)),
-        )
-        unplaced_hit_experts: list[int] = []
-        for expert_id in remaining_hit_experts:
-            best_idx = None
-            best_load = None
-            for idx, wave in enumerate(miss_bins):
-                if len(wave) >= num_slots:
-                    continue
-                load = miss_loads[idx]
-                if best_load is None or load < best_load:
-                    best_idx = idx
-                    best_load = load
-            if best_idx is None:
-                unplaced_hit_experts.append(int(expert_id))
-                continue
-            miss_bins[best_idx].append(int(expert_id))
-            miss_loads[best_idx] += active[int(expert_id)]
-        partial_hit_bins = _pack(unplaced_hit_experts)
-    else:
-        partial_hit_bins = _pack(partial_hit_experts)
-
-    def _copy_friendly_wave(wave: list[int]) -> tuple[int, ...]:
-        normalized_wave = tuple(int(expert_id) for expert_id in wave)
-        # Sort miss-only waves so host expert ids and stage slot ids advance
-        # together, letting the transfer engine coalesce contiguous H2D copies.
-        # Mixed waves deliberately keep the miss-first, hit-tail layout produced
-        # above: sorting them can interleave main-slot D2D hits with host H2D
-        # misses and force the transfer engine back to per-expert copies.
-        if normalized_wave and all(
-            not readiness.get(int(expert_id), False)
-            for expert_id in normalized_wave
-        ):
-            return tuple(sorted(normalized_wave))
-        return normalized_wave
-
-    # Keep the balanced wave membership and wave order; only normalize miss-only
-    # staged waves for copy coalescing.
-    waves = tuple(
-        _copy_friendly_wave(wave)
-        for wave in (full_hit_bins + miss_bins + partial_hit_bins)
-    )
+    # The ignored reads make the compatibility contract explicit and keep static
+    # analysis from treating the parameters as accidental leftovers.
+    _ = slot_readiness, fold_partial_hits_into_miss
+    waves = tuple(tuple(sorted(wave)) for wave in _pack(list(active)))
     return B2WavePlan(waves=waves, token_counts_by_expert=active)
 
 
@@ -1645,7 +1578,11 @@ def scatter_add_b2_pair_output(
     """Accumulate pair-level wave output back to full token output."""
     if pair_output.numel() == 0:
         return full_output
-    full_output.index_add_(0, restore_token_indices.to(full_output.device), pair_output)
+    full_output.index_add_(
+        0,
+        restore_token_indices.to(full_output.device),
+        pair_output.to(device=full_output.device, dtype=full_output.dtype),
+    )
     return full_output
 
 
@@ -1673,7 +1610,13 @@ def scatter_add_b2_pair_outputs(
 
     import torch
 
-    outputs = torch.cat(tuple(output for output, _ in non_empty), dim=0)
+    outputs = torch.cat(
+        tuple(
+            output.to(device=full_output.device, dtype=full_output.dtype)
+            for output, _ in non_empty
+        ),
+        dim=0,
+    )
     indices = torch.cat(
         tuple(indices.to(full_output.device) for _, indices in non_empty),
         dim=0,
@@ -1717,22 +1660,19 @@ def direct_scatter_add_b2_permuted_output(
     weights = (
         device_descriptor.weights
         if device_descriptor is not None
-        else topk_weights.reshape(-1).to(
-            device=permuted_tokens.device,
-            dtype=permuted_tokens.dtype,
-        )
-    )
+        else topk_weights.reshape(-1)
+    ).to(device=permuted_tokens.device, dtype=full_output.dtype)
     scatter_indices = (
         device_descriptor.token_indices
         if device_descriptor is not None
         else restore_token_indices.to(full_output.device)
     )
-    gathered = permuted_tokens.index_select(0, expanded)
+    gathered = permuted_tokens.index_select(0, expanded).to(full_output.dtype)
     weighted = gathered * weights.unsqueeze(-1)
     full_output.index_add_(
         0,
         scatter_indices,
-        weighted.to(full_output.device),
+        weighted.to(device=full_output.device, dtype=full_output.dtype),
     )
     return full_output
 
@@ -1748,7 +1688,10 @@ def direct_scatter_add_b2_permuted_outputs(
     every wave-local unpermute index into one concatenated permuted-token buffer,
     applies the top-k weights once, and performs one layer-level ``index_add_``.
     """
-    non_empty = [payload for payload in payloads if payload.permuted_tokens.numel() > 0]
+    non_empty = sorted(
+        (payload for payload in payloads if payload.permuted_tokens.numel() > 0),
+        key=lambda payload: int(payload.wave_index),
+    )
     if not non_empty:
         return full_output
 
@@ -1780,14 +1723,16 @@ def direct_scatter_add_b2_permuted_outputs(
         weights = (
             descriptor.weights
             if descriptor is not None
-            else payload.topk_weights.reshape(-1).to(
-                device=payload.permuted_tokens.device,
-                dtype=payload.permuted_tokens.dtype,
-            )
+            else payload.topk_weights.reshape(-1)
+        ).to(device=payload.permuted_tokens.device, dtype=full_output.dtype)
+        gathered = payload.permuted_tokens.index_select(0, expanded).to(
+            full_output.dtype
         )
-        gathered = payload.permuted_tokens.index_select(0, expanded)
         weighted_chunks.append(
-            (gathered * weights.unsqueeze(-1)).to(full_output.device)
+            (gathered * weights.unsqueeze(-1)).to(
+                device=full_output.device,
+                dtype=full_output.dtype,
+            )
         )
         restore_chunks.append(
             descriptor.token_indices

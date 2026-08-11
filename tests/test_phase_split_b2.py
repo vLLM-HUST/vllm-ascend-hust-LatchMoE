@@ -40,16 +40,25 @@ def test_count_routed_tokens_by_expert_counts_topk_pairs():
     }
 
 
-def test_plan_balanced_b2_waves_prefers_hits_and_balances_hot_experts():
-    plan = plan_balanced_b2_waves(
-        {1: 10, 2: 9, 3: 8, 4: 1, 5: 1},
-        num_slots=2,
-        slot_readiness={3: True},
+def test_plan_balanced_b2_waves_is_canonical_across_readiness_states():
+    token_counts = {1: 10, 2: 9, 3: 8, 4: 1, 5: 1}
+    plans = tuple(
+        plan_balanced_b2_waves(
+            token_counts,
+            num_slots=2,
+            slot_readiness=readiness,
+        )
+        for readiness in (
+            {},
+            {3: True},
+            {expert_id: True for expert_id in token_counts},
+        )
     )
 
-    assert all(len(wave) <= 2 for wave in plan.waves)
-    assert (3,) in plan.waves
-    loads = [plan.wave_tokens(wave) for wave in plan.waves]
+    assert plans[0].waves == plans[1].waves == plans[2].waves
+    assert plans[0].waves == ((1,), (2, 5), (3, 4))
+    assert all(len(wave) <= 2 for wave in plans[0].waves)
+    loads = [plans[0].wave_tokens(wave) for wave in plans[0].waves]
     assert max(loads) - min(loads) <= 8
 
 
@@ -81,24 +90,19 @@ def test_plan_balanced_b2_waves_folds_partial_hit_tail_into_miss_waves():
     assert len(plan.waves) == 1
 
 
-def test_plan_balanced_b2_waves_can_keep_partial_hits_separate_to_avoid_d2d():
+def test_plan_balanced_b2_waves_legacy_fold_flag_cannot_change_membership():
     readiness = {1: True}
-    plan = plan_balanced_b2_waves(
-        {1: 10, 2: 9, 3: 8, 4: 7},
-        num_slots=4,
-        slot_readiness=readiness,
-        fold_partial_hits_into_miss=False,
+    plans = tuple(
+        plan_balanced_b2_waves(
+            {1: 10, 2: 9, 3: 8, 4: 7},
+            num_slots=4,
+            slot_readiness=readiness,
+            fold_partial_hits_into_miss=fold,
+        )
+        for fold in (False, True)
     )
 
-    assert plan.waves == ((2, 3, 4), (1,))
-    assert all(len(wave) <= 4 for wave in plan.waves)
-    assert all(
-        not (
-            any(readiness.get(expert_id, False) for expert_id in wave)
-            and any(not readiness.get(expert_id, False) for expert_id in wave)
-        )
-        for wave in plan.waves
-    )
+    assert plans[0].waves == plans[1].waves == ((1, 2, 3, 4),)
 
 
 def test_plan_balanced_b2_waves_sorts_wave_members_for_contiguous_stage_copy():
@@ -112,14 +116,14 @@ def test_plan_balanced_b2_waves_sorts_wave_members_for_contiguous_stage_copy():
     assert plan.wave_tokens(plan.waves[0]) == 340
 
 
-def test_plan_balanced_b2_waves_keeps_mixed_wave_miss_prefix():
+def test_plan_balanced_b2_waves_sorts_mixed_wave_canonically():
     plan = plan_balanced_b2_waves(
         {1: 10, 2: 100, 5: 90},
         num_slots=3,
         slot_readiness={1: True},
     )
 
-    assert plan.waves == ((2, 5, 1),)
+    assert plan.waves == ((1, 2, 5),)
 
 
 def test_mixed_wave_microbatch_uses_positional_slots_not_main_bank_ids():
@@ -1009,6 +1013,39 @@ def test_direct_scatter_add_b2_permuted_outputs_offsets_wave_local_indices():
     direct_scatter_add_b2_permuted_outputs(full, payloads)
 
     assert torch.allclose(full, torch.tensor([[40.0], [40.0]]))
+
+
+def test_direct_scatter_uses_canonical_wave_order_and_fp32_accumulator():
+    payloads = tuple(
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[value]], dtype=torch.float32),
+            expanded_row_idx=torch.tensor([0], dtype=torch.int32),
+            topk_weights=torch.tensor([[1.0]], dtype=torch.float32),
+            restore_token_indices=torch.tensor([0], dtype=torch.long),
+            wave_index=wave_index,
+        )
+        for wave_index, value in ((2, 1.0), (1, -1.0e8), (0, 1.0e8))
+    )
+    output = torch.zeros(1, 1, dtype=torch.float32)
+
+    direct_scatter_add_b2_permuted_outputs(output, payloads)
+
+    assert output.dtype == torch.float32
+    assert output.item() == 1.0
+
+
+def test_direct_scatter_promotes_bfloat16_payload_to_accumulator_dtype():
+    output = torch.zeros(1, 1, dtype=torch.float32)
+    direct_scatter_add_b2_permuted_output(
+        output,
+        permuted_tokens=torch.tensor([[2.0]], dtype=torch.bfloat16),
+        expanded_row_idx=torch.tensor([0], dtype=torch.int32),
+        topk_weights=torch.tensor([[0.5]], dtype=torch.bfloat16),
+        restore_token_indices=torch.tensor([0], dtype=torch.long),
+    )
+
+    assert output.dtype == torch.float32
+    assert output.item() == 1.0
 
 
 def test_build_b2_pair_microbatch_can_skip_hot_path_unstaged_validation():
