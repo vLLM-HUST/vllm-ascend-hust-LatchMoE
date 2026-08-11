@@ -54,10 +54,10 @@ graph replay and run eager.
 2. **Replay-boundary staging** — a staging controller executes all
    routing-driven host-to-device expert transfers outside the captured
    region, on a dedicated transfer stream.
-3. **Capacity-bounded wave prefill** — when a prompt-shaped working set
-   exceeds slot capacity, the MLP is executed in bounded waves, and a
-   transfer-aware schedule overlaps the next wave's expert loads with the
-   current wave's compute.
+3. **Correctness-first overflow staging** — when a prompt-shaped working set
+   exceeds slot capacity, the supported path stages the full expert layer and
+   executes one native MoE pass. Capacity-bounded multi-wave prefill remains
+   experimental because it changes BF16 evaluation order.
 4. **Compute-protected slot lifecycle** — event ordering between the compute
    and transfer streams guarantees that asynchronous loads never overwrite a
    slot still referenced by in-flight compute.
@@ -109,7 +109,7 @@ LatchMoE is organized into four layers:
 ├────────────────────────────────────────┤
 │  Compute-Protected Slot Lifecycle      │  ← transfer stream + event ordering
 ├────────────────────────────────────────┤
-│  Capacity-Bounded Wave Prefill         │  ← bounded waves, transfer-aware overlap
+│  Correctness-First Overflow Staging    │  ← full-layer native MoE pass
 ├────────────────────────────────────────┤
 │  Slot-Stable Expert Virtualization     │  ← fixed slot bank + pinned host store
 └────────────────────────────────────────┘
