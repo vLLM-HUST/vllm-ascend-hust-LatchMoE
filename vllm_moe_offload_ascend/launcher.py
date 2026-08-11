@@ -465,6 +465,8 @@ def _force_prefix_cache_disabled(argv: Sequence[str]) -> list[str]:
     """
 
     arguments = list(argv)
+    if not arguments or arguments[0] != "serve":
+        return arguments
     for argument in arguments:
         option = argument.split("=", 1)[0]
         if option in _PREFIX_CACHE_ENABLE_FLAGS:
