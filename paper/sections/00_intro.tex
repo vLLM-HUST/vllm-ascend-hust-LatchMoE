@@ -1,37 +1,34 @@
 \section{Introduction}
 \label{sec:intro}
 
-Mixture-of-experts (MoE) models increase parameter capacity while activating
-only a small subset of experts for each token
-\cite{shazeer2017moe,switch,glam,mixtral,deepseekmoe}.  Sparse activation
-reduces the arithmetic performed per token, but it does not remove the need to
-make every routed expert available.  Consequently, expert weights can dominate
-the memory footprint of an MoE deployment.  Distributed systems spread this
-capacity across accelerators \cite{deepspeedmoe}, while heterogeneous inference
-systems coordinate model storage across device and host memory \cite{flexgen}.
-For a memory-constrained single accelerator, expert offloading applies the
-latter idea specifically to MoE layers: the runtime keeps a bounded set of
-experts in high-bandwidth memory (HBM) and fetches non-resident experts from
-host memory as routing demands them \cite{fastmoeoffload,moeinfinity}.  This
-exchange makes otherwise infeasible model capacity accessible, but it also
-places cache lookup, weight movement, and replacement on the serving path.
+Mixture-of-Experts (MoE) architectures have emerged as a prominent approach for scaling Large Language Models (LLMs) to hundreds of billions of parameters~\cite{shazeer2017outrageously,fedus2022switch, jiang2024mixtral,dai2024deepseekmoe}.
+By dynamically routing each token to only a sparse subset of experts, MoE models substantially increase model capacity while keeping per-token computation bounded~\cite{du2022glam,rajbhandari2022deepspeedmoe}.
+However, sparse activation reduces computation rather than model storage: although only a small number of experts are activated for each token, the runtime must still make the entire expert pool available for routing.
+As MoE models scale, expert weights can therefore dominate the memory footprint and impose substantial pressure on accelerator High-Bandwidth Memory (HBM).
+To serve such models on memory-constrained accelerators, \textbf{expert offloading} has become an important strategy: the runtime keeps non-expert layers and a bounded subset of frequently used experts in local HBM, while fetching non-resident experts from host memory on demand~\cite{hwang2024pregated,xue2024moeinfinity,li2026commitmoe}.
+Expert offloading makes otherwise memory-infeasible MoE models deployable on limited-HBM devices, but introduces dynamic expert movement into the inference critical path.
 
-Prior systems reduce this data-movement cost through expert prediction,
-prefetching, caching, mixed precision, and finer-grained offloading
-\cite{pregated,swapmoe,promoe,hobbit,finemoe,commitmoe}.  These mechanisms
-improve which experts are moved and when they arrive, yet routing-driven cache
-misses still change the correspondence between logical experts and physical
-weight storage.  A separate line of compiler and serving work addresses model
-dynamism and graph-compatible scheduling \cite{nimble,vllm,flashinfer}.
-Accelerator graph replay amortizes repeated host dispatch, but the replayed
-region assumes a repeatable operator topology and stable graph-visible storage
-bindings.  Expert replacement violates this assumption even when tensor shapes
-and kernel choices remain unchanged: the same logical expert may occupy a
-different allocation at the next decoding step.  Eager execution can resolve
-the new placement before every kernel launch, whereas excluding the entire MoE
-path from capture reintroduces fine-grained host orchestration.  Data-movement
-optimizations alone therefore do not provide a replay-stable interface for
-dynamic expert residency.
+To make expert offloading practical, prior systems reduce its data-movement overhead through expert caching, routing-aware prediction and prefetching, and transfer--computation overlap~\cite{hwang2024pregated,kong2024swapmoe,cao2025moelightning,fang2025klotski,xue2024moeinfinity}. 
+These techniques reduce the frequency of host-to-device transfers or hide part of their latency, substantially improving the efficiency of offloaded MoE inference. 
+However, they do not eliminate the inherent execution dynamism introduced by expert offloading. 
+Routing-driven cache misses can still trigger expert loading, eviction, and replacement, causing the set of HBM-resident experts to evolve across decoding steps. 
+More importantly, loading and replacing experts in a bounded HBM cache can change the mapping between logical experts and their physical weight locations across decoding steps.
+Thus, existing data-movement optimizations improve which experts are moved and when they are moved, but they do not eliminate runtime changes in expert residency or logical-to-physical weight bindings.
+
+Such runtime changes can be naturally accommodated under eager execution, where the host resolves the current expert placement and dispatches the corresponding kernels at each decoding step. 
+This flexibility, however, comes at a substantial performance cost. 
+Autoregressive decoding repeatedly executes a largely recurring sequence of fine-grained accelerator kernels, and launching these kernels individually incurs repeated host-side scheduling, dispatch, and synchronization overhead. 
+\textbf{Graph replay} mitigates this overhead by capturing the recurring execution sequence once and replaying it as a unit, thereby reducing host-induced gaps between kernel executions~\cite{kwon2020nimble,ye2025flashinfer}. 
+
+As shown in Figure~\ref{fig:graph_breakdown}, graph replay reduces average decode latency by approximately 75\% across four workloads, from 133.7--137.4~ms/token under eager execution to 32.6--33.6~ms/token, while device execution time remains nearly unchanged. 
+This result indicates that most of the improvement comes from eliminating host-induced device idle time rather than accelerating the underlying kernels. Therefore, falling back to eager execution is not merely a compatibility inconvenience; it forfeits a major source of decoding efficiency.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=1\linewidth]{figures/graph_breakdown.png}
+    \caption{Average decode latency breakdown under eager execution and graph replay. Graph replay substantially reduces host-induced device gaps while leaving device execution time nearly unchanged.}
+    \label{fig:graph_breakdown}
+\end{figure}
 
 Our goal is to preserve graph replay while allowing the resident expert set to
 change within a fixed HBM budget.  The key observation is that expert
