@@ -521,6 +521,73 @@ def _patch_rms_norm_bias_cann_compat() -> None:
         )
 
 
+def _install_cann_compat_when_ready() -> bool:
+    """Install only backend compatibility fixes after Ascend op registration."""
+
+    if _ascend_device_op_is_initializing():
+        return False
+
+    import importlib
+
+    importlib.import_module("vllm_ascend.ops.register_custom_ops")
+    _patch_rms_norm_bias_cann_compat()
+    return True
+
+
+def _patch_cann_compat_adapt_retry() -> None:
+    """Retry compat-only installation at the worker's stable adapt boundary."""
+
+    try:
+        import vllm_ascend.utils as _utils
+    except Exception:
+        return
+
+    current = getattr(_utils, "adapt_patch", None)
+    if current is None or getattr(current, "_latchmoe_cann_compat_retry", False):
+        return
+
+    def adapt_patch(*args, **kwargs):
+        result = current(*args, **kwargs)
+        _install_cann_compat_when_ready()
+        return result
+
+    adapt_patch._latchmoe_cann_compat_retry = True
+    adapt_patch.__wrapped__ = current
+    _utils.adapt_patch = adapt_patch
+
+
+def _patch_cann_compat_config_retry() -> None:
+    """Retry compat-only installation at the final platform config boundary."""
+
+    try:
+        import vllm_ascend.platform as _platform
+    except Exception:
+        return
+
+    current = _platform.NPUPlatform.check_and_update_config
+    current_fn = getattr(current, "__func__", current)
+    if getattr(current_fn, "_latchmoe_cann_compat_retry", False):
+        return
+    original_fn = current_fn
+
+    @classmethod
+    def _patched(cls, vllm_config):
+        original_fn(cls, vllm_config)
+        _install_cann_compat_when_ready()
+
+    _patched.__func__._latchmoe_cann_compat_retry = True
+    _patched.__func__.__wrapped__ = original_fn
+    _platform.NPUPlatform.check_and_update_config = _patched
+
+
+def apply_cann_compat_patches() -> None:
+    """Install CANN compatibility only, without any MoE offload patches."""
+
+    _patch_cann_compat_adapt_retry()
+    _patch_cann_compat_config_retry()
+    _install_cann_compat_when_ready()
+
+
 def apply_patches() -> None:
     # 0. Eagerly write env defaults so spawned worker processes see them.
     _apply_env_defaults_from_gb()
@@ -659,13 +726,26 @@ def _b2_reference_full_layer_enabled(*, async_stage: bool) -> bool:
         "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER",
         "0",
     )
-    if enabled and async_stage:
-        raise RuntimeError(
-            "VLLM_ASCEND_MOE_OFFLOAD_B2_REFERENCE_FULL_LAYER=1 only "
-            "supports synchronous staging; set "
-            "VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD=0"
-        )
+    # This path always performs its own blocking full-layer copy. The global
+    # async setting still controls the ordinary fixed-slot decode path.
+    _ = async_stage
     return enabled
+
+
+def _b2_overflow_mode() -> str:
+    """Return the fail-closed execution mode for slot-capacity overflow."""
+
+    mode = os.getenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
+        "full_layer",
+    ).strip().lower()
+    if mode not in {"full_layer", "experimental_wave"}:
+        raise RuntimeError(
+            "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE must be "
+            "'full_layer' or 'experimental_wave', got "
+            f"{mode!r}"
+        )
+    return mode
 
 
 
@@ -931,6 +1011,9 @@ def _patch_ascend_envs() -> None:
         ),
         "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": lambda: _to_bool_env(
             "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL", "0"
+        ),
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE": lambda: os.getenv(
+            "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE", "full_layer"
         ),
         "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD": lambda: _to_bool_env(
             "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD", "0"
@@ -1295,8 +1378,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             if control_profile
             else None
         )
-        if _b2_reference_full_layer_enabled(
-            async_stage=bool(runtime.config.async_load)
+        if (
+            _b2_reference_full_layer_enabled(
+                async_stage=bool(runtime.config.async_load)
+            )
+            or _b2_overflow_mode() == "full_layer"
         ):
             return self._run_b2_full_layer_reference(
                 fused_experts_input=fused_experts_input,

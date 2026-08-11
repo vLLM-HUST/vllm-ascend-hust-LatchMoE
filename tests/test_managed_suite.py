@@ -54,6 +54,7 @@ def test_managed_env_pins_graph_device_and_digest(tmp_path: Path) -> None:
     )
     assert env["VLLM_ENGINE_NPU_DEVICES"] == "5"
     assert env["VLLM_ENGINE_ENFORCE_EAGER"] == "0"
+    assert env["VLLM_ENGINE_ENABLE_PREFIX_CACHING"] == "0"
     assert "@sha256:" in env["VLLM_ENGINE_IMAGE"]
 
 

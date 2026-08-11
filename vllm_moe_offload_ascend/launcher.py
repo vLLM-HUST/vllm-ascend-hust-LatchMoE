@@ -19,6 +19,14 @@ REQUIRED_PLATFORM_PLUGINS = {
     "moe_offload_ascend": "vllm_moe_offload_ascend:register",
 }
 DEFAULT_COMPATIBILITY_LOCK = Path(__file__).with_name("compatibility.lock")
+_PREFIX_CACHE_ENABLE_FLAGS = {
+    "--enable-prefix-caching",
+    "--enable_prefix_caching",
+}
+_PREFIX_CACHE_DISABLE_FLAGS = {
+    "--no-enable-prefix-caching",
+    "--no-enable_prefix_caching",
+}
 
 
 @dataclass(frozen=True)
@@ -447,6 +455,30 @@ def _run_vllm_cli(argv: Sequence[str]) -> int:
     return int(result or 0)
 
 
+def _force_prefix_cache_disabled(argv: Sequence[str]) -> list[str]:
+    """Keep the supported LatchMoE serving path independent of KV reuse.
+
+    Prefix-cache hits change the number of tokens that enter prefill and the
+    corresponding KV/block metadata.  That is a separate vLLM/Ascend path and
+    is intentionally outside LatchMoE's correctness contract.  Reject an
+    explicit opt-in rather than silently changing a user's requested mode.
+    """
+
+    arguments = list(argv)
+    if not arguments or arguments[0] != "serve":
+        return arguments
+    for argument in arguments:
+        option = argument.split("=", 1)[0]
+        if option in _PREFIX_CACHE_ENABLE_FLAGS:
+            raise ValueError(
+                "LatchMoE does not support prefix caching; remove "
+                f"{argument!r} and use the fixed no-prefix-cache path"
+            )
+    if any(argument in _PREFIX_CACHE_DISABLE_FLAGS for argument in arguments):
+        return arguments
+    return [*arguments, "--no-enable-prefix-caching"]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Check the current interpreter, then delegate to the vLLM CLI."""
 
@@ -470,6 +502,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    try:
+        arguments = _force_prefix_cache_disabled(arguments)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     print(
         f"LatchMoE launcher: using {report.python}; environment check passed",

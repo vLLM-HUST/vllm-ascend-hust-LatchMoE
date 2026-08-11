@@ -8,12 +8,34 @@ import vllm_moe_offload_ascend
 from vllm_moe_offload_ascend.patches.patch_fused_moe import (
     _ascend_device_op_is_initializing,
     _ensure_moe_offload_splitting_op,
+    _install_cann_compat_when_ready,
     _install_runtime_patches_when_ready,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
     _patch_kv_cache_capacity_backstop,
     _unpack_mlp_apply_result,
 )
+
+
+def test_register_compat_only_skips_moe_runtime_patches(monkeypatch):
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    events = []
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_COMPAT_ONLY", "1")
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "apply_cann_compat_patches",
+        lambda: events.append("compat"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "apply_patches",
+        lambda: pytest.fail("compat-only mode must not install MoE runtime patches"),
+    )
+
+    vllm_moe_offload_ascend.register()
+
+    assert events == ["compat"]
 
 
 def test_runtime_patch_install_waits_for_ascend_device_op(monkeypatch):
@@ -78,6 +100,48 @@ def test_runtime_patch_install_registers_custom_ops_before_moe_modules(monkeypat
         "patch_rms_norm_bias_cann_compat",
         "inject_sys_modules",
         "install_runtime_module_patches",
+    ]
+
+
+def test_cann_compat_install_does_not_install_moe_runtime(monkeypatch):
+    import importlib
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    device_op = ModuleType("vllm_ascend.device.device_op")
+    device_op.DeviceOperator = object
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+    events = []
+
+    original_import_module = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == "vllm_ascend.ops.register_custom_ops":
+            events.append("register_custom_ops")
+            return ModuleType(name)
+        return original_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_patch_rms_norm_bias_cann_compat",
+        lambda: events.append("patch_rms_norm_bias_cann_compat"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_inject_sys_modules",
+        lambda: pytest.fail("compat-only mode must not alias MoE modules"),
+    )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_install_runtime_module_patches",
+        lambda: pytest.fail("compat-only mode must not install runtime hooks"),
+    )
+
+    assert _install_cann_compat_when_ready() is True
+    assert events == [
+        "register_custom_ops",
+        "patch_rms_norm_bias_cann_compat",
     ]
 
 
@@ -695,7 +759,7 @@ def test_b2_reference_full_layer_accepts_sync_staging(monkeypatch):
     assert _b2_reference_full_layer_enabled(async_stage=False) is True
 
 
-def test_b2_reference_full_layer_rejects_async_staging(monkeypatch):
+def test_b2_reference_full_layer_uses_blocking_copy_with_async_decode(monkeypatch):
     from vllm_moe_offload_ascend.patches.patch_fused_moe import (
         _b2_reference_full_layer_enabled,
     )
@@ -705,8 +769,47 @@ def test_b2_reference_full_layer_rejects_async_staging(monkeypatch):
         "1",
     )
 
-    with pytest.raises(RuntimeError, match="only supports synchronous staging"):
-        _b2_reference_full_layer_enabled(async_stage=True)
+    assert _b2_reference_full_layer_enabled(async_stage=True) is True
+
+
+def test_b2_overflow_mode_defaults_to_full_layer(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_overflow_mode,
+    )
+
+    monkeypatch.delenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
+        raising=False,
+    )
+
+    assert _b2_overflow_mode() == "full_layer"
+
+
+def test_b2_overflow_mode_allows_explicit_experimental_wave(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_overflow_mode,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
+        "experimental_wave",
+    )
+
+    assert _b2_overflow_mode() == "experimental_wave"
+
+
+def test_b2_overflow_mode_rejects_unknown_value(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_overflow_mode,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
+        "fast",
+    )
+
+    with pytest.raises(RuntimeError, match="must be 'full_layer' or"):
+        _b2_overflow_mode()
 
 
 def test_b2_profile_details_accepts_sync_execution_without_schedule(monkeypatch):

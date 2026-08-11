@@ -140,6 +140,7 @@ def test_render_plan_for_single_unit():
     assert unit["case"] == "sew_14gb_autoslots"
     assert unit["workload"] == "smoke"
     assert unit["server_command"][:2] == ["latchmoe", "serve"]
+    assert "--no-enable-prefix-caching" in unit["server_command"]
     assert unit["client_command"][0] == "python"
     assert "--bucket" in unit["client_command"]
     assert "smoke" in unit["client_command"]

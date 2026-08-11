@@ -24,6 +24,15 @@ project. New control policies must not be added to LatchMoE's main branch.
 Graph-path failures must be diagnosed directly. Forced eager execution is not
 an acceptable substitute for graph validation.
 
+### Prefix-cache boundary
+
+LatchMoE currently does **not** support vLLM prefix-cache reuse. The supported
+path always recomputes the complete prompt. Prefix-cache hits change the
+prefill token count and KV/block metadata, which is a separate vLLM-Ascend
+compatibility path and is not part of LatchMoE's correctness or performance
+claims. The `latchmoe` launcher therefore adds `--no-enable-prefix-caching`
+automatically and rejects an explicit `--enable-prefix-caching` request.
+
 ## What LatchMoE Does
 
 Serving a MoE model whose expert weights exceed single-NPU HBM requires
@@ -45,10 +54,10 @@ graph replay and run eager.
 2. **Replay-boundary staging** — a staging controller executes all
    routing-driven host-to-device expert transfers outside the captured
    region, on a dedicated transfer stream.
-3. **Capacity-bounded wave prefill** — when a prompt-shaped working set
-   exceeds slot capacity, the MLP is executed in bounded waves, and a
-   transfer-aware schedule overlaps the next wave's expert loads with the
-   current wave's compute.
+3. **Correctness-first overflow staging** — when a prompt-shaped working set
+   exceeds slot capacity, the supported path stages the full expert layer and
+   executes one native MoE pass. Capacity-bounded multi-wave prefill remains
+   experimental because it changes BF16 evaluation order.
 4. **Compute-protected slot lifecycle** — event ordering between the compute
    and transfer streams guarantees that asynchronous loads never overwrite a
    slot still referenced by in-flight compute.
@@ -100,7 +109,7 @@ LatchMoE is organized into four layers:
 ├────────────────────────────────────────┤
 │  Compute-Protected Slot Lifecycle      │  ← transfer stream + event ordering
 ├────────────────────────────────────────┤
-│  Capacity-Bounded Wave Prefill         │  ← bounded waves, transfer-aware overlap
+│  Correctness-First Overflow Staging    │  ← full-layer native MoE pass
 ├────────────────────────────────────────┤
 │  Slot-Stable Expert Virtualization     │  ← fixed slot bank + pinned host store
 └────────────────────────────────────────┘
@@ -201,10 +210,12 @@ export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=1
 
 # Canonical: the active Python owns both plugin discovery and vLLM startup.
 python -m vllm_moe_offload_ascend serve \
-  /path/to/Qwen3-30B-A3B --trust-remote-code
+  /path/to/Qwen3-30B-A3B --trust-remote-code \
+  --no-enable-prefix-caching
 
 # Equivalent console script created by pip install.
-latchmoe serve /path/to/Qwen3-30B-A3B --trust-remote-code
+latchmoe serve /path/to/Qwen3-30B-A3B --trust-remote-code \
+  --no-enable-prefix-caching
 ```
 
 SEW AutoConfig releases the original NPU copies of offloaded expert weights
@@ -247,6 +258,7 @@ All configuration is environment-variable based. The main knobs:
 | `VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS` | auto | Comma-separated layer IDs kept fully resident |
 | `VLLM_ASCEND_MOE_OFFLOAD_POLICY` | `deadline` | Staging policy (`deadline` / `lru`) |
 | `VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD` | `1` on SEW path | Load experts on a dedicated transfer stream |
+| `VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE` | `full_layer` | Correctness-first behavior when active experts exceed slot capacity; `experimental_wave` enables the unqualified multi-wave path |
 | `VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE` | `1` on SEW path | Reorder wave staging/compute by per-wave H2D bytes |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH` | `1` | Software-pipeline prefetch depth for wave prefill |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT` | `2` | Stage buffer count for wave prefill |
@@ -259,6 +271,9 @@ All configuration is environment-variable based. The main knobs:
 
 Additional expert-level overrides are documented in
 `vllm_moe_offload_ascend/moe_offload/config.py` and `autoconfig.py`.
+The `experimental_wave` overflow mode changes BF16 evaluation order and is not
+currently token-equivalent to native single-pass MoE. Do not use it for
+correctness or performance claims.
 
 ---
 

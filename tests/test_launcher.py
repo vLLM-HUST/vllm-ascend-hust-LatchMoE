@@ -248,7 +248,48 @@ def test_launcher_delegates_to_vllm_after_check(monkeypatch):
     )
 
     assert launcher.main(["serve", "/models/qwen"]) == 0
-    assert delegated == [["serve", "/models/qwen"]]
+    assert delegated == [["serve", "/models/qwen", "--no-enable-prefix-caching"]]
+
+
+def test_launcher_rejects_prefix_cache_opt_in(monkeypatch, capsys):
+    _patch_complete_environment(monkeypatch)
+    delegated = []
+    monkeypatch.setattr(
+        launcher,
+        "_run_vllm_cli",
+        lambda argv: delegated.append(list(argv)) or 0,
+    )
+
+    assert launcher.main(["serve", "/models/qwen", "--enable-prefix-caching"]) == 2
+    assert delegated == []
+    assert "does not support prefix caching" in capsys.readouterr().err
+
+
+def test_launcher_preserves_explicit_prefix_cache_disable(monkeypatch):
+    _patch_complete_environment(monkeypatch)
+    delegated = []
+    monkeypatch.setattr(
+        launcher,
+        "_run_vllm_cli",
+        lambda argv: delegated.append(list(argv)) or 0,
+    )
+
+    assert launcher.main(["serve", "/models/qwen", "--no-enable-prefix-caching"]) == 0
+    assert delegated == [["serve", "/models/qwen", "--no-enable-prefix-caching"]]
+
+
+def test_launcher_does_not_add_serve_flags_to_other_commands(monkeypatch):
+    _patch_complete_environment(monkeypatch)
+    delegated = []
+    monkeypatch.setattr(
+        launcher,
+        "_run_vllm_cli",
+        lambda argv: delegated.append(list(argv)) or 0,
+    )
+
+    assert launcher.main(["--help"]) == 0
+    assert launcher.main(["bench", "latency", "--help"]) == 0
+    assert delegated == [["--help"], ["bench", "latency", "--help"]]
 
 
 def test_vllm_cli_retry_registers_after_engine_args_import(monkeypatch):

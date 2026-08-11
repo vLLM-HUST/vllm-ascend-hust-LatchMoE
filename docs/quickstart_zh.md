@@ -3,6 +3,11 @@
 本文档面向希望在已有 Ascend vLLM 软件栈上安装和启动 LatchMoE 的开发者。
 核心原则只有一条：**始终用安装 LatchMoE 的同一个 Python 启动 vLLM**。
 
+LatchMoE 当前不兼容 vLLM 的 prefix cache（前缀复用）。它固定使用完整
+prompt prefill；启动入口会自动加入 `--no-enable-prefix-caching`，如果显式
+传入 `--enable-prefix-caching` 则直接拒绝启动。prefix cache 的命中路径属于
+独立的 vLLM-Ascend 兼容性问题，不纳入 LatchMoE 的正确性和性能结论。
+
 安装后推荐使用下面的统一入口：
 
 ```bash

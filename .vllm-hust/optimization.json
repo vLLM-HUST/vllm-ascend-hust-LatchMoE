@@ -13,7 +13,8 @@
       "VLLM_ASCEND_MOE_OFFLOAD_GB": "${offload_gb}",
       "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
       "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1",
-      "VLLM_ENGINE_MAX_NUM_SEQS": "1"
+      "VLLM_ENGINE_MAX_NUM_SEQS": "1",
+      "VLLM_ENGINE_ENABLE_PREFIX_CACHING": "0"
     },
     "extra_env_prefixes": ["VLLM_ASCEND_MOE_OFFLOAD_"]
   },

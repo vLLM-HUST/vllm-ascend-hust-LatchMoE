@@ -1547,6 +1547,16 @@ class MoeOffloadRuntime:
             if collect_profile:
                 load_enqueue_ms = (perf_counter() - load_start) * 1000.0
 
+        # Install the transfer dependency on the exact consumer stream before
+        # publishing the logical mapping. A mapping must never name a slot whose
+        # copy is not yet ordered before its consumer.
+        if ready_event is not None:
+            wait_start = perf_counter() if collect_profile else 0.0
+            self._wait_transfer_event(ready_event)
+            if collect_profile:
+                ready_wait_ms = (perf_counter() - wait_start) * 1000.0
+                load_sync_ms += load_enqueue_ms + ready_wait_ms
+
         mapping_start = perf_counter() if collect_profile else 0.0
         active_slot_ids_tuple = tuple(active_slot_ids)
         log2phy_update_experts, log2phy_update_slots = (
@@ -1578,12 +1588,6 @@ class MoeOffloadRuntime:
         )  # log2phy updated in-place above; always valid on this path
         self._active_slot_ids_by_layer[layer_id] = active_slot_ids_tuple
         mapping_ms = (perf_counter() - mapping_start) * 1000.0 if collect_profile else 0.0
-        if ready_event is not None:
-            wait_start = perf_counter() if collect_profile else 0.0
-            self._wait_transfer_event(ready_event)
-            if collect_profile:
-                ready_wait_ms = (perf_counter() - wait_start) * 1000.0
-                load_sync_ms += load_enqueue_ms + ready_wait_ms
         if collect_profile:
             if _n_misses <= 0:
                 stage_mode = "main_slot_hit"
@@ -2083,6 +2087,15 @@ class MoeOffloadRuntime:
         if ready_event is None:
             return
         import torch
+
+        install_dependency = getattr(
+            ready_event,
+            "install_consumer_dependency",
+            None,
+        )
+        if callable(install_dependency):
+            install_dependency(torch.npu.current_stream())
+            return
 
         event = getattr(ready_event, "event", ready_event)
         has_ready_handle = hasattr(ready_event, "mark_ready")
