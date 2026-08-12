@@ -200,3 +200,10 @@ def test_locked_host_manager_uses_package_entrypoint() -> None:
     assert 'inherited_pythonpath = child_env.get("PYTHONPATH", "")' in source
     assert 'child_env.pop("VLLM_PLUGINS", None)' in source
     assert 'child_env["VLLM_PLUGINS"] = "ascend"' not in source
+
+
+def test_runner_preserves_preflight_failure_before_service_start() -> None:
+    runner_path = REPO_ROOT / "benchmark" / "scripts" / "run_suite.py"
+    source = runner_path.read_text(encoding="utf-8")
+
+    assert 'release_status not in {"released", "not-started"}' in source

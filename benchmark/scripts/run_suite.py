@@ -683,7 +683,9 @@ def run_unit(
     result["launcher_lifecycle_log"] = str(lifecycle_log_path)
     result["release_status"] = release_status
     result["release_ack"] = str(release_ack_path) if release_ack_path else ""
-    if manager is not None and release_status != "released":
+    # A preflight refusal (occupied port/device, invalid custody coordinates)
+    # never started a managed service, so preserve its original diagnostic.
+    if manager is not None and release_status not in {"released", "not-started"}:
         result["status"] = "failed"
         result["stage"] = "release"
         result["error_type"] = "ReleaseError"
