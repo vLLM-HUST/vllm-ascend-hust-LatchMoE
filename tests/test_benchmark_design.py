@@ -125,6 +125,18 @@ def test_sew_cases_release_original_expert_weights():
             ), case["name"]
 
 
+def test_issue17_matched_cases_differ_only_by_overflow_mode():
+    sew_bench = load_sew_bench()
+    config = sew_bench.load_config()
+    cases = {case["name"]: case for case in config["cases"]}
+    full = dict(cases["sew_14gb_full_layer_matched"]["env"])
+    wave = dict(cases["sew_14gb_multi_wave_matched"]["env"])
+
+    assert full.pop("VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE") == "full_layer"
+    assert wave.pop("VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE") == "multi_wave"
+    assert full == wave
+
+
 def test_render_plan_for_single_unit():
     sew_bench = load_sew_bench()
     config = sew_bench.load_config()

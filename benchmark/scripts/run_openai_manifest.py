@@ -280,8 +280,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
     wall_start = time.perf_counter()
     async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
-        tasks = [bounded(session, request, idx) for idx, request in enumerate(requests)]
-        for coro in asyncio.as_completed(tasks):
+        if args.concurrency == 1:
+            pending = (
+                bounded(session, request, idx)
+                for idx, request in enumerate(requests)
+            )
+        else:
+            tasks = [
+                bounded(session, request, idx)
+                for idx, request in enumerate(requests)
+            ]
+            pending = asyncio.as_completed(tasks)
+        for coro in pending:
             result = await coro
             idx = int(result["idx"])
             results[idx] = result

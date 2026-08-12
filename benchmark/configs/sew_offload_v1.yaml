@@ -250,6 +250,40 @@ cases:
       VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
       VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
       VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS: "1"
+  - name: sew_14gb_full_layer_matched
+    title: SEW-Offload, 14 GiB, matched full-layer Prefill
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e3_b2_prefill
+    description: Issue #17 matched Graph arm; identical to the multi-wave arm except for the explicit overflow mode.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE: "full_layer"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS: "1"
+  - name: sew_14gb_multi_wave_matched
+    title: SEW-Offload, 14 GiB, matched multi-wave Prefill
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups:
+      - e3_b2_prefill
+    description: Issue #17 matched Graph arm; identical to the full-layer arm except for the explicit overflow mode.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE: "multi_wave"
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS: "1"
   - name: sew_28gb_autoslots
     title: SEW-Offload, 28 GiB AutoConfig
     role: main
