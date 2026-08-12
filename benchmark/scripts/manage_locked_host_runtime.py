@@ -81,7 +81,7 @@ def _start(path: Path) -> dict:
     command = [
         str(python),
         "-m",
-        "vllm_moe_offload_ascend.launcher",
+        "vllm_moe_offload_ascend",
         "serve",
         model,
         "--served-model-name",

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 from argparse import Namespace
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import importlib.util
 
 import pytest
 
@@ -166,3 +166,11 @@ def test_wait_for_server_fails_fast_when_managed_process_dies() -> None:
             timeout_s=60,
             is_alive=lambda: False,
         )
+
+
+def test_locked_host_manager_uses_package_entrypoint() -> None:
+    manager_path = REPO_ROOT / "benchmark" / "scripts" / "manage_locked_host_runtime.py"
+    source = manager_path.read_text(encoding="utf-8")
+
+    assert '"vllm_moe_offload_ascend",' in source
+    assert '"vllm_moe_offload_ascend.launcher",' not in source
