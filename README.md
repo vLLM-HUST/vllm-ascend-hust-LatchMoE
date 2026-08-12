@@ -160,9 +160,9 @@ checkout 下表中的完整 commit：
 
 `feature/latchmoe-offload-seam-v1-v021` 是唯一的 LatchMoE seam 分支。
 `feature/latchmoe-offload-seam-v1` 对应另一条未经本项目正确性门禁验证的宿主
-主线，不应再用于安装。该分支仍承载打开的
-[`vllm-ascend-hust#214`](https://github.com/vLLM-HUST/vllm-ascend-hust/pull/214)，
-因此本次没有直接删除；应在 #214 合并或关闭后再删除该远端分支。
+主线，不应再用于安装。它承载的
+[`vllm-ascend-hust#214`](https://github.com/vLLM-HUST/vllm-ascend-hust/pull/214)
+已经关闭，远端 `feature/latchmoe-offload-seam-v1` 也已删除。
 
 完整机器可读锁位于
 [`vllm_moe_offload_ascend/compatibility.lock`](vllm_moe_offload_ascend/compatibility.lock)。
@@ -176,6 +176,25 @@ checkout 下表中的完整 commit：
 
 以下命令假设 CANN 9.0.1、Torch 2.10.0 和 Torch-NPU 2.10.0.post2 已由基础镜像或运维环境
 提供：
+
+推荐先 clone 本仓库，再用机器可读 lock 驱动安装。脚本会把两个宿主 checkout
+到固定 commit、补充 vLLM `v0.21.0` tag、始终调用当前 `sys.executable -m pip`、
+跳过与 LatchMoE seam 无关的自定义算子编译，并在最后执行环境检查：
+
+```bash
+git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
+cd vllm-ascend-hust-LatchMoE
+
+# 先检查将要执行的命令；不会 clone、checkout 或安装。
+python tools/install_locked_stack.py \
+  --workspace /path/to/latchmoe-stack --dry-run
+
+# 安装到当前 python；目标目录必须不存在或是 clean Git checkout。
+python tools/install_locked_stack.py \
+  --workspace /path/to/latchmoe-stack
+```
+
+需要手工安装时，等价步骤如下：
 
 ```bash
 # 1. 固定 vLLM-HUST
@@ -191,8 +210,10 @@ git clone --branch feature/latchmoe-offload-seam-v1-v021 \
 git -C vllm-ascend-hust checkout 4806367eeeb7d62b32078ae90cd929cc06d825fe
 
 # 3. 在同一解释器中安装两个宿主和 LatchMoE
-python -m pip install --no-deps --no-build-isolation -e ./vllm-hust
-python -m pip install --no-deps --no-build-isolation -e ./vllm-ascend-hust
+VLLM_TARGET_DEVICE=empty python -m pip install \
+  --no-deps --no-build-isolation -e ./vllm-hust
+COMPILE_CUSTOM_KERNELS=0 python -m pip install \
+  --no-deps --no-build-isolation -e ./vllm-ascend-hust
 
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 python -m pip install --no-deps --no-build-isolation \
@@ -202,6 +223,12 @@ python -m pip install --no-deps --no-build-isolation \
 额外 fetch `v0.21.0` tag 是必要的：HUST 仓库当前没有公开这一 tag，但固定的
 commit 与上游 `v0.21.0` 完全相同；setuptools-scm 需要该 tag 才会生成正确的
 `0.21.0` 包版本。
+
+`VLLM_TARGET_DEVICE=empty` 只关闭 vLLM-HUST 自身的 CUDA 构建；运行时 NPU
+platform 仍由 Ascend plugin 提供。`COMPILE_CUSTOM_KERNELS=0` 则避免安装 seam 时
+编译整套与 Qwen3/LatchMoE 无关的 Ascend 自定义算子。需要这些额外算子的其他
+模型应由基础 vLLM-Ascend 镜像单独提供，不能把它们的构建结果当作 LatchMoE
+安装是否成功的门禁。
 
 安装完成后无需复制源码、修改 `PYTHONPATH` 或手动调用 `register()`。vLLM 0.21.0
 会在 API、EngineCore 和 Worker 进程自动发现 `vllm.general_plugins`，并调用
