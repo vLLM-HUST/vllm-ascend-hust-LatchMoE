@@ -168,6 +168,29 @@ def test_wait_for_server_fails_fast_when_managed_process_dies() -> None:
         )
 
 
+def test_npu_sampler_writes_machine_readable_usage(tmp_path: Path, monkeypatch) -> None:
+    module = _load_run_suite()
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout="HBM Usage Rate(%) : 91\nNPU Utilization(%) : 27\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    stop = module.threading.Event()
+    stop.set()
+    output = tmp_path / "npu_samples.jsonl"
+
+    module._sample_npu_usage(5, output, stop, interval_s=0.0)
+
+    sample = json.loads(output.read_text())
+    assert sample["device"] == 5
+    assert sample["hbm_usage_percent"] == 91
+    assert sample["npu_utilization_percent"] == 27
+
+
 def test_locked_host_manager_uses_package_entrypoint() -> None:
     manager_path = REPO_ROOT / "benchmark" / "scripts" / "manage_locked_host_runtime.py"
     source = manager_path.read_text(encoding="utf-8")

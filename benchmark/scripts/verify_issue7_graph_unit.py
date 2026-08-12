@@ -49,7 +49,65 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_unit(unit_dir: Path, *, minimum_requests: int = 1) -> dict[str, Any]:
+def _request_outputs(benchmark: dict[str, Any]) -> dict[str, list[int]]:
+    outputs: dict[str, list[int]] = {}
+    for item in benchmark.get("per_request") or []:
+        request_id = str(item.get("request_id") or "")
+        token_ids = item.get("output_token_ids")
+        if not request_id or not isinstance(token_ids, list):
+            continue
+        if request_id in outputs:
+            raise ValueError(f"duplicate request_id in benchmark: {request_id}")
+        outputs[request_id] = [int(token_id) for token_id in token_ids]
+    return outputs
+
+
+def _verify_oracle(
+    benchmark: dict[str, Any], oracle_path: Path | None
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if oracle_path is None:
+        return None, []
+    failures: list[str] = []
+    if not oracle_path.is_file():
+        return None, [f"oracle benchmark does not exist: {oracle_path}"]
+    oracle = _read_json(oracle_path)
+    expected = _request_outputs(oracle)
+    observed = _request_outputs(benchmark)
+    if not expected:
+        failures.append("oracle benchmark has no request token arrays")
+    missing = sorted(set(expected) - set(observed))
+    mismatched = sorted(
+        request_id
+        for request_id in set(expected) & set(observed)
+        if expected[request_id] != observed[request_id]
+    )
+    if missing:
+        failures.append(f"oracle request IDs are missing: {missing}")
+    if mismatched:
+        failures.append(f"oracle token IDs differ: {mismatched}")
+    compared_tokens = sum(
+        len(expected[request_id])
+        for request_id in set(expected) & set(observed)
+        if expected[request_id] == observed[request_id]
+    )
+    return {
+        "path": str(oracle_path),
+        "sha256": _sha256(oracle_path),
+        "expected_requests": len(expected),
+        "compared_requests": len(set(expected) & set(observed)),
+        "exact_requests": len(set(expected) & set(observed)) - len(mismatched),
+        "exact_tokens": compared_tokens,
+        "missing_request_ids": missing,
+        "mismatched_request_ids": mismatched,
+    }, failures
+
+
+def verify_unit(
+    unit_dir: Path,
+    *,
+    minimum_requests: int = 1,
+    oracle_benchmark: Path | None = None,
+) -> dict[str, Any]:
     failures: list[str] = []
     required = {
         name: unit_dir / name
@@ -61,6 +119,7 @@ def verify_unit(unit_dir: Path, *, minimum_requests: int = 1) -> dict[str, Any]:
             "client.log",
             "launcher_lifecycle.log",
             "moe_profile.jsonl",
+            "npu_samples.jsonl",
         )
     }
     for name, path in required.items():
@@ -74,6 +133,7 @@ def verify_unit(unit_dir: Path, *, minimum_requests: int = 1) -> dict[str, Any]:
     benchmark = _read_json(required["benchmark.json"])
     server_log = required["server.log"].read_text(encoding="utf-8", errors="replace")
     records = _profile_records(required["moe_profile.jsonl"])
+    npu_samples = _profile_records(required["npu_samples.jsonl"])
     provenance = manifest.get("provenance") or {}
 
     if result.get("status") != "ok":
@@ -97,6 +157,8 @@ def verify_unit(unit_dir: Path, *, minimum_requests: int = 1) -> dict[str, Any]:
         )
     if int(benchmark.get("total_output_tokens") or 0) <= 0:
         failures.append("no output tokens were produced")
+    oracle_report, oracle_failures = _verify_oracle(benchmark, oracle_benchmark)
+    failures.extend(oracle_failures)
 
     graph_capture = "Graph capturing finished" in server_log
     graph_replay = bool(re.search(r"Replaying aclgraph", server_log))
@@ -183,6 +245,23 @@ def verify_unit(unit_dir: Path, *, minimum_requests: int = 1) -> dict[str, Any]:
         if int(summary.get("prefetch_after_compute_issues") or 0) != 0:
             failures.append("late after-compute H2D prefetch observed")
 
+    graph_replays = by_name.get("graph_replay_issue", [])
+    if not graph_replays:
+        failures.append("missing sampled graph replay timing")
+    if any(
+        (record.get("payload") or {}).get("synchronizes_npu") is not False
+        for record in graph_replays
+    ):
+        failures.append("graph replay timing introduced an NPU synchronization")
+
+    hbm_values = [
+        int(sample["hbm_usage_percent"])
+        for sample in npu_samples
+        if sample.get("hbm_usage_percent") is not None
+    ]
+    if not hbm_values:
+        failures.append("NPU HBM samples are missing")
+
     for key in (
         "repository_head_sha",
         "repository_parent_sha",
@@ -214,8 +293,15 @@ def verify_unit(unit_dir: Path, *, minimum_requests: int = 1) -> dict[str, Any]:
             "address_validation_layers": len(validation_by_layer),
             "h2d_decode_stages": len(h2d_stages),
             "b2_prefill_events": len(b2_events),
+            "graph_replay_samples": len(graph_replays),
+            "npu_samples": len(npu_samples),
+        },
+        "memory": {
+            "hbm_usage_peak_percent": max(hbm_values) if hbm_values else None,
+            "hbm_usage_final_percent": hbm_values[-1] if hbm_values else None,
         },
         "timing": timing_breakdown(records),
+        "oracle": oracle_report,
         "artifact_sha256": artifact_sha256,
     }
 
@@ -229,6 +315,7 @@ def timing_breakdown(records: list[dict[str, Any]]) -> dict[str, float | int]:
         "wave_prefill_compute_ms": 0.0,
         "wave_prefill_stage_issue_ms": 0.0,
         "wave_prefill_stage_wait_ms": 0.0,
+        "graph_replay_issue_ms": 0.0,
     }
     for record in records:
         payload = record.get("payload") or {}
@@ -244,6 +331,10 @@ def timing_breakdown(records: list[dict[str, Any]]) -> dict[str, float | int]:
             totals["wave_prefill_compute_ms"] += float(summary.get("mlp_ms") or 0.0)
             totals["wave_prefill_stage_issue_ms"] += float(summary.get("stage_issue_ms") or 0.0)
             totals["wave_prefill_stage_wait_ms"] += float(summary.get("stage_wait_ms") or 0.0)
+        if record.get("name") == "graph_replay_issue":
+            totals["graph_replay_issue_ms"] += (
+                float(record.get("seconds") or 0.0) * 1000.0 * sample_rate
+            )
     return {
         key: int(value) if key == "h2d_bytes" else round(float(value), 3)
         for key, value in totals.items()
@@ -254,9 +345,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit-dir", required=True)
     parser.add_argument("--minimum-requests", type=int, default=1)
+    parser.add_argument(
+        "--oracle-benchmark",
+        help=(
+            "Fail unless every request/token array in this benchmark is present "
+            "and exactly equal in the candidate unit."
+        ),
+    )
     args = parser.parse_args()
     unit_dir = Path(args.unit_dir)
-    report = verify_unit(unit_dir, minimum_requests=args.minimum_requests)
+    report = verify_unit(
+        unit_dir,
+        minimum_requests=args.minimum_requests,
+        oracle_benchmark=(
+            Path(args.oracle_benchmark).resolve() if args.oracle_benchmark else None
+        ),
+    )
     report_path = unit_dir / "graph_correctness.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     marker = unit_dir / ("PASSED.txt" if report["status"] == "passed" else "FAILED.txt")

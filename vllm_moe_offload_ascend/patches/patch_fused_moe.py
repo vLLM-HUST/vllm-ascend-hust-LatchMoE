@@ -22,6 +22,7 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from time import perf_counter
 from typing import Any
 
 
@@ -619,6 +620,74 @@ def _install_runtime_module_patches() -> None:
             print(f"SEW_PATCH token_dispatcher_hook_failed: {exc!r}", flush=True)
 
     _patch_kv_cache_capacity_backstop()
+    _patch_aclgraph_replay_profile()
+
+
+def _patch_aclgraph_replay_profile() -> None:
+    """Sample graph replay issue latency without synchronizing the NPU stream."""
+
+    try:
+        from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+        from vllm_ascend.ascend_forward_context import get_forward_context
+    except Exception:
+        return
+    current = ACLGraphWrapper.__call__
+    if getattr(current, "_latchmoe_replay_profile_patch", False):
+        return
+    original = current
+
+    def _profiled_call(self, *args, **kwargs):
+        context = get_forward_context()
+        runtime_mode = getattr(context, "cudagraph_runtime_mode", None)
+        batch_descriptor = getattr(context, "batch_descriptor", None)
+        entry = getattr(self, "concrete_aclgraph_entries", {}).get(batch_descriptor)
+        is_replay = bool(
+            runtime_mode is not None
+            and runtime_mode == getattr(self, "runtime_mode", None)
+            and entry is not None
+            and getattr(entry, "aclgraph", None) is not None
+        )
+        if not is_replay:
+            return original(self, *args, **kwargs)
+
+        counter = int(getattr(self, "_latchmoe_replay_calls", 0)) + 1
+        self._latchmoe_replay_calls = counter
+        try:
+            sample_rate = max(
+                1,
+                int(
+                    os.getenv(
+                        "VLLM_ASCEND_MOE_GRAPH_REPLAY_PROFILE_SAMPLE_RATE",
+                        "1024",
+                    )
+                ),
+            )
+        except ValueError:
+            sample_rate = 1024
+        sampled = counter == 1 or counter % sample_rate == 0
+        start = perf_counter() if sampled else 0.0
+        output = original(self, *args, **kwargs)
+        if sampled:
+            from vllm_moe_offload_ascend.moe_offload.runtime import (
+                get_moe_offload_runtime,
+            )
+
+            get_moe_offload_runtime()._record_profile_event(
+                "graph_replay_issue",
+                layer_id=None,
+                start=start,
+                payload={
+                    "profile_sample_rate": 1 if counter == 1 else sample_rate,
+                    "replay_call_index": counter,
+                    "runtime_mode": str(runtime_mode),
+                    "synchronizes_npu": False,
+                },
+            )
+        return output
+
+    _profiled_call._latchmoe_replay_profile_patch = True
+    _profiled_call.__wrapped__ = original
+    ACLGraphWrapper.__call__ = _profiled_call
 
 
 def _to_bool_env(name: str, default: str) -> bool:

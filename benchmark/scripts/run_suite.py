@@ -12,6 +12,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -280,6 +281,47 @@ def _assert_device_free(device: int) -> None:
         raise RuntimeError(f"NPU{device} is occupied; refusing to continue")
 
 
+def _sample_npu_usage(
+    device: int,
+    output_path: Path,
+    stop_event: threading.Event,
+    interval_s: float = 2.0,
+) -> None:
+    """Persist bounded-rate physical-device HBM/utilization samples."""
+
+    hbm_pattern = re.compile(r"HBM Usage Rate\(%\)\s*:\s*(\d+)")
+    utilization_pattern = re.compile(r"NPU Utilization\(%\)\s*:\s*(\d+)")
+    with output_path.open("a", encoding="utf-8") as handle:
+        while True:
+            completed = subprocess.run(
+                ["npu-smi", "info", "-t", "usages", "-i", str(device), "-c", "0"],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            hbm = hbm_pattern.search(completed.stdout)
+            utilization = utilization_pattern.search(completed.stdout)
+            handle.write(
+                json.dumps(
+                    {
+                        "timestamp_ns": time.time_ns(),
+                        "device": int(device),
+                        "returncode": int(completed.returncode),
+                        "hbm_usage_percent": int(hbm.group(1)) if hbm else None,
+                        "npu_utilization_percent": (
+                            int(utilization.group(1)) if utilization else None
+                        ),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            handle.flush()
+            if stop_event.wait(interval_s):
+                break
+
+
 def _managed_env(
     config: dict[str, Any],
     case: dict[str, Any],
@@ -497,6 +539,8 @@ def run_unit(
     managed_env: dict[str, str] | None = None
     release_status = "not-started"
     release_ack_path: Path | None = None
+    sample_stop = threading.Event()
+    sample_thread: threading.Thread | None = None
     result: dict[str, Any]
     try:
         if not args.no_start_server:
@@ -513,6 +557,12 @@ def run_unit(
                     raise RuntimeError("custody unit is active; refusing server reuse")
             _manager_call(manager, "start", managed_env, lifecycle_log_path, check=True)
             release_status = "started"
+            sample_thread = threading.Thread(
+                target=_sample_npu_usage,
+                args=(int(args.device), unit_dir / "npu_samples.jsonl", sample_stop),
+                daemon=True,
+            )
+            sample_thread.start()
             timeout_s = (
                 float(args.startup_timeout_s)
                 if args.startup_timeout_s is not None
@@ -607,6 +657,18 @@ def run_unit(
                         "status": release_status,
                     },
                 )
+        if sample_thread is not None:
+            sample_stop.set()
+            sample_thread.join(timeout=10.0)
+            # Capture a post-release sample in the same raw artifact.
+            final_stop = threading.Event()
+            final_stop.set()
+            _sample_npu_usage(
+                int(args.device),
+                unit_dir / "npu_samples.jsonl",
+                final_stop,
+                interval_s=0.0,
+            )
     result["launcher_lifecycle_log"] = str(lifecycle_log_path)
     result["release_status"] = release_status
     result["release_ack"] = str(release_ack_path) if release_ack_path else ""

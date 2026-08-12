@@ -54,6 +54,7 @@ def main() -> int:
         ],
     ]
     bundle_results = []
+    repeat_oracle: Path | None = None
     for stage_name, workload, requests in stages:
         stage_root = output_root / stage_name
         before = {path for path in stage_root.glob("sew-offload-ascend-v1-*")}
@@ -108,15 +109,23 @@ def main() -> int:
                 encoding="utf-8",
             )
             return completed.returncode
+        verify_command = [
+            str(args.python),
+            str(VERIFY),
+            "--unit-dir",
+            str(unit_dir),
+            "--minimum-requests",
+            str(requests),
+        ]
+        if stage_name == "repeat-1":
+            short = next(item for item in bundle_results if item["stage"] == "short-gate")
+            verify_command.extend(
+                ["--oracle-benchmark", str(Path(short["unit_dir"]) / "benchmark.json")]
+            )
+        elif stage_name.startswith("repeat-") and repeat_oracle is not None:
+            verify_command.extend(["--oracle-benchmark", str(repeat_oracle)])
         verified = subprocess.run(
-            [
-                str(args.python),
-                str(VERIFY),
-                "--unit-dir",
-                str(unit_dir),
-                "--minimum-requests",
-                str(requests),
-            ],
+            verify_command,
             cwd=REPO_ROOT,
             check=False,
         )
@@ -138,6 +147,8 @@ def main() -> int:
         )
         if verified.returncode != 0:
             return verified.returncode
+        if stage_name == "repeat-1":
+            repeat_oracle = unit_dir / "benchmark.json"
 
     repeat_units = [item for item in bundle_results if item["stage"].startswith("repeat-")]
     if len(repeat_units) != 3 or any(

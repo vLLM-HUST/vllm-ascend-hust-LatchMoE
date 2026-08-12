@@ -87,6 +87,7 @@ def _profile_summary(path: str | Path) -> dict[str, Any]:
         "wave_prefill_compute_ms_total": 0.0,
         "wave_prefill_stage_issue_ms_total": 0.0,
         "wave_prefill_stage_wait_ms_total": 0.0,
+        "graph_replay_issue_ms_total": 0.0,
         "max_active_experts": 0,
         "max_wave_count": 0,
         "b2_events": 0,
@@ -160,6 +161,10 @@ def _profile_summary(path: str | Path) -> dict[str, Any]:
             summary["wave_prefill_stage_wait_ms_total"] += float(
                 wave_summary.get("stage_wait_ms") or 0.0
             )
+            if name == "graph_replay_issue":
+                summary["graph_replay_issue_ms_total"] += (
+                    float(record.get("seconds") or 0.0) * 1000.0 * sample_rate
+                )
 
     summary["h2d_gib_total"] = h2d_bytes_total / BYTES_PER_GIB
     summary["stage_ms_total"] = stage_ms_total

@@ -47,7 +47,14 @@ def _valid_unit(tmp_path: Path) -> Path:
     )
     _write_json(
         unit / "benchmark.json",
-        {"successful_requests": 1, "failed_requests": 0, "total_output_tokens": 8},
+        {
+            "successful_requests": 1,
+            "failed_requests": 0,
+            "total_output_tokens": 2,
+            "per_request": [
+                {"request_id": "request-1", "output_token_ids": [101, 102]}
+            ],
+        },
     )
     (unit / "server.log").write_text(
         "\n".join(
@@ -101,9 +108,27 @@ def _valid_unit(tmp_path: Path) -> Path:
                 "wave_summary": {"wave_count": 1, "prefetch_after_compute_issues": 0},
             },
         },
+        {
+            "name": "graph_replay_issue",
+            "layer_id": None,
+            "seconds": 0.001,
+            "payload": {"profile_sample_rate": 1, "synchronizes_npu": False},
+        },
     ]
     (unit / "moe_profile.jsonl").write_text(
         "".join(json.dumps(record) + "\n" for record in profile),
+        encoding="utf-8",
+    )
+    (unit / "npu_samples.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp_ns": 1,
+                "device": 5,
+                "hbm_usage_percent": 91,
+                "npu_utilization_percent": 20,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     return unit
@@ -146,7 +171,7 @@ def test_issue7_verifier_fails_closed_without_release_ack(tmp_path: Path) -> Non
 def test_issue7_verifier_fails_closed_on_over_capacity_wave(tmp_path: Path) -> None:
     unit = _valid_unit(tmp_path)
     records = [json.loads(line) for line in (unit / "moe_profile.jsonl").read_text().splitlines()]
-    records[-1]["payload"]["wave_plan"]["waves"][0]["experts"] = [1, 2, 3]
+    records[-2]["payload"]["wave_plan"]["waves"][0]["experts"] = [1, 2, 3]
     (unit / "moe_profile.jsonl").write_text(
         "".join(json.dumps(record) + "\n" for record in records),
         encoding="utf-8",
@@ -156,3 +181,41 @@ def test_issue7_verifier_fails_closed_on_over_capacity_wave(tmp_path: Path) -> N
 
     assert report["status"] == "failed"
     assert "wave active working set exceeds slot capacity" in report["failures"]
+
+
+def test_issue7_verifier_requires_exact_oracle_tokens(tmp_path: Path) -> None:
+    unit = _valid_unit(tmp_path)
+    oracle = tmp_path / "oracle.json"
+    _write_json(
+        oracle,
+        {
+            "per_request": [
+                {"request_id": "request-1", "output_token_ids": [101, 999]}
+            ]
+        },
+    )
+
+    report = _load_verifier().verify_unit(unit, oracle_benchmark=oracle)
+
+    assert report["status"] == "failed"
+    assert report["oracle"]["mismatched_request_ids"] == ["request-1"]
+    assert "oracle token IDs differ: ['request-1']" in report["failures"]
+
+
+def test_issue7_verifier_accepts_oracle_subset(tmp_path: Path) -> None:
+    unit = _valid_unit(tmp_path)
+    oracle = tmp_path / "oracle.json"
+    _write_json(
+        oracle,
+        {
+            "per_request": [
+                {"request_id": "request-1", "output_token_ids": [101, 102]}
+            ]
+        },
+    )
+
+    report = _load_verifier().verify_unit(unit, oracle_benchmark=oracle)
+
+    assert report["status"] == "passed"
+    assert report["oracle"]["exact_requests"] == 1
+    assert report["oracle"]["exact_tokens"] == 2
