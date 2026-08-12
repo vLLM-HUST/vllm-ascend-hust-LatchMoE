@@ -21,6 +21,10 @@ def test_register_compat_only_skips_moe_runtime_patches(monkeypatch):
     from vllm_moe_offload_ascend.patches import patch_fused_moe
 
     events = []
+    monkeypatch.setattr(
+        "vllm_moe_offload_ascend.env_registry.register_environment_variables",
+        lambda: events.append("envs"),
+    )
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_COMPAT_ONLY", "1")
     monkeypatch.setattr(
         patch_fused_moe,
@@ -35,7 +39,7 @@ def test_register_compat_only_skips_moe_runtime_patches(monkeypatch):
 
     vllm_moe_offload_ascend.register()
 
-    assert events == ["compat"]
+    assert events == ["envs", "compat"]
 
 
 def test_runtime_patch_install_waits_for_ascend_device_op(monkeypatch):
@@ -45,7 +49,7 @@ def test_runtime_patch_install_waits_for_ascend_device_op(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
     monkeypatch.setattr(
         patch_fused_moe,
-        "_inject_sys_modules",
+        "_register_plugin_ops",
         lambda: pytest.fail("must not import Ascend ops during device-op initialization"),
     )
     monkeypatch.setattr(
@@ -79,8 +83,8 @@ def test_runtime_patch_install_registers_custom_ops_before_moe_modules(monkeypat
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(
         patch_fused_moe,
-        "_inject_sys_modules",
-        lambda: events.append("inject_sys_modules"),
+        "_register_plugin_ops",
+        lambda: events.append("register_plugin_ops"),
     )
     monkeypatch.setattr(
         patch_fused_moe,
@@ -98,7 +102,7 @@ def test_runtime_patch_install_registers_custom_ops_before_moe_modules(monkeypat
     assert events == [
         "register_custom_ops",
         "patch_rms_norm_bias_cann_compat",
-        "inject_sys_modules",
+        "register_plugin_ops",
         "install_runtime_module_patches",
     ]
 
@@ -129,8 +133,8 @@ def test_cann_compat_install_does_not_install_moe_runtime(monkeypatch):
     )
     monkeypatch.setattr(
         patch_fused_moe,
-        "_inject_sys_modules",
-        lambda: pytest.fail("compat-only mode must not alias MoE modules"),
+        "_register_plugin_ops",
+        lambda: pytest.fail("compat-only mode must not register MoE ops"),
     )
     monkeypatch.setattr(
         patch_fused_moe,
@@ -540,7 +544,12 @@ def test_kv_backstop_fails_after_resolved_blocks_if_one_request_cannot_fit(monke
         nonlocal called
         called = True
 
-    monkeypatch.setattr(kv_utils, "_report_kv_cache_config", original_report)
+    monkeypatch.setattr(
+        kv_utils,
+        "_report_kv_cache_config",
+        original_report,
+        raising=False,
+    )
     monkeypatch.setattr(
         kv_utils,
         "get_max_concurrency_for_kv_cache_config",
@@ -882,34 +891,25 @@ def test_estimate_b2_wave_h2d_bytes_falls_back_without_cache():
     assert runtime.calls == [(7, 1), (7, 3)]
 
 
-def test_register_aliases_plugin_modules_under_vllm_ascend_namespace(monkeypatch):
+def test_register_does_not_alias_plugin_modules_into_vllm_ascend(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14")
 
     vllm_moe_offload_ascend.register()
 
-    import vllm_ascend
-    import vllm_moe_offload_ascend.moe_offload as plugin_pkg
-    import vllm_moe_offload_ascend.moe_offload.prefill_residency as prefill_residency
-    from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
+    assert "vllm_ascend.moe_offload" not in sys.modules
+    assert all(
+        not name.startswith("vllm_ascend.moe_offload.") for name in sys.modules
+    )
 
-    assert sys.modules["vllm_ascend.moe_offload"] is plugin_pkg
-    assert sys.modules["vllm_ascend.moe_offload.prefill_residency"] is prefill_residency
-    assert vllm_ascend.moe_offload is plugin_pkg
-    assert get_moe_offload_runtime.__module__ == "vllm_moe_offload_ascend.moe_offload.runtime"
 
-def test_register_aliases_sew_custom_op_modules(monkeypatch):
+def test_register_imports_plugin_owned_sew_custom_ops(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14")
 
     vllm_moe_offload_ascend.register()
 
-    import vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op as stage_op
-    import vllm_moe_offload_ascend.ops.fused_moe.moe_router_op as router_op
-    import vllm_ascend.ops.fused_moe as ascend_fused_moe
-
-    assert sys.modules["vllm_ascend.ops.fused_moe.moe_offload_stage_op"] is stage_op
-    assert sys.modules["vllm_ascend.ops.fused_moe.moe_router_op"] is router_op
-    assert ascend_fused_moe.moe_offload_stage_op is stage_op
-    assert ascend_fused_moe.moe_router_op is router_op
+    assert "vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op" in sys.modules
+    assert "vllm_moe_offload_ascend.ops.fused_moe.moe_router_op" in sys.modules
+    assert "vllm_ascend.ops.fused_moe.moe_offload_stage_op" not in sys.modules
 
 
 def test_register_rebinds_already_imported_hook_globals(monkeypatch):
@@ -976,7 +976,7 @@ def test_seam_forward_prefill_resident_uses_native_fused_moe(monkeypatch):
 
     runtime = FakeRuntime()
     vllm_moe_offload_ascend.register()
-    import vllm_ascend.moe_offload.runtime as runtime_mod
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
 
     monkeypatch.setattr(patch_fused_moe, "_current_forward_is_prefill", lambda: True)
     monkeypatch.setattr(
@@ -1092,7 +1092,7 @@ def test_seam_forward_compares_native_layer_boundary_without_changing_result(
         )
     )
     vllm_moe_offload_ascend.register()
-    import vllm_ascend.moe_offload.runtime as runtime_mod
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
 
     monkeypatch.setattr(
         runtime_mod,
@@ -1773,7 +1773,7 @@ def test_seam_guard_returns_false_when_layer_has_no_layer_id(monkeypatch):
     runner.layer_name = "model.layers.0.mlp.experts"
     runner._seam_active = None
 
-    import vllm_ascend.moe_offload.runtime as runtime_mod
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
     from vllm_moe_offload_ascend.moe_offload.config import MoeOffloadConfig
     from vllm_moe_offload_ascend.moe_offload.runtime import MoeOffloadRuntime
     monkeypatch.setattr(

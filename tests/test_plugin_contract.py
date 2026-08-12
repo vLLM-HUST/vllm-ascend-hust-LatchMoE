@@ -8,13 +8,13 @@ import vllm_moe_offload_ascend as plugin
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-def test_platform_plugin_entry_point_is_declared() -> None:
+def test_general_plugin_entry_point_is_declared() -> None:
     config = (REPO_ROOT / "pyproject.toml").read_text()
 
     assert '[project.scripts]' in config
     assert 'latchmoe = "vllm_moe_offload_ascend.launcher:main"' in config
-    assert '[project.entry-points."vllm.platform_plugins"]' in config
     assert '[project.entry-points."vllm.general_plugins"]' in config
+    assert '[project.entry-points."vllm.platform_plugins"]' not in config
     assert (
         'moe_offload_ascend = "vllm_moe_offload_ascend:register"' in config
     )
@@ -28,7 +28,7 @@ def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
     assert manifest["schema_version"] == 1
     assert manifest["id"] == "latchmoe"
     assert manifest["entrypoint"] == {
-        "group": "vllm.platform_plugins",
+        "group": "vllm.general_plugins",
         "name": "moe_offload_ascend",
     }
     assert manifest["parameters"]["offload_gb"]["default"] == "14"
@@ -43,6 +43,10 @@ def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
 def test_register_retries_idempotent_patch_path(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
+        "vllm_moe_offload_ascend.env_registry.register_environment_variables",
+        lambda: calls.append("envs"),
+    )
+    monkeypatch.setattr(
         "vllm_moe_offload_ascend.patches.patch_fused_moe.apply_patches",
         lambda: calls.append("patched"),
     )
@@ -50,11 +54,15 @@ def test_register_retries_idempotent_patch_path(monkeypatch) -> None:
     plugin.register()
     plugin.register()
 
-    assert calls == ["patched", "patched"]
+    assert calls == ["envs", "patched", "envs", "patched"]
 
 
 def test_failed_registration_can_be_retried(monkeypatch) -> None:
     calls: list[str] = []
+    monkeypatch.setattr(
+        "vllm_moe_offload_ascend.env_registry.register_environment_variables",
+        lambda: calls.append("envs"),
+    )
 
     def fail() -> None:
         calls.append("failed")
@@ -78,4 +86,4 @@ def test_failed_registration_can_be_retried(monkeypatch) -> None:
     )
     plugin.register()
 
-    assert calls == ["failed", "retried"]
+    assert calls == ["envs", "failed", "envs", "retried"]

@@ -725,6 +725,24 @@ def _raise_on_sew_native_offload_conflict(engine_args: Any) -> None:
         )
 
 
+def _set_sew_piecewise_default(engine_args: Any) -> None:
+    """Select PIECEWISE graphs when SEW is enabled and no mode was requested."""
+
+    compilation_config = getattr(engine_args, "compilation_config", None)
+    if compilation_config is None:
+        return
+    if isinstance(compilation_config, dict):
+        if compilation_config.get("cudagraph_mode") is None:
+            compilation_config["cudagraph_mode"] = "PIECEWISE"
+        return
+    if getattr(compilation_config, "cudagraph_mode", None) is not None:
+        return
+
+    from vllm.config import CUDAGraphMode
+
+    compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+
 def apply_moe_offload_defaults(engine_args: Any) -> bool:
     target_offload_gb = get_moe_offload_gb()
     if target_offload_gb <= 0:
@@ -746,6 +764,8 @@ def apply_moe_offload_defaults(engine_args: Any) -> bool:
             os.environ.setdefault(env_name, value)
     _raise_on_layered_release_conflict()
     _raise_on_sew_native_offload_conflict(engine_args)
+    if sew_dataplane:
+        _set_sew_piecewise_default(engine_args)
     model_config = _load_model_config_dict(engine_args)
     prefetch_defaults = derive_prefetch_defaults(
         target_offload_gb,

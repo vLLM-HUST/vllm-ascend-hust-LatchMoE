@@ -13,20 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""Monkey-patches that restore MoE Offloading hooks into vllm-ascend.
-
-Called once by vllm_moe_offload_ascend.register() at plugin load time.
-
-Strategy (two-step):
-  1. sys.modules injection  – insert every plugin submodule under
-     ``vllm_ascend.moe_offload.*`` so that *both* top-level imports
-     (already resolved at module-import time) and lazy ``from … import``
-     statements inside function bodies resolve to the plugin's
-     implementations rather than hitting the empty placeholder directory.
-  2. Module-global rebind – for modules that were already imported before
-     the plugin registered, replace the name binding that was captured at
-     module import time (the null stub) with the real function/class.
-"""
+"""Install LatchMoE implementations on vLLM-Ascend's explicit hook seam."""
 
 from __future__ import annotations
 
@@ -45,83 +32,19 @@ def _ascend_device_op_is_initializing() -> bool:
     return module is not None and not hasattr(module, "DeviceOperator")
 
 
-# ---------------------------------------------------------------------------
-# Step 1 – sys.modules injection
-# ---------------------------------------------------------------------------
-
-def _inject_sys_modules() -> None:
-    """Map every plugin moe_offload submodule to vllm_ascend.moe_offload.*."""
+def _register_plugin_ops() -> None:
+    """Import the plugin-owned custom ops without aliasing host namespaces."""
     import importlib
 
-    import vllm_ascend
-    import vllm_moe_offload_ascend.moe_offload as _plugin_pkg
-
-    # vllm-ascend's hook branch intentionally has no real
-    # vllm_ascend.moe_offload package.  Provide the parent alias explicitly so
-    # both "from vllm_ascend.moe_offload.foo import ..." and parent-package
-    # attribute lookups resolve to this plugin package.
-    sys.modules["vllm_ascend.moe_offload"] = _plugin_pkg
-    setattr(vllm_ascend, "moe_offload", _plugin_pkg)
-
-    # Submodules provided by the plugin that must shadow the empty
-    # vllm_ascend/moe_offload/ placeholder directory.
-    _PLUGIN_SUBMODULES = [
-        "autoconfig_advisor",
-        "autoconfig",
-        "compute_bucket",
-        "config",
-        "cpu_first_loader",
-        "expert_key",
-        "expert_weight_release",
-        "host_store",
-        "layered_strategy",
-        "layout",
-        "phase_split",
-        "pipeline",
-        "policy",
-        "prefill_residency",
-        "runtime",
-        "slot_bank",
-        "slot_mapping",
-        "slot_simulator",
-        "tiered_residency",
-        "trace_collector",
-        "transfer_engine",
-    ]
-
-    for name in _PLUGIN_SUBMODULES:
-        plugin_path = f"vllm_moe_offload_ascend.moe_offload.{name}"
-        ascend_path = f"vllm_ascend.moe_offload.{name}"
-        try:
-            mod = importlib.import_module(plugin_path)
-        except ImportError:
-            continue  # optional submodule not present in this plugin version
-        sys.modules[ascend_path] = mod
-        setattr(_plugin_pkg, name, mod)
-
-    try:
-        _ascend_ops_pkg = importlib.import_module("vllm_ascend.ops")
-        setattr(vllm_ascend, "ops", _ascend_ops_pkg)
-        _ascend_fused_moe_pkg = importlib.import_module(
-            "vllm_ascend.ops.fused_moe"
+    for name in (
+        "moe_offload_stage_op",
+        "moe_router_op",
+        "moe_mlp_op",
+        "moe_seam_inject",
+    ):
+        importlib.import_module(
+            f"vllm_moe_offload_ascend.ops.fused_moe.{name}"
         )
-        import vllm_moe_offload_ascend.ops.fused_moe as _plugin_ops_pkg
-
-        _OPS_SUBMODULES = [
-            "moe_offload_stage_op",
-            "moe_router_op",
-            "moe_mlp_op",
-            "moe_seam_inject",
-        ]
-        for name in _OPS_SUBMODULES:
-            plugin_path = f"vllm_moe_offload_ascend.ops.fused_moe.{name}"
-            ascend_path = f"vllm_ascend.ops.fused_moe.{name}"
-            mod = importlib.import_module(plugin_path)
-            sys.modules[ascend_path] = mod
-            setattr(_ascend_fused_moe_pkg, name, mod)
-            setattr(_plugin_ops_pkg, name, mod)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -592,11 +515,6 @@ def apply_patches() -> None:
     # 0. Eagerly write env defaults so spawned worker processes see them.
     _apply_env_defaults_from_gb()
 
-    # vllm_moe_offload_ascend.moe_offload.config/runtime read values from
-    # vllm_ascend.envs lazily.  Install the plugin env contract before those
-    # modules are imported or aliased below.
-    _patch_ascend_envs()
-
     _patch_adapt_patch_reinstall()
     _install_runtime_patches_when_ready()
 
@@ -610,9 +528,9 @@ def apply_patches() -> None:
 
 
 def _install_runtime_patches_when_ready() -> bool:
-    """Install op aliases and runtime patches after device-op initialization.
+    """Register plugin ops and runtime adapters after device-op initialization.
 
-    Platform plugin discovery can call ``register()`` while
+    General plugin discovery can call ``register()`` while
     ``vllm_ascend.device.device_op`` is still importing. Importing
     ``vllm_ascend.ops`` in that window leaves its package cached without the
     custom-op registrations that its own cycle guard skipped. NPUWorker calls
@@ -630,7 +548,7 @@ def _install_runtime_patches_when_ready() -> bool:
 
     importlib.import_module("vllm_ascend.ops.register_custom_ops")
     _patch_rms_norm_bias_cann_compat()
-    _inject_sys_modules()
+    _register_plugin_ops()
     _install_runtime_module_patches()
     return True
 
@@ -965,102 +883,6 @@ def _summarize_b2_wave_profiles(
     return summary
 
 
-def _patch_ascend_envs() -> None:
-    """Install MoE-offload env vars on vllm_ascend.envs when hooks omit them."""
-    try:
-        import vllm_ascend.envs as _envs
-    except Exception:
-        return
-
-    env_variables = getattr(_envs, "env_variables", None)
-    if not isinstance(env_variables, dict):
-        return
-
-    additions: dict[str, Callable[[], Any]] = {
-        "VLLM_ASCEND_MOE_OFFLOAD_GB": lambda: float(os.getenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "0")),
-        "VLLM_ASCEND_MOE_OFFLOAD_ENABLED": lambda: _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_ENABLED", "0"),
-        "VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY": lambda: _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_TRACE_ONLY", "0"),
-        "VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS": lambda: int(os.getenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "0")),
-        "VLLM_ASCEND_MOE_OFFLOAD_POLICY": lambda: os.getenv("VLLM_ASCEND_MOE_OFFLOAD_POLICY", "deadline"),
-        "VLLM_ASCEND_MOE_OFFLOAD_MAX_PHASES": lambda: int(os.getenv("VLLM_ASCEND_MOE_OFFLOAD_MAX_PHASES", "2")),
-        "VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD": lambda: _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD", "0"),
-        "VLLM_ASCEND_MOE_OFFLOAD_TRACE_MAX_RECORDS": lambda: int(
-            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_TRACE_MAX_RECORDS", "4096")
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH": lambda: os.getenv("VLLM_ASCEND_MOE_OFFLOAD_TRACE_PATH", ""),
-        "VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS", ""
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME", "1"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD": lambda: int(
-            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD", "0")
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_PHASE_SPLIT": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_PHASE_SPLIT", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE", "full_layer"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY": lambda: (
-            None
-            if "VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY" not in os.environ
-            else _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY", "0")
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE", "1"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH": lambda: int(
-            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH", "1")
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT": lambda: int(
-            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT", "2")
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0"
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": lambda: int(
-            os.getenv("VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT", "0")
-        ),
-        "VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH", ""
-        ),
-        "VLLM_ASCEND_MOE_COMPUTE_BUCKET_PLAN_PATH": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_COMPUTE_BUCKET_PLAN_PATH", ""
-        ),
-        "VLLM_ASCEND_MOE_GMM_TRACE_PATH": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_GMM_TRACE_PATH", ""
-        ),
-        "VLLM_ASCEND_MOE_GMM_PROFILE_PATH": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_GMM_PROFILE_PATH", ""
-        ),
-        "VLLM_ASCEND_MOE_GMM_BUCKET_PLAN_PATH": lambda: os.getenv(
-            "VLLM_ASCEND_MOE_GMM_BUCKET_PLAN_PATH", ""
-        ),
-        "VLLM_ASCEND_MOE_PIPELINE_PROFILING": lambda: _to_bool_env(
-            "VLLM_ASCEND_MOE_PIPELINE_PROFILING", "0"
-        ),
-    }
-    for name, loader in additions.items():
-        env_variables[name] = loader
-
-
 def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
     cls = getattr(_comm, "MoECommMethod", None)
     if cls is None:
@@ -1233,7 +1055,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         return original_maybe_apply(self, fused_experts_input)
 
     def _maybe_run_b2_wave_prefill(self, fused_experts_input, before_dispatch_evt):
-        from vllm_ascend.moe_offload.phase_split import count_routed_tokens_by_expert
+        from vllm_moe_offload_ascend.moe_offload.phase_split import (
+            count_routed_tokens_by_expert,
+        )
 
         b2_control_start = perf_counter()
         offload = fused_experts_input.offload
@@ -1341,7 +1165,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         before_dispatch_evt,
         control_profile=None,
     ):
-        from vllm_ascend.moe_offload.phase_split import (
+        from vllm_moe_offload_ascend.moe_offload.phase_split import (
             count_routed_tokens_by_expert,
             direct_scatter_add_b2_permuted_outputs,
             plan_b2_prefill_async_schedule,
@@ -1488,7 +1312,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         pair_index_cache_hit = pair_offsets_by_expert is not None
         pair_index = None
         pair_index_start = perf_counter()
-        from vllm_ascend.moe_offload.phase_split import (
+        from vllm_moe_offload_ascend.moe_offload.phase_split import (
             build_b2_device_wave_microbatch_plans,
             build_b2_routed_pair_index,
             build_b2_wave_microbatch_plans,
@@ -2502,7 +2326,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         microbatch=None,
         use_wave_plan_physical_ids=False,
     ):
-        from vllm_ascend.moe_offload.phase_split import (
+        from vllm_moe_offload_ascend.moe_offload.phase_split import (
             B2DirectScatterPayload,
             build_b2_device_scatter_descriptor,
             build_b2_pair_microbatch,
@@ -2710,7 +2534,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         )
 
     def _run_b2_single_wave(self, *, fused_experts_input, prepared):
-        from vllm_ascend.moe_offload.phase_split import build_b2_wave_routing
+        from vllm_moe_offload_ascend.moe_offload.phase_split import (
+            build_b2_wave_routing,
+        )
 
         runtime = get_moe_offload_runtime()
         physical_topk_ids = prepared.log2phy[fused_experts_input.topk_ids]
@@ -3303,7 +3129,9 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         if not decision:
             return _native_moe_forward()
 
-        from vllm_ascend.moe_offload.runtime import get_moe_offload_runtime
+        from vllm_moe_offload_ascend.moe_offload.runtime import (
+            get_moe_offload_runtime,
+        )
         runtime = get_moe_offload_runtime()
         phase_int = _infer_forward_phase_int(int(hidden_states.shape[0]))
         from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
@@ -3520,7 +3348,7 @@ def _ensure_moe_offload_splitting_op(
 ) -> bool:
     """Put the eager staging seam in the final piecewise graph config.
 
-    Platform-plugin discovery can invoke ``register()`` while
+    General-plugin discovery can invoke ``register()`` while
     ``vllm_ascend.platform`` is only partially initialized. In that import
     order, installing the NPUPlatform wrapper is best-effort and may not take
     effect. This helper is also called at EngineArgs' final config boundary,

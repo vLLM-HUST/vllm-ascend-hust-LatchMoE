@@ -408,6 +408,62 @@ def test_apply_defaults_sew_dataplane_skips_native_prefetch(monkeypatch):
     assert engine_args._ascend_moe_offload_sew_dataplane is True
 
 
+def test_apply_defaults_sew_dataplane_selects_piecewise_graph(monkeypatch):
+    from vllm.config import CUDAGraphMode
+
+    monkeypatch.setenv(MOE_OFFLOAD_GB_ENV, "14")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE", "1")
+    engine_args = type(
+        "EngineArgsStub",
+        (),
+        {
+            "_ascend_moe_offload_model_config": QWEN3_MOE_CONFIG,
+            "offload_backend": "auto",
+            "offload_group_size": 0,
+            "offload_num_in_group": 1,
+            "offload_prefetch_step": 0,
+            "offload_params": set(),
+            "cpu_offload_gb": 0,
+            "cpu_offload_params": set(),
+            "compilation_config": type(
+                "CompilationConfigStub", (), {"cudagraph_mode": None}
+            )(),
+        },
+    )()
+
+    assert apply_moe_offload_defaults(engine_args) is True
+    assert engine_args.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
+def test_apply_defaults_sew_dataplane_preserves_explicit_graph_mode(monkeypatch):
+    from vllm.config import CUDAGraphMode
+
+    monkeypatch.setenv(MOE_OFFLOAD_GB_ENV, "14")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE", "1")
+    engine_args = type(
+        "EngineArgsStub",
+        (),
+        {
+            "_ascend_moe_offload_model_config": QWEN3_MOE_CONFIG,
+            "offload_backend": "auto",
+            "offload_group_size": 0,
+            "offload_num_in_group": 1,
+            "offload_prefetch_step": 0,
+            "offload_params": set(),
+            "cpu_offload_gb": 0,
+            "cpu_offload_params": set(),
+            "compilation_config": type(
+                "CompilationConfigStub",
+                (),
+                {"cudagraph_mode": CUDAGraphMode.FULL},
+            )(),
+        },
+    )()
+
+    assert apply_moe_offload_defaults(engine_args) is True
+    assert engine_args.compilation_config.cudagraph_mode is CUDAGraphMode.FULL
+
+
 def test_apply_defaults_sew_dataplane_preserves_release_override(monkeypatch):
     monkeypatch.setenv(MOE_OFFLOAD_GB_ENV, "14")
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE", "1")

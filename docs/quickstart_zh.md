@@ -23,41 +23,73 @@ latchmoe serve <model> [vLLM 参数...]
 ```
 
 统一入口会先检查当前 Python、vLLM、vLLM-Ascend、LatchMoE 插件入口和
-`VLLM_PLUGINS`，检查通过后才在同一个 Python 进程中启动 vLLM。这样可以避免
-激活虚拟环境后，裸 `vllm` 命令仍然由系统 Python 启动的问题。
+`VLLM_PLUGINS`，检查通过后才在同一个 Python 进程中启动 vLLM。LatchMoE 只
+注册为 `vllm.general_plugins`；`ascend` 仍是 `vllm.platform_plugins`。这样可以
+避免激活虚拟环境后，裸 `vllm` 命令仍然由系统 Python 启动的问题。
 
 ## 环境要求
 
 - Ascend 910B-class NPU，以及可用的 CANN 和 torch-npu 环境；
-- vLLM 0.21.0；
+- `vLLM-HUST/vllm-hust` commit
+  `ad7125a431e176d4161099480a66f0169609a690`（vLLM 0.21.0）；
 - hook-enabled `vllm-ascend-hust`：
   `feature/latchmoe-offload-seam-v1-v021`；
-- 当前复现锁定的 seam commit：
-  `fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25`；
+- seam commit：`4806367eeeb7d62b32078ae90cd929cc06d825fe`；
+- Torch 2.10.0、Torch-NPU 2.10.0.post2、CANN 9.0.1；
 - Python 3.10 或更高版本。
+
+项目只维护上述一条已验证宿主线。不要使用未经 LatchMoE 正确性门禁验证的
+`feature/latchmoe-offload-seam-v1`。对应的 `vllm-ascend-hust#214` 已关闭，
+该远端分支也已删除。完整机器可读锁见
+`vllm_moe_offload_ascend/compatibility.lock`；安装脚本和环境检查都以该文件为准。
 
 不要在已经验证的 Ascend 环境中执行 `pip install vllm` 或
 `pip install vllm-ascend`。它们可能引入 PyPI CUDA/上游依赖并替换 HUST 软件栈。
 
 ## 方式一：源码可编辑安装（研究开发推荐）
 
-### 步骤 1：准备 vLLM-HUST 工作环境
+### 自动安装固定宿主（推荐）
 
-可以通过 `vllm-hust-dev-hub` 初始化工作区：
-
-```bash
-git clone https://github.com/vLLM-HUST/vllm-hust-dev-hub.git
-cd vllm-hust-dev-hub
-bash scripts/quickstart.sh
-```
-
-首次运行时按照脚本提示创建开发环境。完成后激活脚本创建的 Conda 环境；如果
-环境名不同，请替换下面的名称：
+在已经提供 CANN、Torch 与 Torch-NPU 的 Ascend Python 环境中执行：
 
 ```bash
-conda activate vllm-hust-dev
-python -c 'import sys; print(sys.executable)'
+git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
+cd vllm-ascend-hust-LatchMoE
+
+python tools/install_locked_stack.py \
+  --workspace /path/to/latchmoe-stack --dry-run
+python tools/install_locked_stack.py \
+  --workspace /path/to/latchmoe-stack
 ```
+
+安装器直接读取 `compatibility.lock`，拒绝覆盖 dirty checkout，并完成以下容易
+出错的步骤：
+
+- 固定 vLLM-HUST 与唯一 seam 分支的完整 commit；
+- 从上游补充 vLLM `v0.21.0` tag，保证 setuptools-scm 版本正确；
+- 全程使用当前 `sys.executable -m pip`，防止 venv 与系统 Python 混用；
+- 以 `VLLM_TARGET_DEVICE=empty` 安装 vLLM-HUST；
+- 以 `COMPILE_CUSTOM_KERNELS=0` 安装 hook seam，避免编译 37 个与本插件无关的
+  自定义算子及其 CANN 子进程；
+- 使用 `--no-deps --no-build-isolation` 保护镜像中的 Torch-NPU 软件栈；
+- 最后自动运行 `python -m vllm_moe_offload_ascend check`。
+
+下面保留手工步骤，供离线环境或安装器排障使用。
+
+### 步骤 1：安装固定的 vLLM-HUST
+
+```bash
+git clone https://github.com/vLLM-HUST/vllm-hust.git
+git -C vllm-hust fetch origin ad7125a431e176d4161099480a66f0169609a690
+git -C vllm-hust fetch https://github.com/vllm-project/vllm.git \
+  refs/tags/v0.21.0:refs/tags/v0.21.0
+git -C vllm-hust checkout ad7125a431e176d4161099480a66f0169609a690
+VLLM_TARGET_DEVICE=empty python -m pip install \
+  --no-deps --no-build-isolation -e ./vllm-hust
+```
+
+第二次 fetch 用于补充 HUST 仓库当前没有发布的 `v0.21.0` tag；固定 commit 与
+该上游 tag 完全相同，setuptools-scm 需要它生成正确的 `0.21.0` 包版本。
 
 ### 步骤 2：安装固定的 vLLM-Ascend hook seam
 
@@ -66,9 +98,9 @@ git clone --branch feature/latchmoe-offload-seam-v1-v021 \
   https://github.com/vLLM-HUST/vllm-ascend-hust.git
 
 git -C vllm-ascend-hust checkout \
-  fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25
+  4806367eeeb7d62b32078ae90cd929cc06d825fe
 
-python -m pip install \
+COMPILE_CUSTOM_KERNELS=0 python -m pip install \
   --no-deps \
   --no-build-isolation \
   -e ./vllm-ascend-hust
@@ -99,6 +131,16 @@ python -m pip install \
 解释器。`--no-deps` 用来避免 pip 自动替换已经安装好的 vLLM、Torch 或
 vLLM-Ascend。
 
+这里的 hook seam 只提供 LatchMoE 所需的 Python hook ABI；不要把“成功编译
+vLLM-Ascend 全量自定义算子”当作插件安装前置条件。全量构建会编译大量与
+Qwen3/LatchMoE 无关的算子，还可能由 CANN 构建子进程选中 PATH 中另一个
+Python。确有其他模型需要额外算子时，应在基础镜像层独立构建并验证。
+
+安装后无需修改 vLLM/vLLM-Ascend 源码、设置 `PYTHONPATH` 或手动调用
+`register()`。vLLM 会在 API、EngineCore 和 Worker 进程自动加载
+`vllm.general_plugins`；LatchMoE 的 `register()` 会先把插件配置注册到
+`vllm.envs` 与 `vllm_ascend.envs`，再安装 seam adapter。
+
 ### 步骤 4：安装后核查
 
 ```bash
@@ -113,7 +155,8 @@ python = <当前环境的 Python>
 vllm = <vLLM 模块路径>
 vllm_ascend = <hook seam 模块路径>
 plugin = <LatchMoE 模块路径>
-platform_plugins = ascend, moe_offload_ascend
+platform_plugins = ascend
+general_plugins = moe_offload_ascend
 ```
 
 机器部署脚本可以读取 JSON：
@@ -121,6 +164,24 @@ platform_plugins = ascend, moe_offload_ascend
 ```bash
 python -m vllm_moe_offload_ascend check --json
 ```
+
+## 本次实机部署暴露的问题
+
+在 NPU 5 上完成 Qwen3-30B-A3B 端到端验证时，实际遇到的问题及项目侧处理如下：
+
+| 问题 | 根因 | 当前处理 |
+|---|---|---|
+| vLLM 显示错误或不稳定的源码版本 | HUST checkout 缺少上游 `v0.21.0` tag | 锁定安装器自动补 tag，并由 `check` 核验版本和 commit |
+| seam 安装尝试编译 37 个算子，且在无关 compressor 算子失败 | 默认走了 vLLM-Ascend 全量 custom-kernel build | 安装器固定 `COMPILE_CUSTOM_KERNELS=0`；LatchMoE seam 不以全量算子构建为门禁 |
+| CANN 构建子进程使用另一个 Python，缺少当前 venv 的 NumPy | 全量算子构建通过 PATH 解析子进程解释器 | 跳过无关构建；pip 和启动均固定使用当前 Python |
+| API 进程能导入插件，但 EngineCore/Worker 配置未注册 | 插件曾错误混入 platform plugin 生命周期 | 仅注册 `vllm.general_plugins`，`register()` 在每个进程注册全部环境变量 |
+| Worker 报 “Cannot re-initialize NPU in forked subprocess” | Torch-NPU 不支持已经初始化后的 fork | 启动文档固定 `VLLM_WORKER_MULTIPROC_METHOD=spawn` |
+| SEW 默认落入不安全的组合 Graph 模式 | vLLM 默认值不是纯 `PIECEWISE` | 插件在用户未显式指定时自动选择 `PIECEWISE` 并 fail-close |
+| NPU 空闲显存检查失败或模型构造 OOM | 目标卡被其他容器占用；降低 utilization 不能创造实际显存 | 启动前检查目标卡，资源不足时等待或换卡，不终止未知任务 |
+| 误以为 `OFFLOAD_GB=14` 代表整模只占 14 GiB | 该值是目标 expert offload 容量，默认仍保留部分常驻层 | 文档明确容量语义，并提供显存受限验证用的全层卸载配置 |
+
+安装器能够消除前六项中的安装和默认配置错误；NPU 资源竞争不能由安装过程
+“自动修复”，只能在启动前发现并拒绝给出误导性的性能结论。
 
 ## 方式二：在已有 HUST 软件栈中直接安装
 
@@ -169,6 +230,25 @@ python -m vllm_moe_offload_ascend serve <model> [vLLM 参数...]
 
 ## 启动服务
 
+### 启动前资源检查
+
+先确认目标 NPU 没有不属于本次验证的进程，并记录实际空闲 HBM：
+
+```bash
+npu-smi info
+python - <<'PY'
+import torch
+import torch_npu  # noqa: F401
+
+free, total = torch.npu.mem_get_info()
+print(f"free={free / 2**30:.2f} GiB total={total / 2**30:.2f} GiB")
+PY
+```
+
+如果 `npu-smi` 显示的是其他容器 PID，不要直接终止。等待资源释放或选择空闲卡。
+`--gpu-memory-utilization` 只设置 vLLM 的预算/启动门禁，无法解决真实 HBM 已被
+占用的问题。共享卡数据只能用于功能诊断，不能作为 TTFT/TPOT 性能基线。
+
 ### AutoConfig（推荐）
 
 ```bash
@@ -179,12 +259,26 @@ export ASCEND_RT_VISIBLE_DEVICES=4
 export VLLM_ASCEND_MOE_OFFLOAD_GB=14
 export VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1
 export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 python -m vllm_moe_offload_ascend serve \
   /path/to/Qwen3-30B-A3B \
   --trust-remote-code \
   --max-num-seqs 1
 ```
+
+`VLLM_ASCEND_MOE_OFFLOAD_GB=14` 表示生成约 14 GiB expert 的部分常驻规划，
+不表示整个模型只占 14 GiB。若要在显存受限卡上验证“所有 MoE 层均卸载”，需显式
+设置空的常驻层集合，并开启 CPU-first 与固定 slot override：
+
+```bash
+export VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS=
+export VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD=1
+export VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS=16
+```
+
+该配置会以更多 H2D 传输换取更低 HBM 占用。常规服务仍建议使用 AutoConfig 的
+部分常驻规划，除非已针对目标负载核验容量与性能取舍。
 
 SEW AutoConfig 默认会在 host store 和 fixed-slot bank 就绪后释放 offloaded
 expert 的原始 NPU 副本。只有在排查“保留完整权重”路径时才显式设置
