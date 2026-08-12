@@ -159,10 +159,6 @@ checkout 下表中的完整 commit：
 | CANN | system runtime | — | `9.0.1` |
 
 `feature/latchmoe-offload-seam-v1-v021` 是唯一的 LatchMoE seam 分支。
-`feature/latchmoe-offload-seam-v1` 对应另一条未经本项目正确性门禁验证的宿主
-主线，不应再用于安装。它承载的
-[`vllm-ascend-hust#214`](https://github.com/vLLM-HUST/vllm-ascend-hust/pull/214)
-已经关闭，远端 `feature/latchmoe-offload-seam-v1` 也已删除。
 
 完整机器可读锁位于
 [`vllm_moe_offload_ascend/compatibility.lock`](vllm_moe_offload_ascend/compatibility.lock)。
