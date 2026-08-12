@@ -241,7 +241,11 @@ def test_collect_evidence_extracts_log_and_profile_fields(tmp_path):
         '{"host_store_bytes":1073741824,"slot_bank_bytes":2147483648,'
         '"total_managed_bytes":3221225472,"registered_layers":1},'
         '"payload":{"num_slots":32,"h2d_bytes":1024,"stage_ms":1.5,'
-        '"n_active":4,"profile_sample_rate":2}}\n',
+        '"load_enqueue_ms":0.4,"ready_wait_ms":0.2,"mapping_ms":0.1,'
+        '"n_active":4,"profile_sample_rate":2}}\n'
+        '{"name":"b2_work_conserving_prefill","payload":{"wave_summary":'
+        '{"wave_count":2,"h2d_bytes":2048,"stage_issue_ms":3.0,'
+        '"stage_wait_ms":1.0,"mlp_ms":5.0}}}\n',
         encoding="utf-8",
     )
     result_json.write_text(
@@ -265,5 +269,11 @@ def test_collect_evidence_extracts_log_and_profile_fields(tmp_path):
     assert row["moe_offload_stage_seen"] is True
     assert row["num_slots"] == 32
     assert row["slot_bank_gib"] == 2.0
-    assert row["h2d_gib_total"] == 2048 / collect.BYTES_PER_GIB
+    assert row["h2d_gib_total"] == 4096 / collect.BYTES_PER_GIB
     assert row["stage_ms_total"] == 3.0
+    assert row["h2d_copy_enqueue_ms_total"] == 0.8
+    assert row["waiting_event_ms_total"] == 0.4
+    assert row["slot_update_ms_total"] == 0.2
+    assert row["wave_prefill_stage_issue_ms_total"] == 3.0
+    assert row["wave_prefill_stage_wait_ms_total"] == 1.0
+    assert row["wave_prefill_compute_ms_total"] == 5.0

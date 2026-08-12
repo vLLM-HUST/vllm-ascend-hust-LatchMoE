@@ -1254,6 +1254,34 @@ def test_capture_safe_slot_weights_locks_fixed_address_fingerprint():
         runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
 
 
+def test_post_capture_staging_records_stable_address_evidence():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+        )
+    )
+    runtime.register_layer_for_fixed_slots(TinyLayer(), slot_device=torch.device("cpu"))
+    locked = runtime.capture_safe_slot_weights(layer_id=7)
+    assert locked is not None
+
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(0, 1),
+        num_logical_experts=4,
+    )
+
+    events = runtime.profiling_summary()["events"]
+    lock = next(event for event in events if event["name"] == "graph_slot_address_lock")
+    validation = next(
+        event for event in events if event["name"] == "graph_slot_address_validate"
+    )
+    assert validation["payload"]["matches_capture_fingerprint"] is True
+    for key in ("w13_data_ptr", "w2_data_ptr", "log2phy_data_ptr"):
+        assert lock["payload"][key] == validation["payload"][key]
+
+
 def test_begin_slot_compute_refuses_h2d_slot_until_ready_event_completes():
     runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=1))
     runtime.register_layer_for_fixed_slots(TinyLayer(), slot_device=torch.device("cpu"))

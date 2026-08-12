@@ -59,6 +59,13 @@ def test_stage_drains_prior_compute_before_reserving_sync_misses():
     assert completion.synchronize_calls == 1
     assert all(slot.state == SlotState.READY for slot in bank.slots)
     assert prepared.mapping.active_slot_ids == (2, 3, 0)
+    evidence = [
+        event
+        for event in runtime.profiling_summary()["events"]
+        if event["name"] == "slot_generation_protected_until_compute_complete"
+    ]
+    assert evidence[-1]["payload"]["leases_still_match"] is True
+    assert evidence[-1]["payload"]["completion_events_synchronized"] == 1
 
 
 def test_capture_handoff_releases_prior_compute_without_host_synchronize(monkeypatch):

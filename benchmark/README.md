@@ -119,21 +119,55 @@ The default supported boundary is intentionally narrow:
 
 Each benchmark unit writes:
 
-- `unit_manifest.json`: commands, environment, case, workload, and paths.
+- `unit_manifest.json`: commands, environment, case, workload, paths, parent
+  SHA, dependency SHAs, model/dataset hashes, device, and runtime-bundle identity.
 - `server.log`: vLLM server stdout and stderr.
+- `launcher_lifecycle.log`: manager start, status, stop, and release output.
 - `client.log`: benchmark client stdout and stderr.
 - `benchmark.json`: serving metrics from the streaming client.
 - `unit_result.json`: normalized status and pointers to artifacts.
 - `moe_profile.jsonl`: SEW/MoE runtime profile events when enabled.
 - `moe_trace.jsonl`: routed expert trace events when enabled.
+- `PASSED.txt` or `FAILED.txt`: fail-closed unit disposition.
 
-Failed units still write `unit_result.json`; expected OOM or graph-capture
-failures are evidence, not missing data.
+Failed units still write `unit_result.json` and `FAILED.txt`; expected OOM or
+graph-capture failures are evidence, not missing data. A request-success result
+is downgraded to failure when the manager cannot prove service release.
 # Managed graph-mode launch
 
-Non-dry suite runs start and stop the service only through the pinned
-`third_party/vllm-hust-dev-hub/manage.sh`. Supply physical NPU5 or NPU6, an
-immutable image digest, a unique container name, and a release-ack directory.
-The runner rejects occupied ports/devices, active custody units, forced eager,
-and external manager paths. `--no-start-server` remains a probe mode and must
-not be labeled repository-owned online evidence.
+Non-dry suite runs start and stop the service only through a pinned repository
+manager. The default container backend uses
+`third_party/vllm-hust-dev-hub/manage.sh`, an immutable image digest, and a
+unique container. On a systemd-less host, `--managed-backend locked-host` uses
+`benchmark/scripts/manage_locked_host_runtime.py` with an explicit Python and
+the compatibility-locked vLLM/vLLM-Ascend checkouts. Both backends require a
+physical NPU5 or NPU6 and a release-ack directory. The runner rejects occupied
+ports/devices, active custody state, forced eager, and external manager paths.
+`--no-start-server` remains a probe mode and must not be labeled
+repository-owned online evidence.
+
+## Issue #7 graph correctness bundle
+
+`run_issue7_graph_bundle.py` enforces the required order: one-request ShareGPT
+smoke, a short mixed-chat gate, then three independent managed service starts.
+Every stage runs PIECEWISE ACLGraph only and is checked by
+`verify_issue7_graph_unit.py`. The verifier requires non-empty output, graph
+capture and replay, fixed slot-address equality, generation-protected compute,
+H2D-before-mapping publication, capacity-bounded multi-wave prefill, complete
+provenance, and a successful release ACK. It also emits the H2D copy enqueue,
+waiting/event, slot update, wave-prefill compute, and stage issue/wait timing
+breakdown requested by Issue #7.
+
+Example for a locked host stack:
+
+```bash
+python benchmark/scripts/run_issue7_graph_bundle.py \
+  --output-root benchmark/artifacts/issue7-npu5 \
+  --device 5 \
+  --python /workspace/latchmoe-issue13-venv/bin/python \
+  --vllm-root /workspace/latchmoe-issue13-stack/vllm-hust \
+  --seam-root /workspace/latchmoe-issue13-stack/vllm-ascend-hust \
+  --manifest benchmark/artifacts/workloads/issue13_sharegpt.jsonl \
+  --model-path /root/data/shared_models/strict-models/Qwen3-30B-A3B \
+  --dataset-path /root/data/benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json
+```

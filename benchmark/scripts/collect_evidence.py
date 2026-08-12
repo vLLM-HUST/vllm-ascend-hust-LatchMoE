@@ -81,6 +81,12 @@ def _profile_summary(path: str | Path) -> dict[str, Any]:
         "num_slots": None,
         "h2d_gib_total": 0.0,
         "stage_ms_total": 0.0,
+        "h2d_copy_enqueue_ms_total": 0.0,
+        "waiting_event_ms_total": 0.0,
+        "slot_update_ms_total": 0.0,
+        "wave_prefill_compute_ms_total": 0.0,
+        "wave_prefill_stage_issue_ms_total": 0.0,
+        "wave_prefill_stage_wait_ms_total": 0.0,
         "max_active_experts": 0,
         "max_wave_count": 0,
         "b2_events": 0,
@@ -128,6 +134,15 @@ def _profile_summary(path: str | Path) -> dict[str, Any]:
             h2d_bytes_total += int(payload.get("h2d_bytes") or 0) * sample_rate
             if "stage_ms" in payload:
                 stage_ms_total += float(payload.get("stage_ms") or 0.0) * sample_rate
+            summary["h2d_copy_enqueue_ms_total"] += (
+                float(payload.get("load_enqueue_ms") or 0.0) * sample_rate
+            )
+            summary["waiting_event_ms_total"] += (
+                float(payload.get("ready_wait_ms") or 0.0) * sample_rate
+            )
+            summary["slot_update_ms_total"] += (
+                float(payload.get("mapping_ms") or 0.0) * sample_rate
+            )
             wave_summary = payload.get("wave_summary") or {}
             h2d_bytes_total += int(wave_summary.get("h2d_bytes") or 0)
             if "stage_ms" in wave_summary:
@@ -136,6 +151,15 @@ def _profile_summary(path: str | Path) -> dict[str, Any]:
                 summary["max_wave_count"] = max(
                     int(summary["max_wave_count"]), int(wave_summary.get("wave_count") or 0)
                 )
+            summary["wave_prefill_compute_ms_total"] += float(
+                wave_summary.get("mlp_ms") or 0.0
+            )
+            summary["wave_prefill_stage_issue_ms_total"] += float(
+                wave_summary.get("stage_issue_ms") or 0.0
+            )
+            summary["wave_prefill_stage_wait_ms_total"] += float(
+                wave_summary.get("stage_wait_ms") or 0.0
+            )
 
     summary["h2d_gib_total"] = h2d_bytes_total / BYTES_PER_GIB
     summary["stage_ms_total"] = stage_ms_total

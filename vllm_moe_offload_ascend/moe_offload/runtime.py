@@ -213,6 +213,21 @@ class SlotAddressFingerprint:
     dtype: str
 
 
+def _slot_address_fingerprint_payload(
+    fingerprint: SlotAddressFingerprint,
+) -> dict[str, object]:
+    return {
+        "w13_data_ptr": int(fingerprint.w13_data_ptr),
+        "w2_data_ptr": int(fingerprint.w2_data_ptr),
+        "log2phy_data_ptr": int(fingerprint.log2phy_data_ptr),
+        "w13_shape": [int(dim) for dim in fingerprint.w13_shape],
+        "w2_shape": [int(dim) for dim in fingerprint.w2_shape],
+        "log2phy_shape": [int(dim) for dim in fingerprint.log2phy_shape],
+        "device": str(fingerprint.device),
+        "dtype": str(fingerprint.dtype),
+    }
+
+
 class MoeOffloadRuntime:
     def __init__(self, config: MoeOffloadConfig | None = None) -> None:
         self.config = config if config is not None else MoeOffloadConfig.from_env()
@@ -248,6 +263,9 @@ class MoeOffloadRuntime:
         self._log2phy_buffers: dict[int, torch.Tensor] = {}
         self._log2phy_slot_by_expert: dict[int, dict[int, int]] = {}
         self._graph_slot_address_fingerprints: dict[int, SlotAddressFingerprint] = {}
+        self._graph_slot_address_lock_evidence: set[int] = set()
+        self._graph_slot_address_validation_evidence: set[int] = set()
+        self._slot_generation_protection_evidence: set[int] = set()
         self._transfer_engine = TransferEngine()
         self._profile_events: list[MoeOffloadProfileEvent] = []
         self._memory_ledger_cache: MoeOffloadMemoryLedger | None = None
@@ -749,6 +767,35 @@ class MoeOffloadRuntime:
                 )
             if slot.state == SlotState.COMPUTING:
                 slot.state = SlotState.READY
+        protected_layers = sorted(
+            {
+                int(lease.expert_key.layer_id)
+                for lease in leases
+                if int(lease.expert_key.layer_id)
+                not in self._slot_generation_protection_evidence
+            }
+        )
+        for layer_id in protected_layers:
+            layer_leases = [
+                lease
+                for lease in leases
+                if int(lease.expert_key.layer_id) == layer_id
+            ]
+            self._slot_generation_protection_evidence.add(layer_id)
+            self._record_profile_event(
+                "slot_generation_protected_until_compute_complete",
+                layer_id=layer_id,
+                start=perf_counter(),
+                payload={
+                    "slot_ids": [int(lease.slot_id) for lease in layer_leases],
+                    "generations": [int(lease.version) for lease in layer_leases],
+                    "expert_ids": [
+                        int(lease.expert_key.expert_id) for lease in layer_leases
+                    ],
+                    "completion_events_synchronized": len(events_to_sync),
+                    "leases_still_match": True,
+                },
+            )
 
     def _synchronize_event(self, event: object) -> None:
         synchronize = getattr(event, "synchronize", None)
@@ -1462,6 +1509,7 @@ class MoeOffloadRuntime:
         load_enqueue_ms = 0.0
         ready_wait_ms = 0.0
         ready_event = None
+        consumer_dependency_installed = False
         async_loads = []
         sync_loads = []
         _n_hits = 0
@@ -1553,6 +1601,7 @@ class MoeOffloadRuntime:
         if ready_event is not None:
             wait_start = perf_counter() if collect_profile else 0.0
             self._wait_transfer_event(ready_event)
+            consumer_dependency_installed = True
             if collect_profile:
                 ready_wait_ms = (perf_counter() - wait_start) * 1000.0
                 load_sync_ms += load_enqueue_ms + ready_wait_ms
@@ -1618,6 +1667,10 @@ class MoeOffloadRuntime:
                 "mapping_mode": "persistent_log2phy",
                 "log2phy_update_count": int(len(log2phy_update_experts)),
                 "stage_mode": stage_mode,
+                "consumer_dependency_installed": (
+                    ready_event is None or consumer_dependency_installed
+                ),
+                "mapping_published_after_ready": True,
                 "profile_sample_rate": int(profile_sample_rate),
             }
             if collect_profile_details:
@@ -2448,6 +2501,7 @@ class MoeOffloadRuntime:
         )
 
     def _lock_graph_slot_addresses(self, layer_id: int) -> None:
+        start = perf_counter()
         fingerprint = self._slot_address_fingerprint(layer_id)
         existing = self._graph_slot_address_fingerprints.get(int(layer_id))
         if existing is None:
@@ -2456,6 +2510,28 @@ class MoeOffloadRuntime:
         if existing != fingerprint:
             raise RuntimeError(
                 f"fixed-slot address fingerprint changed for captured layer {layer_id}"
+            )
+        if (
+            not _is_current_graph_capturing()
+            and int(layer_id) not in self._graph_slot_address_validation_evidence
+        ):
+            if int(layer_id) not in self._graph_slot_address_lock_evidence:
+                self._graph_slot_address_lock_evidence.add(int(layer_id))
+                self._record_profile_event(
+                    "graph_slot_address_lock",
+                    layer_id=int(layer_id),
+                    start=start,
+                    payload=_slot_address_fingerprint_payload(existing),
+                )
+            self._graph_slot_address_validation_evidence.add(int(layer_id))
+            self._record_profile_event(
+                "graph_slot_address_validate",
+                layer_id=int(layer_id),
+                start=start,
+                payload={
+                    **_slot_address_fingerprint_payload(fingerprint),
+                    "matches_capture_fingerprint": True,
+                },
             )
 
     def _assert_locked_slot_addresses(self, layer_id: int) -> None:
