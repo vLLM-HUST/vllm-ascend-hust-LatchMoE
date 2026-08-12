@@ -156,3 +156,7 @@ passes because:
 
 Deleting the branch removes only the legacy branch ref. It does not revert any
 current LatchMoE or Ascend MoE Control commit.
+
+The deletion was rechecked on 2026-08-12: `git ls-remote --heads origin` did
+not return `feature/latchmoe-issue-175-control-plane` or another Issue #175
+legacy ref.
