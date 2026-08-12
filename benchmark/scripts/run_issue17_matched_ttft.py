@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -31,6 +33,19 @@ def _latest_suite(root: Path, before: set[Path]) -> Path:
     if len(created) != 1:
         raise RuntimeError(f"expected one new suite directory, found {len(created)}")
     return created.pop()
+
+
+def _run_managed(command: list[str]) -> int:
+    process = subprocess.Popen(command, cwd=REPO_ROOT, start_new_session=True)
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        os.killpg(process.pid, signal.SIGINT)
+        try:
+            return process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            return process.wait(timeout=30)
 
 
 def main() -> int:
@@ -77,15 +92,15 @@ def main() -> int:
             "--dataset-path", str(Path(args.dataset_path).resolve()),
             "--custody-unit-prefix", f"issue17-{stage}",
         ]
-        completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+        returncode = _run_managed(command)
         suite = _latest_suite(stage_root, before)
         unit = suite / CASES[arm] / "mixed_chat"
-        item = {"stage": stage, "arm": arm, "unit_dir": str(unit), "runner_returncode": completed.returncode}
+        item = {"stage": stage, "arm": arm, "unit_dir": str(unit), "runner_returncode": returncode}
         units.append(item)
         campaign = output_root / "campaign.json"
         campaign.write_text(json.dumps({"order": [list(value) for value in ORDER], "units": units}, indent=2), encoding="utf-8")
-        if completed.returncode != 0:
-            return completed.returncode
+        if returncode != 0:
+            return returncode
         verify = [
             str(args.python), str(VERIFY),
             "--unit-dir", str(unit),

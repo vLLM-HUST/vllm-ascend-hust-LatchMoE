@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from types import SimpleNamespace
 
 from benchmark.scripts import run_openai_manifest
@@ -80,3 +81,56 @@ def test_stream_result_retains_token_ids_and_hashes():
     assert result["output_text_sha256"] == (
         "38164fbd17603d73f696b8b4d72664d735bb6a7c88577687fd2ae33fd6964153"
     )
+
+
+def test_single_concurrency_preserves_manifest_request_order(monkeypatch, tmp_path):
+    observed = []
+    requests = [
+        {"request_id": f"r{index}", "prompt": "hello", "max_output_tokens": 1}
+        for index in range(4)
+    ]
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def fake_stream(_session, *, request_record, **_kwargs):
+        observed.append(request_record["request_id"])
+        await asyncio.sleep(0)
+        return {
+            "request_id": request_record["request_id"],
+            "ttft_s": 0.1,
+            "total_s": 0.2,
+            "output_tokens": 1,
+            "output_token_ids": [1],
+        }
+
+    fake_aiohttp = SimpleNamespace(
+        ClientTimeout=lambda **_kwargs: object(),
+        ClientSession=FakeSession,
+    )
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+    monkeypatch.setattr(run_openai_manifest, "load_requests", lambda *_args, **_kwargs: requests)
+    monkeypatch.setattr(run_openai_manifest, "_load_tokenizer", lambda _path: None)
+    monkeypatch.setattr(run_openai_manifest, "stream_request", fake_stream)
+    args = SimpleNamespace(
+        concurrency=1,
+        manifest=str(tmp_path / "manifest.jsonl"),
+        bucket="mixed_chat",
+        max_requests=4,
+        tokenizer="",
+        request_timeout_s=10,
+        base_url="http://127.0.0.1:1",
+        model="qwen3",
+    )
+
+    summary = asyncio.run(run_openai_manifest.run(args))
+
+    assert observed == ["r0", "r1", "r2", "r3"]
+    assert [item["request_id"] for item in summary["per_request"]] == observed
