@@ -177,3 +177,13 @@ python benchmark/scripts/run_issue7_graph_bundle.py \
   --model-path /root/data/shared_models/strict-models/Qwen3-30B-A3B \
   --dataset-path /root/data/benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json
 ```
+
+## Issue #17 matched TTFT campaign
+
+`run_issue17_matched_ttft.py` runs three independent `full_layer` and three
+independent `multi_wave` PIECEWISE Graph starts in a fixed AB/BA/AB order. Both
+arms use the same 200-request `mixed_chat` manifest; the only case difference
+is `VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE`. The dedicated verifier derives
+TTFT/TPOT p50 and p95 from every raw request, requires exact token IDs across
+all units, rejects multi-wave fallback, checks NPU/ACL/OOM markers and release
+ACKs, and fails if provenance differs between arms.
