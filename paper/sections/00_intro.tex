@@ -30,6 +30,32 @@ This result indicates that most of the improvement comes from eliminating host-i
     \label{fig:graph_breakdown}
 \end{figure}
 
+However, these efficiency gains rely on a \textbf{replay-stable execution state}, in which the captured execution structure and graph-visible memory bindings remain valid across replays. 
+Dynamic expert offloading creates a fundamental tension with this requirement. 
+When routing-driven cache misses trigger expert replacement, the same logical expert may be served from different physical weight locations across decoding steps, changing the logical-to-physical binding observed by captured computation. 
+Such binding changes prevent the runtime from safely reusing the captured execution state unless it repairs the affected graph state or reintroduces eager intervention, both of which erode the host-overhead savings of graph replay. 
+The central challenge is thus to \textbf{preserve graph replay while allowing expert residency and physical placement to evolve dynamically under a bounded HBM budget}.
+
+Existing systems address the two sides of this tension largely in isolation. 
+Expert-offloading systems optimize \emph{what changes} at runtime---which experts remain resident, which experts are transferred, and when those transfers occur---through caching, prediction, prefetching, and transfer--computation overlap~\cite{hwang2024pregated,kong2024swapmoe,cao2025moelightning,fang2025klotski}. 
+These techniques improve expert availability under constrained memory, but dynamic replacement and the resulting logical-to-physical bindings remain part of the runtime-managed execution state. 
+In contrast, graph-compatible inference runtimes focus on \emph{what must remain reusable}, stabilizing graph-visible workspaces, metadata, and execution configurations so that captured computation can be replayed efficiently~\cite{ye2025flashinfer}. 
+However, such mechanisms do not virtualize a dynamically replaceable expert working set within a bounded HBM budget. 
+Consequently, neither line of work provides an execution abstraction that simultaneously hides dynamic expert replacement from captured computation and preserves efficient graph replay.
+
+Our key insight is to \textbf{separate what graph replay needs to keep stable from what expert offloading needs to change}. 
+Expert offloading requires the resident expert set and its placement to evolve with runtime routing, whereas replayability fundamentally depends on keeping the graph-visible execution interface valid across replays. 
+This distinction allows us to decouple \emph{logical expert identity} from \emph{graph-visible physical storage}: the physical storage exposed to captured computation can remain stable, while the association between logical experts and resident weights evolves between replays to reflect the current resident set.
+Under this abstraction, expert replacement becomes an \emph{inter-replay state transition} rather than a change to the graph-visible execution interface. 
+Dynamic expert residency can therefore coexist with reusable graph execution without requiring all experts to remain permanently resident in HBM.
+
+Realizing this abstraction introduces three systems challenges. 
+\textbf{First, dynamic expert staging must be separated from captured computation without changing MoE execution semantics.} 
+Conventional fused MoE implementations tightly couple routing, expert selection, and expert computation, leaving no explicit execution boundary at which routing-dependent placement decisions and weight transfers can occur outside the captured region while preserving the tensors and routing decisions consumed by subsequent computation. \textbf{Second, dynamically reused expert storage must remain correct under asynchronous transfer and computation.} Replacing an expert too early can overwrite weights still being consumed by in-flight computation, whereas exposing a newly assigned location before its transfer completes can cause captured computation to observe incomplete or incorrect weights. \textbf{Third, execution must remain exact when the routed expert working set exceeds the available HBM capacity.} Requiring all active experts to reside simultaneously would violate the memory budget, while dropping experts or approximating their outputs would alter model semantics. The runtime must therefore bound physical residency without sacrificing correctness, while still retaining opportunities to overlap expert transfer with computation.
+
+
+
+
 Our goal is to preserve graph replay while allowing the resident expert set to
 change within a fixed HBM budget.  The key observation is that expert
 \emph{identity} may change without changing the addresses consumed by captured
