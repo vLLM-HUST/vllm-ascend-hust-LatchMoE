@@ -781,7 +781,7 @@ def test_b2_reference_full_layer_uses_blocking_copy_with_async_decode(monkeypatc
     assert _b2_reference_full_layer_enabled(async_stage=True) is True
 
 
-def test_b2_overflow_mode_defaults_to_full_layer(monkeypatch):
+def test_b2_overflow_mode_defaults_to_multi_wave(monkeypatch):
     from vllm_moe_offload_ascend.patches.patch_fused_moe import (
         _b2_overflow_mode,
     )
@@ -791,10 +791,10 @@ def test_b2_overflow_mode_defaults_to_full_layer(monkeypatch):
         raising=False,
     )
 
-    assert _b2_overflow_mode() == "full_layer"
+    assert _b2_overflow_mode() == "multi_wave"
 
 
-def test_b2_overflow_mode_allows_explicit_experimental_wave(monkeypatch):
+def test_b2_overflow_mode_accepts_legacy_experimental_wave_alias(monkeypatch):
     from vllm_moe_offload_ascend.patches.patch_fused_moe import (
         _b2_overflow_mode,
     )
@@ -804,7 +804,20 @@ def test_b2_overflow_mode_allows_explicit_experimental_wave(monkeypatch):
         "experimental_wave",
     )
 
-    assert _b2_overflow_mode() == "experimental_wave"
+    assert _b2_overflow_mode() == "multi_wave"
+
+
+def test_b2_overflow_mode_allows_explicit_full_layer(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_overflow_mode,
+    )
+
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
+        "full_layer",
+    )
+
+    assert _b2_overflow_mode() == "full_layer"
 
 
 def test_b2_overflow_mode_rejects_unknown_value(monkeypatch):
@@ -817,8 +830,53 @@ def test_b2_overflow_mode_rejects_unknown_value(monkeypatch):
         "fast",
     )
 
-    with pytest.raises(RuntimeError, match="must be 'full_layer' or"):
+    with pytest.raises(RuntimeError, match="must be 'multi_wave'"):
         _b2_overflow_mode()
+
+
+def test_b2_multi_wave_preflight_falls_back_without_native_recombine(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_multi_wave_preflight_failure,
+    )
+
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_B2_DIRECT_SCATTER", "0")
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            num_slots=32,
+            async_load=True,
+            effective_prefill_prefetch_depth=1,
+            effective_prefill_buffer_count=2,
+        )
+    )
+
+    assert (
+        _b2_multi_wave_preflight_failure(runtime)
+        == "native_recombine_disabled"
+    )
+
+
+def test_b2_multi_wave_preflight_requires_two_buffers_for_overlap(monkeypatch):
+    from vllm_moe_offload_ascend.patches.patch_fused_moe import (
+        _b2_multi_wave_preflight_failure,
+    )
+
+    monkeypatch.delenv(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_DIRECT_SCATTER",
+        raising=False,
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(
+            num_slots=32,
+            async_load=True,
+            effective_prefill_prefetch_depth=1,
+            effective_prefill_buffer_count=1,
+        )
+    )
+
+    assert (
+        _b2_multi_wave_preflight_failure(runtime)
+        == "overlap_requires_two_buffers"
+    )
 
 
 def test_b2_profile_details_accepts_sync_execution_without_schedule(monkeypatch):
@@ -1398,6 +1456,88 @@ def test_b2_runs_exact_pair_waves_for_multi_request_decode_overflow(monkeypatch)
         before_dispatch_evt=None,
     ) == "b2"
     assert calls[0]["control_profile"]["forward_phase"] == "decode"
+
+
+def test_b2_recoverable_wave_failure_runs_full_layer_fallback(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.moe_offload.phase_split import B2WaveFallback
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeCommMethod:
+        _ascend_moe_offload_runtime_patch = False
+
+        def fused_experts(self, fused_experts_input):
+            return "native"
+
+        def _maybe_apply_moe_offload_plan(self, fused_experts_input):
+            return fused_experts_input
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            graph_compatible_offload=False,
+            b2_wave_prefill=True,
+            gmm_profile_path="",
+            num_slots=2,
+        )
+
+        def is_resident_layer(self, layer_id):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def consume_prefill_route_stats_record(self, **kwargs):
+            return None
+
+        def should_use_b2_pair_waves(self, *, layer_id, active_expert_count):
+            return active_expert_count > 2
+
+    monkeypatch.setattr(patch_fused_moe, "_current_forward_is_prefill", lambda: False)
+    monkeypatch.setattr(
+        runtime_impl,
+        "get_moe_offload_runtime",
+        lambda: FakeRuntime(),
+    )
+
+    fake_comm = SimpleNamespace(
+        MoECommMethod=FakeCommMethod,
+        build_token_dispatch_input=lambda **kwargs: kwargs,
+        build_mlp_compute_input=lambda **kwargs: kwargs,
+        FusedExpertsResult=SimpleNamespace,
+        MoEFusedExpertsInput=SimpleNamespace,
+        MoEWeights=SimpleNamespace,
+        MoEOffloadParams=SimpleNamespace,
+        MoERoutingParams=SimpleNamespace,
+        setup_moe_comm_method=None,
+    )
+    patch_fused_moe._patch_moe_comm_method_runtime_hooks(fake_comm)
+
+    comm = FakeCommMethod()
+    TokenDispatcherWithAllGather = type("TokenDispatcherWithAllGather", (), {})
+    comm.token_dispatcher = TokenDispatcherWithAllGather()
+    comm._run_b2_wave_prefill = lambda **kwargs: (_ for _ in ()).throw(
+        B2WaveFallback("incomplete native pair coverage")
+    )
+    fallback_calls = []
+    comm._run_b2_full_layer_reference = (
+        lambda **kwargs: fallback_calls.append(kwargs) or "full_layer"
+    )
+    fused_experts_input = SimpleNamespace(
+        hidden_states=torch.empty((4, 16)),
+        topk_ids=torch.tensor([[1, 2], [2, 3], [3, 4], [4, 5]]),
+        offload=SimpleNamespace(enabled=True, layer_id=7),
+    )
+
+    assert comm._maybe_run_b2_wave_prefill(
+        fused_experts_input,
+        before_dispatch_evt=None,
+    ) == "full_layer"
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0]["fallback_reason"].startswith(
+        "B2WaveFallback: incomplete native pair coverage"
+    )
 
 
 def test_stage_op_defers_capacity_overflow_to_b2_without_phase_hint(monkeypatch):

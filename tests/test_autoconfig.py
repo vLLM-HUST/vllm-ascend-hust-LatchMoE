@@ -396,7 +396,7 @@ def test_apply_defaults_sew_dataplane_skips_native_prefetch(monkeypatch):
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE"] == "1"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM"] == "1"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL"] == "1"
-    assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE"] == "full_layer"
+    assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE"] == "multi_wave"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD"] == "1"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY"] == "1"
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE"] == "1"

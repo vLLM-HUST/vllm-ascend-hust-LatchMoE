@@ -341,7 +341,7 @@ All configuration is environment-variable based. The main knobs:
 | `VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS` | auto | Comma-separated layer IDs kept fully resident |
 | `VLLM_ASCEND_MOE_OFFLOAD_POLICY` | `deadline` | Staging policy (`deadline` / `lru`) |
 | `VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD` | `1` on SEW path | Load experts on a dedicated transfer stream |
-| `VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE` | `full_layer` | Correctness-first behavior when active experts exceed slot capacity; `experimental_wave` enables the unqualified multi-wave path |
+| `VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE` | `multi_wave` | Prefer qualified native-recombine multi-wave execution when active experts exceed slot capacity; recoverable qualification failures automatically use `full_layer`. Set `full_layer` to force the blocking fallback; `experimental_wave` is a legacy alias for `multi_wave` |
 | `VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE` | `1` on SEW path | Reorder wave staging/compute by per-wave H2D bytes |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_PREFETCH_DEPTH` | `1` | Software-pipeline prefetch depth for wave prefill |
 | `VLLM_ASCEND_MOE_OFFLOAD_PREFILL_BUFFER_COUNT` | `2` | Stage buffer count for wave prefill |
@@ -354,9 +354,14 @@ All configuration is environment-variable based. The main knobs:
 
 Additional expert-level overrides are documented in
 `vllm_moe_offload_ascend/moe_offload/config.py` and `autoconfig.py`.
-The `experimental_wave` overflow mode changes BF16 evaluation order and is not
-currently token-equivalent to native single-pass MoE. Do not use it for
-correctness or performance claims.
+The default `multi_wave` overflow mode uses a single native layer-level top-k
+recombine so wave-local execution does not change the native combine order. It
+has been qualified for the narrow single-card, TP1, `max_num_seqs=1`,
+no-prefix-cache configuration documented in
+`docs/evidence/issue-13-multi-wave-prefill.md`. Recoverable preflight or native
+recombine qualification failures fall back to blocking `full_layer` execution;
+NPU/ACL, OOM, and arbitrary runtime failures remain visible. Set the mode to
+`full_layer` to force the fallback outside the validated boundary.
 
 ---
 
