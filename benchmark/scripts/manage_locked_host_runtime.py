@@ -111,10 +111,20 @@ def _start(path: Path) -> dict:
     command.extend(str(item) for item in extra_args)
     child_env = dict(os.environ)
     child_env["ASCEND_RT_VISIBLE_DEVICES"] = _required_env("VLLM_ENGINE_NPU_DEVICES")
+    inherited_pythonpath = child_env.get("PYTHONPATH", "")
     child_env["PYTHONPATH"] = ":".join(
-        (str(runtime_root), str(vllm_root), str(seam_root))
+        path
+        for path in (
+            str(runtime_root),
+            str(vllm_root),
+            str(seam_root),
+            inherited_pythonpath,
+        )
+        if path
     )
-    child_env["VLLM_PLUGINS"] = "ascend"
+    # Empty means vLLM discovers both the Ascend platform plugin and LatchMoE's
+    # general plugin. A caller-supplied restrictive filter is not accepted.
+    child_env.pop("VLLM_PLUGINS", None)
     child_env.pop("VLLM_ENGINE_ENFORCE_EAGER", None)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab", buffering=0) as log_handle:

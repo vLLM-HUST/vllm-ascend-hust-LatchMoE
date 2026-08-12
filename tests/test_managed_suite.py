@@ -174,3 +174,6 @@ def test_locked_host_manager_uses_package_entrypoint() -> None:
 
     assert '"vllm_moe_offload_ascend",' in source
     assert '"vllm_moe_offload_ascend.launcher",' not in source
+    assert 'inherited_pythonpath = child_env.get("PYTHONPATH", "")' in source
+    assert 'child_env.pop("VLLM_PLUGINS", None)' in source
+    assert 'child_env["VLLM_PLUGINS"] = "ascend"' not in source
