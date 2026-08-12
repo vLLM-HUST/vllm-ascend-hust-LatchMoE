@@ -21,8 +21,12 @@ def _patch_complete_environment(monkeypatch):
     monkeypatch.setattr(
         launcher,
         "_discover_platform_plugins",
+        lambda: (("ascend", "vllm_ascend:register"),),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_discover_general_plugins",
         lambda: (
-            ("ascend", "vllm_ascend:register"),
             ("moe_offload_ascend", "vllm_moe_offload_ascend:register"),
         ),
     )
@@ -36,6 +40,7 @@ def _patch_complete_environment(monkeypatch):
                 "runtime_clean_paths": "vllm_moe_offload_ascend,tests",
                 "seam_abi": "1",
                 "seam_commit": "seam-commit",
+                "vllm_commit": "vllm-commit",
                 "vllm_version": "0.21.0",
                 "torch_version": "2.10.0",
                 "torch_npu_version": "2.10.0",
@@ -76,6 +81,13 @@ def _patch_complete_environment(monkeypatch):
                 branch="main",
                 dirty_paths=(),
             )
+        if "/vllm/" in origin:
+            return launcher.GitCheckout(
+                root="/src/vllm",
+                commit="vllm-commit",
+                branch="v0.21.0",
+                dirty_paths=(),
+            )
         return None
 
     monkeypatch.setattr(launcher, "_git_checkout_for_origin", checkout)
@@ -107,14 +119,14 @@ def test_environment_check_rejects_missing_entry_point(monkeypatch):
     _patch_complete_environment(monkeypatch)
     monkeypatch.setattr(
         launcher,
-        "_discover_platform_plugins",
-        lambda: (("ascend", "vllm_ascend:register"),),
+        "_discover_general_plugins",
+        lambda: (),
     )
 
     report = launcher.inspect_environment({})
 
     assert not report.ok
-    assert "missing vllm.platform_plugins entry point: moe_offload_ascend" in (
+    assert "missing vllm.general_plugins entry point: moe_offload_ascend" in (
         report.errors
     )
 
@@ -139,10 +151,7 @@ def test_environment_check_rejects_incorrect_entry_point_value(monkeypatch):
     monkeypatch.setattr(
         launcher,
         "_discover_platform_plugins",
-        lambda: (
-            ("ascend", "wrong.module:register"),
-            ("moe_offload_ascend", "vllm_moe_offload_ascend:register"),
-        ),
+        lambda: (("ascend", "wrong.module:register"),),
     )
 
     report = launcher.inspect_environment({})
@@ -222,8 +231,10 @@ def test_bundled_compatibility_lock_declares_current_seam_contract():
 
     lock = launcher._read_key_value_file(lock_path)
 
-    assert lock["seam_commit"] == "fffbd1eb75db455e4c90dfb2b8455d0e66ff5b25"
+    assert lock["seam_commit"] == "4806367eeeb7d62b32078ae90cd929cc06d825fe"
     assert lock["seam_abi"] == "1"
+    assert lock["vllm_commit"] == "ad7125a431e176d4161099480a66f0169609a690"
+    assert lock["vllm_tag"] == "v0.21.0"
     assert lock["vllm_version"] == "0.21.0"
 
 
@@ -234,7 +245,7 @@ def test_check_json_reports_result(monkeypatch, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
-    assert payload["platform_plugins"][1][0] == "moe_offload_ascend"
+    assert payload["general_plugins"][0][0] == "moe_offload_ascend"
     assert payload["seam_checkout"]["commit"] == "seam-commit"
 
 

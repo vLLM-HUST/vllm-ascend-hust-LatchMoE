@@ -15,9 +15,9 @@
 #
 """vllm-moe-offload-ascend: MoE Expert Offloading plugin for vllm-ascend.
 
-Registers via vllm's platform_plugins entry point. Calling register()
-monkey-patches the hook points in vllm_ascend so the real MoE offload
-logic is active instead of the null stubs.
+Registers via vLLM's general_plugins entry point. Calling register()
+installs adapters on the explicit hook points in vllm_ascend so the real MoE
+offload logic is active instead of the null stubs.
 """
 
 import os
@@ -36,7 +36,15 @@ def _compat_only_enabled() -> bool:
 
 
 def register() -> None:
-    """Entry point called by vllm's platform plugin system at startup."""
+    """Entry point called by vLLM's general-plugin loader in every process."""
+    from vllm_moe_offload_ascend.env_registry import (
+        register_environment_variables,
+    )
+
+    # Do this before importing runtime/config modules. vLLM owns validation,
+    # Ray propagation, and compile-cache handling for registered VLLM_* names.
+    register_environment_variables()
+
     if _compat_only_enabled():
         from vllm_moe_offload_ascend.patches.patch_fused_moe import (
             apply_cann_compat_patches,

@@ -3,7 +3,7 @@
   "id": "latchmoe",
   "repository": "vllm-ascend-hust-LatchMoE",
   "source_subdir": "",
-  "entrypoint": {"group": "vllm.platform_plugins", "name": "moe_offload_ascend"},
+  "entrypoint": {"group": "vllm.general_plugins", "name": "moe_offload_ascend"},
   "parameters": {
     "offload_gb": {"flag": "--offload-gb", "default": "14"}
   },

@@ -14,8 +14,11 @@ from typing import Mapping, Sequence
 
 
 PLATFORM_PLUGIN_GROUP = "vllm.platform_plugins"
+GENERAL_PLUGIN_GROUP = "vllm.general_plugins"
 REQUIRED_PLATFORM_PLUGINS = {
     "ascend": "vllm_ascend:register",
+}
+REQUIRED_GENERAL_PLUGINS = {
     "moe_offload_ascend": "vllm_moe_offload_ascend:register",
 }
 DEFAULT_COMPATIBILITY_LOCK = Path(__file__).with_name("compatibility.lock")
@@ -49,11 +52,13 @@ class EnvironmentReport:
     plugin: str | None
     acl: str | None
     platform_plugins: tuple[tuple[str, str], ...]
+    general_plugins: tuple[tuple[str, str], ...]
     vllm_plugins_filter: str | None
     compatibility_lock: str | None
     versions: tuple[tuple[str, str | None], ...]
     cann_root: str | None
     runtime_checkout: GitCheckout | None
+    vllm_checkout: GitCheckout | None
     seam_checkout: GitCheckout | None
     seam_abi: str | None
     strict: bool
@@ -88,6 +93,14 @@ def _discover_platform_plugins() -> tuple[tuple[str, str], ...]:
     discovered = (
         (str(item.name), str(item.value))
         for item in entry_points(group=PLATFORM_PLUGIN_GROUP)
+    )
+    return tuple(sorted(discovered))
+
+
+def _discover_general_plugins() -> tuple[tuple[str, str], ...]:
+    discovered = (
+        (str(item.name), str(item.value))
+        for item in entry_points(group=GENERAL_PLUGIN_GROUP)
     )
     return tuple(sorted(discovered))
 
@@ -229,14 +242,18 @@ def _validate_seam_abi(root: str, abi: str) -> tuple[str, ...]:
         ),
         "vllm_ascend/ops/fused_moe/moe_comm_method.py": (
             "class FusedExpertsResult",
+            "def _maybe_apply_moe_offload_plan",
             "before_gmm2_evt",
             "swiglu_limit",
         ),
-        "vllm_ascend/utils.py": ("def adapt_patch",),
-        "vllm_ascend/platform.py": (
-            "_LATCHMOE_STAGE_SEAM_ENV",
-            "vllm::moe_offload_stage",
+        "vllm_ascend/ops/fused_moe/moe_runtime_args.py": (
+            "MoEOffloadParams",
+            "physical_expert_count",
         ),
+        "vllm_ascend/ops/fused_moe/token_dispatcher.py": (
+            "physical_expert_count",
+        ),
+        "vllm_ascend/utils.py": ("def adapt_patch",),
     }
     errors: list[str] = []
     checkout = Path(root)
@@ -276,8 +293,8 @@ def inspect_environment(
         "plugin": _module_origin("vllm_moe_offload_ascend"),
         "acl": _module_origin("acl"),
     }
-    plugins = _discover_platform_plugins()
-    plugin_values = dict(plugins)
+    platform_plugins = _discover_platform_plugins()
+    general_plugins = _discover_general_plugins()
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -288,20 +305,27 @@ def inspect_environment(
         if origin is None:
             errors.append(f"required module is not importable: {label}")
 
-    for name, expected_value in REQUIRED_PLATFORM_PLUGINS.items():
-        actual_value = plugin_values.get(name)
-        if actual_value is None:
-            errors.append(f"missing {PLATFORM_PLUGIN_GROUP} entry point: {name}")
-        elif actual_value != expected_value:
-            errors.append(
-                f"incorrect {PLATFORM_PLUGIN_GROUP} entry point {name}: "
-                f"expected {expected_value}, got {actual_value}"
-            )
+    required_groups = (
+        (PLATFORM_PLUGIN_GROUP, REQUIRED_PLATFORM_PLUGINS, platform_plugins),
+        (GENERAL_PLUGIN_GROUP, REQUIRED_GENERAL_PLUGINS, general_plugins),
+    )
+    for group, required, discovered in required_groups:
+        plugin_values = dict(discovered)
+        for name, expected_value in required.items():
+            actual_value = plugin_values.get(name)
+            if actual_value is None:
+                errors.append(f"missing {group} entry point: {name}")
+            elif actual_value != expected_value:
+                errors.append(
+                    f"incorrect {group} entry point {name}: "
+                    f"expected {expected_value}, got {actual_value}"
+                )
 
     raw_filter = environment.get("VLLM_PLUGINS")
     if raw_filter is not None:
         allowed = {item.strip() for item in raw_filter.split(",") if item.strip()}
-        filtered = [name for name in REQUIRED_PLATFORM_PLUGINS if name not in allowed]
+        required_names = {*REQUIRED_PLATFORM_PLUGINS, *REQUIRED_GENERAL_PLUGINS}
+        filtered = [name for name in required_names if name not in allowed]
         if filtered:
             errors.append("VLLM_PLUGINS filters required plugins: " + ", ".join(filtered))
 
@@ -334,6 +358,7 @@ def inspect_environment(
         if item.strip()
     )
     runtime_checkout = _git_checkout_for_origin(origins["plugin"], clean_paths=clean_paths)
+    vllm_checkout = _git_checkout_for_origin(origins["vllm"])
     seam_checkout = _git_checkout_for_origin(origins["vllm_ascend"])
     expected_runtime = environment.get("LATCHMOE_EXPECTED_RUNTIME_COMMIT")
     minimum_runtime = compatibility.get("runtime_min_commit")
@@ -361,6 +386,16 @@ def inspect_environment(
             )
             (errors if strict_mode else warnings).append(message)
 
+    expected_vllm = compatibility.get("vllm_commit")
+    if vllm_checkout is None:
+        message = "vllm module is not backed by the locked Git checkout"
+        (errors if strict_mode else warnings).append(message)
+    elif expected_vllm and vllm_checkout.commit != expected_vllm:
+        errors.append(
+            f"vllm commit mismatch: expected {expected_vllm}, "
+            f"got {vllm_checkout.commit}"
+        )
+
     expected_seam = compatibility.get("seam_commit")
     seam_abi = compatibility.get("seam_abi")
     if seam_checkout is None:
@@ -383,12 +418,14 @@ def inspect_environment(
         vllm_ascend=origins["vllm_ascend"],
         plugin=origins["plugin"],
         acl=origins["acl"],
-        platform_plugins=plugins,
+        platform_plugins=platform_plugins,
+        general_plugins=general_plugins,
         vllm_plugins_filter=raw_filter,
         compatibility_lock=lock_path,
         versions=tuple(sorted(versions.items())),
         cann_root=cann_root,
         runtime_checkout=runtime_checkout,
+        vllm_checkout=vllm_checkout,
         seam_checkout=seam_checkout,
         seam_abi=seam_abi,
         strict=bool(strict_mode),
@@ -403,14 +440,16 @@ def _print_report(report: EnvironmentReport, *, as_json: bool = False) -> None:
         return
 
     status = "PASS" if report.ok else "FAIL"
-    plugin_names = ", ".join(name for name, _value in report.platform_plugins)
+    platform_names = ", ".join(name for name, _value in report.platform_plugins)
+    general_names = ", ".join(name for name, _value in report.general_plugins)
     print(f"LatchMoE environment check: {status}")
     print(f"python = {report.python}")
     print(f"vllm = {report.vllm or '<missing>'}")
     print(f"vllm_ascend = {report.vllm_ascend or '<missing>'}")
     print(f"plugin = {report.plugin or '<missing>'}")
     print(f"acl = {report.acl or '<missing>'}")
-    print(f"platform_plugins = {plugin_names or '<none>'}")
+    print(f"platform_plugins = {platform_names or '<none>'}")
+    print(f"general_plugins = {general_names or '<none>'}")
     print(f"VLLM_PLUGINS = {report.vllm_plugins_filter or '<unset>'}")
     print(f"compatibility_lock = {report.compatibility_lock or '<missing>'}")
     print("versions = " + ", ".join(f"{name}={value or '<missing>'}" for name, value in report.versions))
@@ -420,6 +459,13 @@ def _print_report(report: EnvironmentReport, *, as_json: bool = False) -> None:
             "runtime_git = "
             f"{report.runtime_checkout.commit} "
             f"root={report.runtime_checkout.root} dirty={report.runtime_checkout.dirty}"
+        )
+    if report.vllm_checkout is not None:
+        print(
+            "vllm_git = "
+            f"{report.vllm_checkout.commit} "
+            f"root={report.vllm_checkout.root} "
+            f"dirty={report.vllm_checkout.dirty}"
         )
     if report.seam_checkout is not None:
         print(
@@ -436,10 +482,8 @@ def _print_report(report: EnvironmentReport, *, as_json: bool = False) -> None:
 
 
 def _run_vllm_cli(argv: Sequence[str]) -> int:
-    # Import EngineArgs to completion before retrying plugin registration. vLLM
-    # platform discovery may call the plugin while this module is still being
-    # defined, which makes EngineArgs and NPUPlatform monkey-patches best-effort
-    # on the first pass.
+    # General plugin discovery normally registers LatchMoE while importing
+    # EngineArgs. Retry explicitly for programmatic launchers and idempotency.
     from vllm.engine.arg_utils import EngineArgs as _EngineArgs  # noqa: F401
     from vllm_moe_offload_ascend import register
 
