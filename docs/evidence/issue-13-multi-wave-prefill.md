@@ -77,10 +77,12 @@ remains the 11 historical trigger requests.
 | Prefix-cache hit rate | 0.0% |
 | Runtime/NPU/ACL errors | 0 |
 
-Compared with the Issue #11 no-prefix-cache `full_layer` Graph TTFT p50 of
-871.42 ms, multi-wave improves p50 by 31.5%. Its p95 of 755.86 ms is also below
-that historical p50 baseline. The 200-request run completed after successful
-PIECEWISE compilation and capture; the graph pool used 0.02 GiB.
+The original 31.5% comparison against the Issue #11 `full_layer` result came
+from different campaigns and was preliminary. Issue #17 subsequently replaced
+it with three same-campaign matched pairs: the repeat-median TTFT p50/p95
+reductions are 35.21%/22.96% within the qualified narrow configuration. See
+`docs/evidence/issue-17-matched-ttft.md`. The Issue #13 200-request run still
+serves as its original stability record; it is no longer the performance A/B.
 
 ## Overlap and Memory Evidence
 

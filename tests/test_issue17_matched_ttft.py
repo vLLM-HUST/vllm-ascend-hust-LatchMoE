@@ -6,13 +6,21 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 VERIFY = ROOT / "benchmark" / "scripts" / "verify_issue17_matched_ttft.py"
+PACKAGE = ROOT / "benchmark" / "scripts" / "package_issue17_evidence.py"
 
 
 def _module():
     spec = importlib.util.spec_from_file_location("issue17_verify", VERIFY)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _package_module():
+    spec = importlib.util.spec_from_file_location("issue17_package", PACKAGE)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -88,3 +96,12 @@ def test_verifier_rejects_token_mismatch(tmp_path: Path) -> None:
     report = _module().verify_unit(wave, arm="multi_wave", expected_requests=3, oracle_benchmark=full / "benchmark.json")
     assert report["status"] == "failed"
     assert report["oracle"]["mismatched_request_ids"] == ["r1"]
+
+
+def test_packager_requires_passing_campaign(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    _write(output / "campaign.json", {"units": []})
+    _write(output / "matched_summary.json", {"status": "failed"})
+    with pytest.raises(ValueError, match="has not passed"):
+        _package_module().package(output, tmp_path / "bundle.tar.gz")

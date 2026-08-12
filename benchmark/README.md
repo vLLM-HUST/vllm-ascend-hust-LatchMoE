@@ -187,3 +187,9 @@ is `VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE`. The dedicated verifier derives
 TTFT/TPOT p50 and p95 from every raw request, requires exact token IDs across
 all units, rejects multi-wave fallback, checks NPU/ACL/OOM markers and release
 ACKs, and fails if provenance differs between arms.
+
+After a passing campaign, `package_issue17_evidence.py` copies only the six
+declared formal units into a portable archive, rewrites the campaign unit paths
+relative to the bundle root, includes the fixed workload manifest, and emits a
+SHA-256 list for every packaged file. It refuses to package a campaign without
+both a passing summary and `PASSED.txt`.
