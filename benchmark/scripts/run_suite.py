@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -224,13 +225,22 @@ def _health_url(config: dict[str, Any]) -> str:
 
 
 def _wait_for_server(
-    url: str, proc: subprocess.Popen[Any] | None, timeout_s: float
+    url: str,
+    proc: subprocess.Popen[Any] | None,
+    timeout_s: float,
+    is_alive: Callable[[], bool] | None = None,
 ) -> None:
     deadline = time.monotonic() + float(timeout_s)
     last_error = ""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     request = urllib.request.Request(url, headers={"Connection": "close"})
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"server process exited before readiness with code {proc.returncode}"
+            )
+        if is_alive is not None and not is_alive():
+            raise RuntimeError("managed server exited before readiness")
         try:
             with opener.open(request, timeout=5) as resp:
                 if 200 <= int(resp.status) < 500:
@@ -340,7 +350,7 @@ def _managed_env(
     if managed_backend == "locked-host":
         env.update(
             {
-                "LATCHMOE_HOST_PYTHON": str(Path(args.host_python).resolve()),
+                "LATCHMOE_HOST_PYTHON": str(Path(args.host_python).absolute()),
                 "LATCHMOE_RUNTIME_ROOT": str(Path(__file__).resolve().parents[2]),
                 "LATCHMOE_VLLM_ROOT": str(Path(args.vllm_root).resolve()),
                 "LATCHMOE_SEAM_ROOT": str(Path(args.seam_root).resolve()),
@@ -508,7 +518,28 @@ def run_unit(
                 if args.startup_timeout_s is not None
                 else float(config["server"].get("startup_timeout_s", 1200))
             )
-            _wait_for_server(_health_url(config), None, timeout_s)
+            def managed_server_alive() -> bool:
+                observed = _manager_call(
+                    manager,
+                    "status",
+                    managed_env,
+                    lifecycle_log_path,
+                    check=False,
+                )
+                if observed.returncode != 0:
+                    return False
+                state = json.loads(observed.stdout.strip().splitlines()[-1])
+                return (
+                    state.get("active_state") == "active"
+                    and int(state.get("main_pid", 0)) > 0
+                )
+
+            _wait_for_server(
+                _health_url(config),
+                None,
+                timeout_s,
+                is_alive=managed_server_alive,
+            )
 
         with client_log_path.open("w", encoding="utf-8") as client_log:
             completed = subprocess.run(
@@ -588,7 +619,12 @@ def run_unit(
         )
     marker = unit_dir / ("FAILED.txt" if result["status"] == "failed" else "PASSED.txt")
     marker.write_text(
-        str(result.get("error") or "all managed unit gates passed") + "\n",
+        str(
+            result.get("error")
+            or result.get("error_type")
+            or "all managed unit gates passed"
+        )
+        + "\n",
         encoding="utf-8",
     )
     write_json(unit_dir / "unit_result.json", result)

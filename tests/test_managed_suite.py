@@ -123,7 +123,7 @@ def test_locked_host_env_pins_custody_and_piecewise_graph(tmp_path: Path) -> Non
         ),
     )
 
-    assert env["LATCHMOE_HOST_PYTHON"] == str(Path(sys.executable).resolve())
+    assert env["LATCHMOE_HOST_PYTHON"] == str(Path(sys.executable).absolute())
     assert env["LATCHMOE_CUSTODY_STATE"].endswith("custody_state.json")
     compilation = json.loads(env["VLLM_ENGINE_COMPILATION_CONFIG"])
     assert compilation["cudagraph_mode"] == "PIECEWISE"
@@ -156,3 +156,13 @@ def test_locked_host_manager_stops_only_its_process_group(tmp_path: Path) -> Non
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_wait_for_server_fails_fast_when_managed_process_dies() -> None:
+    with pytest.raises(RuntimeError, match="managed server exited"):
+        _load_run_suite()._wait_for_server(
+            "http://127.0.0.1:9/v1/models",
+            proc=None,
+            timeout_s=60,
+            is_alive=lambda: False,
+        )

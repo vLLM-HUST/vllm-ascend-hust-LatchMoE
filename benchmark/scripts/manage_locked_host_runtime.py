@@ -64,7 +64,9 @@ def _start(path: Path) -> dict:
     current = _status(path)
     if current["active_state"] == "active":
         raise RuntimeError(f"custody already active with pid {current['main_pid']}")
-    python = Path(_required_env("LATCHMOE_HOST_PYTHON")).resolve()
+    # Preserve a venv launcher path instead of resolving its symlink to the base
+    # interpreter; Python uses argv[0] to recover the virtual-environment prefix.
+    python = Path(_required_env("LATCHMOE_HOST_PYTHON")).absolute()
     runtime_root = Path(_required_env("LATCHMOE_RUNTIME_ROOT")).resolve()
     vllm_root = Path(_required_env("LATCHMOE_VLLM_ROOT")).resolve()
     seam_root = Path(_required_env("LATCHMOE_SEAM_ROOT")).resolve()
@@ -139,6 +141,12 @@ def _start(path: Path) -> dict:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     temporary.replace(path)
+    time.sleep(0.25)
+    return_code = process.poll()
+    if return_code is not None:
+        raise RuntimeError(
+            f"managed runtime exited during startup with code {return_code}"
+        )
     return _status(path)
 
 
