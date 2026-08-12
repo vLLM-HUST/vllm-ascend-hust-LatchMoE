@@ -285,6 +285,18 @@ class B2DirectScatterPayload:
     restore_token_indices: "torch.Tensor"
     device_descriptor: "B2DeviceScatterDescriptor | None" = None
     wave_index: int = 0
+    pair_offsets: "torch.Tensor | None" = None
+    combine_metadata: object | None = None
+
+
+class B2WaveFallback(RuntimeError):
+    """A recoverable multi-wave qualification failure.
+
+    This exception is reserved for failures detected before a wave result is
+    published to the model.  The comm-method wrapper may safely replace the
+    attempted multi-wave result with the blocking full-layer path.  Device,
+    ACL, OOM, and arbitrary runtime failures must not be wrapped in this type.
+    """
 
 
 @dataclass(frozen=True)
@@ -1748,6 +1760,99 @@ def direct_scatter_add_b2_permuted_outputs(
         torch.cat(tuple(weighted_chunks), dim=0),
     )
     return full_output
+
+
+def build_b2_native_combine_inputs(
+    payloads: tuple[B2DirectScatterPayload, ...],
+    *,
+    total_pairs: int,
+) -> tuple["torch.Tensor", "torch.Tensor", object]:
+    """Reassemble wave outputs for one native top-k token-unpermute.
+
+    A pair wave forces ``top_k=1`` and therefore cannot use its local combine
+    result without changing the native MoE reduction contract.  This helper
+    concatenates the wave-local permuted MLP outputs, then builds one global
+    unpermute index in the *original flattened top-k pair order*.  The caller
+    can pass these tensors, the original top-k weights, and the returned
+    metadata template to the dispatcher's ordinary ``token_combine`` method.
+
+    Keeping the final router weighting and top-k reduction inside the native
+    operator avoids the different BF16/FP32 evaluation order introduced by
+    wave-local combine followed by ``index_add_``.
+    """
+    import os
+    import torch
+
+    expected_pairs = int(total_pairs)
+    if expected_pairs < 0:
+        raise ValueError("total_pairs must be non-negative")
+
+    non_empty = sorted(
+        (payload for payload in payloads if payload.permuted_tokens.numel() > 0),
+        key=lambda payload: int(payload.wave_index),
+    )
+    if not non_empty:
+        raise ValueError("native B2 combine requires at least one non-empty wave")
+    if any(payload.pair_offsets is None for payload in non_empty):
+        raise B2WaveFallback(
+            "native B2 combine requires original flat pair offsets for every wave"
+        )
+    metadata = non_empty[0].combine_metadata
+    if metadata is None:
+        raise B2WaveFallback(
+            "native B2 combine requires a combine metadata template"
+        )
+
+    device = non_empty[0].permuted_tokens.device
+    pair_count = sum(int(payload.pair_offsets.numel()) for payload in non_empty)
+    if pair_count != expected_pairs:
+        raise B2WaveFallback(
+            "B2 wave pair coverage does not match the original top-k routing: "
+            f"covered={pair_count} expected={expected_pairs}"
+        )
+
+    global_unpermute = torch.empty(
+        expected_pairs,
+        dtype=non_empty[0].expanded_row_idx.dtype,
+        device=device,
+    )
+    permuted_chunks = []
+    row_base = 0
+    for payload in non_empty:
+        permuted = payload.permuted_tokens
+        pair_offsets = payload.pair_offsets.to(device=device, dtype=torch.long)
+        expanded = payload.expanded_row_idx.reshape(-1).abs().to(
+            device=device,
+            dtype=global_unpermute.dtype,
+        )
+        if int(expanded.numel()) != int(pair_offsets.numel()):
+            raise B2WaveFallback(
+                "B2 wave unpermute index does not match its routed-pair count: "
+                f"indices={int(expanded.numel())} "
+                f"pairs={int(pair_offsets.numel())}"
+            )
+        global_unpermute.index_copy_(0, pair_offsets, expanded + int(row_base))
+        permuted_chunks.append(permuted)
+        row_base += int(permuted.shape[0])
+
+    if os.environ.get("SEW_B2_VALIDATE"):
+        all_pair_offsets = torch.cat(
+            tuple(
+                payload.pair_offsets.to(device=device, dtype=torch.long)
+                for payload in non_empty
+            )
+        )
+        canonical_offsets = torch.arange(
+            expected_pairs,
+            dtype=torch.long,
+            device=device,
+        )
+        if not torch.equal(torch.sort(all_pair_offsets).values, canonical_offsets):
+            raise B2WaveFallback(
+                "B2 waves must cover every original top-k pair exactly once"
+            )
+
+    return torch.cat(tuple(permuted_chunks), dim=0), global_unpermute, metadata
 
 
 def build_wave_expert_map(

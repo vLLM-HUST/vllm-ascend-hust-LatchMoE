@@ -651,19 +651,46 @@ def _b2_reference_full_layer_enabled(*, async_stage: bool) -> bool:
 
 
 def _b2_overflow_mode() -> str:
-    """Return the fail-closed execution mode for slot-capacity overflow."""
+    """Return the execution mode for slot-capacity overflow.
+
+    ``experimental_wave`` remains a compatibility alias for the now-qualified
+    ``multi_wave`` mode.  ``full_layer`` stays available as an explicit mode
+    and as the automatic fallback for recoverable wave qualification failures.
+    """
 
     mode = os.getenv(
         "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
-        "full_layer",
+        "multi_wave",
     ).strip().lower()
-    if mode not in {"full_layer", "experimental_wave"}:
+    if mode == "experimental_wave":
+        mode = "multi_wave"
+    if mode not in {"full_layer", "multi_wave"}:
         raise RuntimeError(
             "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE must be "
-            "'full_layer' or 'experimental_wave', got "
+            "'multi_wave' (legacy alias 'experimental_wave') or "
+            "'full_layer', got "
             f"{mode!r}"
         )
     return mode
+
+
+def _b2_multi_wave_preflight_failure(runtime: Any) -> str | None:
+    """Return a safe fallback reason before any wave staging or compute."""
+
+    if not _to_bool_env(
+        "VLLM_ASCEND_MOE_OFFLOAD_B2_DIRECT_SCATTER",
+        "1",
+    ):
+        return "native_recombine_disabled"
+    if int(getattr(runtime.config, "num_slots", 0) or 0) <= 0:
+        return "no_physical_slots"
+    if (
+        bool(getattr(runtime.config, "async_load", False))
+        and int(getattr(runtime.config, "effective_prefill_prefetch_depth", 0)) > 0
+        and int(getattr(runtime.config, "effective_prefill_buffer_count", 1)) < 2
+    ):
+        return "overlap_requires_two_buffers"
+    return None
 
 
 
@@ -1056,6 +1083,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
 
     def _maybe_run_b2_wave_prefill(self, fused_experts_input, before_dispatch_evt):
         from vllm_moe_offload_ascend.moe_offload.phase_split import (
+            B2WaveFallback,
             count_routed_tokens_by_expert,
         )
 
@@ -1138,23 +1166,43 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         if not (b2_phase_match or b2_overflow_handoff):
             return None
 
-        return self._run_b2_wave_prefill(
-            fused_experts_input=fused_experts_input,
-            active_experts=active_experts,
-            token_counts=token_counts,
-            before_dispatch_evt=before_dispatch_evt,
-            control_profile={
-                "b2_total_start": b2_control_start,
-                "token_count_ms": token_count_ms,
-                "route_stats_cache_hit": route_stats_cache_hit,
-                "forward_phase": str(forward_phase),
-                "pair_offsets_by_expert": (
-                    route_stats.pair_offsets_by_expert
-                    if route_stats is not None
-                    else None
-                ),
-            },
-        )
+        control_profile = {
+            "b2_total_start": b2_control_start,
+            "token_count_ms": token_count_ms,
+            "route_stats_cache_hit": route_stats_cache_hit,
+            "forward_phase": str(forward_phase),
+            "pair_offsets_by_expert": (
+                route_stats.pair_offsets_by_expert
+                if route_stats is not None
+                else None
+            ),
+        }
+        try:
+            return self._run_b2_wave_prefill(
+                fused_experts_input=fused_experts_input,
+                active_experts=active_experts,
+                token_counts=token_counts,
+                before_dispatch_evt=before_dispatch_evt,
+                control_profile=control_profile,
+            )
+        except B2WaveFallback as exc:
+            fallback_reason = f"{type(exc).__name__}: {exc}"
+            if _os.environ.get("SEW_B2_PROBE") or _os.environ.get(
+                "SEW_OFFLOAD_PROBE"
+            ):
+                print(
+                    "SEW_B2 branch=FALLBACK_FULL_LAYER "
+                    f"layer={offload.layer_id} reason={fallback_reason}",
+                    flush=True,
+                )
+            return self._run_b2_full_layer_reference(
+                fused_experts_input=fused_experts_input,
+                before_dispatch_evt=before_dispatch_evt,
+                b2_total_start=b2_control_start,
+                forward_phase=str(forward_phase),
+                route_stats_cache_hit=route_stats_cache_hit,
+                fallback_reason=fallback_reason,
+            )
 
     def _run_b2_wave_prefill(
         self,
@@ -1166,8 +1214,9 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         control_profile=None,
     ):
         from vllm_moe_offload_ascend.moe_offload.phase_split import (
+            B2WaveFallback,
+            build_b2_native_combine_inputs,
             count_routed_tokens_by_expert,
-            direct_scatter_add_b2_permuted_outputs,
             plan_b2_prefill_async_schedule,
             plan_balanced_b2_waves,
             scatter_add_b2_pair_outputs,
@@ -1202,11 +1251,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             if control_profile
             else None
         )
+        overflow_mode = _b2_overflow_mode()
         if (
             _b2_reference_full_layer_enabled(
                 async_stage=bool(runtime.config.async_load)
             )
-            or _b2_overflow_mode() == "full_layer"
+            or overflow_mode == "full_layer"
         ):
             return self._run_b2_full_layer_reference(
                 fused_experts_input=fused_experts_input,
@@ -1214,6 +1264,16 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 b2_total_start=b2_total_start,
                 forward_phase=forward_phase,
                 route_stats_cache_hit=route_stats_cache_hit,
+            )
+        preflight_failure = _b2_multi_wave_preflight_failure(runtime)
+        if preflight_failure is not None:
+            return self._run_b2_full_layer_reference(
+                fused_experts_input=fused_experts_input,
+                before_dispatch_evt=before_dispatch_evt,
+                b2_total_start=b2_total_start,
+                forward_phase=forward_phase,
+                route_stats_cache_hit=route_stats_cache_hit,
+                fallback_reason=preflight_failure,
             )
         if token_counts is None:
             token_count_start = perf_counter()
@@ -1231,18 +1291,21 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             "0",
         )
         wave_plan_start = perf_counter()
-        wave_plan = plan_balanced_b2_waves(
-            token_counts,
-            num_slots,
-            slot_readiness=(
-                {} if reference_full_tokens_requested else readiness
-            ),
-            fold_partial_hits_into_miss=(
-                True
-                if reference_full_tokens_requested
-                else not bool(runtime.config.b2_avoid_mixed_wave_d2d)
-            ),
-        )
+        try:
+            wave_plan = plan_balanced_b2_waves(
+                token_counts,
+                num_slots,
+                slot_readiness=(
+                    {} if reference_full_tokens_requested else readiness
+                ),
+                fold_partial_hits_into_miss=(
+                    True
+                    if reference_full_tokens_requested
+                    else not bool(runtime.config.b2_avoid_mixed_wave_d2d)
+                ),
+            )
+        except ValueError as exc:
+            raise B2WaveFallback(f"wave planning failed: {exc}") from exc
         wave_plan_ms = (perf_counter() - wave_plan_start) * 1000.0
         waves = wave_plan.waves
         wave_token_counts = tuple(int(wave_plan.wave_tokens(wave)) for wave in waves)
@@ -1335,30 +1398,35 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             )
         pair_index_ms = (perf_counter() - pair_index_start) * 1000.0
         wave_microbatch_plan_start = perf_counter()
-        if reference_full_tokens:
-            wave_microbatch_plans = None
-        elif device_pair_planning:
-            wave_microbatch_plans = build_b2_device_wave_microbatch_plans(
-                fused_experts_input.topk_ids,
-                waves,
-                num_logical_experts=int(offload.num_logical_experts),
-                active_experts=unique_active,
-                physical_slot_by_expert={},
-                wave_pair_counts=tuple(
-                    int(wave_plan.wave_tokens(wave)) for wave in waves
-                ),
-                include_logical_expert_ids=False,
-            )
-        else:
-            wave_microbatch_plans = build_b2_wave_microbatch_plans(
-                pair_index,
-                waves,
-                physical_slot_by_expert={},
-                preserve_pair_order=False,
-                include_logical_expert_ids=False,
-                include_topk_positions=False,
-                normalize_inputs=False,
-            )
+        try:
+            if reference_full_tokens:
+                wave_microbatch_plans = None
+            elif device_pair_planning:
+                wave_microbatch_plans = build_b2_device_wave_microbatch_plans(
+                    fused_experts_input.topk_ids,
+                    waves,
+                    num_logical_experts=int(offload.num_logical_experts),
+                    active_experts=unique_active,
+                    physical_slot_by_expert={},
+                    wave_pair_counts=tuple(
+                        int(wave_plan.wave_tokens(wave)) for wave in waves
+                    ),
+                    include_logical_expert_ids=False,
+                )
+            else:
+                wave_microbatch_plans = build_b2_wave_microbatch_plans(
+                    pair_index,
+                    waves,
+                    physical_slot_by_expert={},
+                    preserve_pair_order=False,
+                    include_logical_expert_ids=False,
+                    include_topk_positions=False,
+                    normalize_inputs=False,
+                )
+        except ValueError as exc:
+            raise B2WaveFallback(
+                f"wave microbatch planning failed: {exc}"
+            ) from exc
         wave_microbatch_plan_ms = (
             perf_counter() - wave_microbatch_plan_start
         ) * 1000.0
@@ -2027,14 +2095,26 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             return None
         scatter_start = perf_counter()
         if pending_direct_scatter_payloads:
-            direct_scatter_add_b2_permuted_outputs(
-                accumulated,
-                tuple(
-                    payload
-                    for _, payload in sorted(
-                        pending_direct_scatter_payloads.items()
-                    )
-                ),
+            native_permuted, native_expanded, combine_metadata = (
+                build_b2_native_combine_inputs(
+                    tuple(
+                        payload
+                        for _, payload in sorted(
+                            pending_direct_scatter_payloads.items()
+                        )
+                    ),
+                    total_pairs=int(fused_experts_input.topk_ids.numel()),
+                )
+            )
+            native_metadata = replace(
+                combine_metadata,
+                topk_weights=fused_experts_input.topk_weights,
+                expanded_row_idx=native_expanded,
+                restore_shape=fused_experts_input.hidden_states.shape,
+            )
+            accumulated = self.token_dispatcher.token_combine(
+                hidden_states=native_permuted,
+                combine_metadata=native_metadata,
             )
         if pending_pair_outputs:
             pair_wave_indices = sorted(pending_pair_outputs)
@@ -2149,6 +2229,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         b2_total_start,
         forward_phase,
         route_stats_cache_hit,
+        fallback_reason=None,
     ):
         runtime = get_moe_offload_runtime()
         offload = fused_experts_input.offload
@@ -2284,7 +2365,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 f"SEW_B2 branch=REFERENCE_FULL_LAYER layer={offload.layer_id} "
                 f"n_tokens={int(fused_experts_input.hidden_states.shape[0])} "
                 f"physical_experts={prepared.physical_expert_count} "
-                f"h2d_bytes={stage_payload['h2d_bytes']}",
+                f"h2d_bytes={stage_payload['h2d_bytes']} "
+                f"fallback_reason={fallback_reason}",
                 flush=True,
             )
         if (
@@ -2302,6 +2384,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     "top_k": int(fused_experts_input.topk_ids.shape[-1]),
                     "forward_phase": str(forward_phase),
                     "route_stats_cache_hit": bool(route_stats_cache_hit),
+                    "fallback_reason": fallback_reason,
                     "end_to_end_ms": round(end_to_end_ms, 3),
                 },
             )
@@ -2328,7 +2411,6 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
     ):
         from vllm_moe_offload_ascend.moe_offload.phase_split import (
             B2DirectScatterPayload,
-            build_b2_device_scatter_descriptor,
             build_b2_pair_microbatch,
             build_b2_pair_microbatch_from_index,
             build_b2_pair_microbatch_from_plan,
@@ -2446,22 +2528,14 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 "VLLM_ASCEND_MOE_OFFLOAD_B2_DIRECT_SCATTER",
                 "1",
             )
+            if not direct_scatter_enabled:
+                raise RuntimeError(
+                    "experimental B2 wave execution requires native layer-level "
+                    "top-k recombine; refusing the non-equivalent wave-local "
+                    "combine fallback"
+                )
             if direct_scatter_enabled:
                 combine_start = perf_counter()
-                device_scatter_descriptor = None
-                if _to_bool_env(
-                    "VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING",
-                    "1",
-                ):
-                    device_scatter_descriptor = build_b2_device_scatter_descriptor(
-                        expanded_row_idx=(
-                            token_dispatch_output.combine_metadata.expanded_row_idx
-                        ),
-                        topk_weights=microbatch.topk_weights,
-                        restore_token_indices=microbatch.restore_token_indices,
-                        output_dtype=mlp_output.dtype,
-                        output_device=mlp_output.device,
-                    )
                 direct_scatter_payload = B2DirectScatterPayload(
                     permuted_tokens=mlp_output,
                     expanded_row_idx=(
@@ -2469,7 +2543,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     ),
                     topk_weights=microbatch.topk_weights,
                     restore_token_indices=microbatch.restore_token_indices,
-                    device_descriptor=device_scatter_descriptor,
+                    pair_offsets=(
+                        microbatch_plan.pair_offsets
+                        if microbatch_plan is not None
+                        else None
+                    ),
+                    combine_metadata=token_dispatch_output.combine_metadata,
                 )
                 routed_out = torch.empty(
                     0,
@@ -2478,8 +2557,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                     device=mlp_output.device,
                 )
                 combine_ms = (perf_counter() - combine_start) * 1000.0
-                combine_mode = "direct_scatter_payload"
-                scatter_mode = "layer_direct_permuted"
+                combine_mode = "native_recombine_payload"
+                scatter_mode = "layer_native_topk"
             else:
                 combine_start = perf_counter()
                 routed_out = self.token_dispatcher.token_combine(
@@ -2524,9 +2603,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 "combine_mode": combine_mode,
                 "scatter_mode": scatter_mode,
                 "scatter_descriptor_mode": (
-                    "npu_device"
+                    "native_topk"
                     if direct_scatter_payload is not None
-                    and direct_scatter_payload.device_descriptor is not None
                     else "deferred"
                 ),
                 "direct_scatter_payload": direct_scatter_payload,

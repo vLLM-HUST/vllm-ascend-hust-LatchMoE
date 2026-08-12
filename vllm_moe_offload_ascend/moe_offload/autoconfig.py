@@ -85,9 +85,9 @@ _SEW_DATAPLANE_ENV_VARS = {
     "VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE": "1",
     "VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM": "1",
     "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL": "1",
-    # Multi-wave BF16 accumulation is not token-equivalent to the native
-    # single-pass MoE path. Keep it opt-in until it passes the oracle suite.
-    "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE": "full_layer",
+    # Prefer the qualified native-recombine multi-wave path. Recoverable
+    # qualification failures fall back to the blocking full-layer path.
+    "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE": "multi_wave",
     "VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME": "0",
     "VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD": "1",
     "VLLM_ASCEND_MOE_OFFLOAD_PIN_HOST_MEMORY": "1",

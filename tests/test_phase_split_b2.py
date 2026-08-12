@@ -3,6 +3,7 @@ import pytest
 
 from vllm_moe_offload_ascend.moe_offload.phase_split import (
     B2DirectScatterPayload,
+    build_b2_native_combine_inputs,
     build_b2_pair_microbatch,
     build_b2_pair_microbatch_from_index,
     build_b2_pair_microbatch_from_plan,
@@ -1046,6 +1047,74 @@ def test_direct_scatter_promotes_bfloat16_payload_to_accumulator_dtype():
 
     assert output.dtype == torch.float32
     assert output.item() == 1.0
+
+
+def test_native_combine_inputs_restore_original_topk_pair_order():
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Metadata:
+        topk_weights: torch.Tensor
+        expanded_row_idx: torch.Tensor
+        restore_shape: torch.Size
+
+    metadata = Metadata(
+        topk_weights=torch.empty(0),
+        expanded_row_idx=torch.empty(0, dtype=torch.long),
+        restore_shape=torch.Size((0, 1)),
+    )
+    # Wave 0 owns original pairs 1 and 3. Its local unpermute swaps the two
+    # rows. Wave 1 owns original pairs 0 and 2 and keeps its rows in order.
+    payloads = (
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[30.0], [10.0]]),
+            expanded_row_idx=torch.tensor([1, 0], dtype=torch.int32),
+            topk_weights=torch.ones(2, 1),
+            restore_token_indices=torch.tensor([0, 1]),
+            pair_offsets=torch.tensor([1, 3]),
+            combine_metadata=metadata,
+            wave_index=0,
+        ),
+        B2DirectScatterPayload(
+            permuted_tokens=torch.tensor([[20.0], [40.0]]),
+            expanded_row_idx=torch.tensor([0, 1], dtype=torch.int32),
+            topk_weights=torch.ones(2, 1),
+            restore_token_indices=torch.tensor([0, 1]),
+            pair_offsets=torch.tensor([0, 2]),
+            combine_metadata=metadata,
+            wave_index=1,
+        ),
+    )
+
+    permuted, expanded, observed_metadata = build_b2_native_combine_inputs(
+        payloads,
+        total_pairs=4,
+    )
+
+    assert torch.equal(
+        permuted,
+        torch.tensor([[30.0], [10.0], [20.0], [40.0]]),
+    )
+    assert expanded.tolist() == [2, 1, 3, 0]
+    assert torch.equal(
+        permuted.index_select(0, expanded.to(torch.long)),
+        torch.tensor([[20.0], [10.0], [40.0], [30.0]]),
+    )
+    assert observed_metadata is metadata
+
+
+def test_native_combine_inputs_fail_closed_on_incomplete_pair_coverage():
+    payload = B2DirectScatterPayload(
+        permuted_tokens=torch.tensor([[1.0]]),
+        expanded_row_idx=torch.tensor([0], dtype=torch.int32),
+        topk_weights=torch.ones(1, 1),
+        restore_token_indices=torch.tensor([0]),
+        pair_offsets=torch.tensor([0]),
+        combine_metadata=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="pair coverage"):
+        build_b2_native_combine_inputs((payload,), total_pairs=2)
 
 
 def test_build_b2_pair_microbatch_can_skip_hot_path_unstaged_validation():
