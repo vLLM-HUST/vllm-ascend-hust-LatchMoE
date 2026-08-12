@@ -127,6 +127,10 @@ Each benchmark unit writes:
 - `benchmark.json`: serving metrics from the streaming client.
 - `unit_result.json`: normalized status and pointers to artifacts.
 - `moe_profile.jsonl`: SEW/MoE runtime profile events when enabled.
+- `npu_samples.jsonl`: bounded-rate physical HBM and NPU-utilization samples,
+  including a post-release sample.
+- `release_ack.json`: portable unit-local release proof (the external custody
+  directory retains the same acknowledgement).
 - `moe_trace.jsonl`: routed expert trace events when enabled.
 - `PASSED.txt` or `FAILED.txt`: fail-closed unit disposition.
 
@@ -154,9 +158,11 @@ Every stage runs PIECEWISE ACLGraph only and is checked by
 `verify_issue7_graph_unit.py`. The verifier requires non-empty output, graph
 capture and replay, fixed slot-address equality, generation-protected compute,
 H2D-before-mapping publication, capacity-bounded multi-wave prefill, complete
-provenance, and a successful release ACK. It also emits the H2D copy enqueue,
-waiting/event, slot update, wave-prefill compute, and stage issue/wait timing
-breakdown requested by Issue #7.
+provenance, exact token IDs against the preceding gate, physical HBM samples,
+and a successful release ACK. It also emits H2D copy enqueue, waiting/event,
+slot update, wave-prefill compute, stage issue/wait, and sampled Graph replay
+issue timing. Replay issue time is CPU-side dispatch timing and does not imply
+device-kernel execution time.
 
 Example for a locked host stack:
 

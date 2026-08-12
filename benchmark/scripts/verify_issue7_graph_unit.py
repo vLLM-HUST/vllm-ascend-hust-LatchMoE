@@ -140,7 +140,12 @@ def verify_unit(
         failures.append(f"unit status is {result.get('status')!r}")
     if result.get("release_status") != "released":
         failures.append(f"release status is {result.get('release_status')!r}")
-    release_ack = Path(str(result.get("release_ack") or ""))
+    local_release_ack = unit_dir / "release_ack.json"
+    release_ack = (
+        local_release_ack
+        if local_release_ack.is_file()
+        else Path(str(result.get("release_ack") or ""))
+    )
     if not release_ack.is_file():
         failures.append("release ACK is missing")
     else:

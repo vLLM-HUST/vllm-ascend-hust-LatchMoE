@@ -3,11 +3,11 @@
 **LatchMoE: Address-stable, Graph-compatible expert offloading framework for MoE inference**
 
 > 📄 **Paper**: [USENIX-style draft](paper/main.pdf) and
-> [claim ledger](paper/CLAIMS.md). The current performance table remains
-> preliminary until its raw run manifests and repetitions are checked in.
+> [claim ledger](paper/CLAIMS.md). Graph-path lifecycle evidence is checked in;
+> broad performance claims still require the full matched evaluation matrix.
 
 - 负责人：李昶吾（`@Li-changwu`）、陈德斌（`@pluviophile-chen`）
-- 当前工作：[运行时边界与 graph 路径证据 #4](https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE/issues/4)
+- 当前证据：[Issue #7 graph lifecycle bundle](docs/evidence/issue-7-graph-lifecycle.md)
 
 ---
 
@@ -54,10 +54,10 @@ graph replay and run eager.
 2. **Replay-boundary staging** — a staging controller executes all
    routing-driven host-to-device expert transfers outside the captured
    region, on a dedicated transfer stream.
-3. **Correctness-first overflow staging** — when a prompt-shaped working set
-   exceeds slot capacity, the supported path stages the full expert layer and
-   executes one native MoE pass. Capacity-bounded multi-wave prefill remains
-   experimental because it changes BF16 evaluation order.
+3. **Capacity-bounded multi-wave prefill** — when a prompt-shaped working set
+   exceeds slot capacity, the default path executes exact routed pairs in
+   bounded waves and performs one native combine. Recoverable qualification
+   failures fall back to the blocking `full_layer` path.
 4. **Compute-protected slot lifecycle** — event ordering between the compute
    and transfer streams guarantees that asynchronous loads never overwrite a
    slot still referenced by in-flight compute.
@@ -75,28 +75,29 @@ uninstalling the plugin restores stock behavior.
 
 ---
 
-## Key Results
+## Qualified Graph Result
 
-Engineering measurements with Qwen3-30B-A3B (BF16, unquantized MoE), a single
-Ascend 910B-class NPU (64 GB), TP1, `max_num_seqs=1`, 200 real ShareGPT
-mixed-chat requests, and a 14 GiB offload budget. Both sides run the same
-LatchMoE runtime and offload configuration; only ACLGraph capture is toggled.
+Issue #7 validates the graph lifecycle on Qwen3-30B-A3B BF16, one Ascend
+910B2 NPU, TP1, `max_num_seqs=1`, prefix cache disabled, and a 14 GiB offload
+budget. Three independent service starts used the same 11-request ShareGPT
+gate; each completed 11/11 requests and 1,408 output tokens with exact token-ID
+agreement across starts.
 
-| Metric | Eager offload (capture off) | LatchMoE (capture on) | Improvement |
-|---|---:|---:|---:|
-| TTFT p50 (ms) | 2283.2 | 1373.6 | **1.66×** |
-| TPOT p50 (ms/token) | 192.5 | 83.6 | **2.30×** |
-| Output throughput (tok/s) | 4.71 | 10.47 | **2.22×** |
+| Metric | Repeat 1 | Repeat 2 | Repeat 3 | Mean ± population SD |
+|---|---:|---:|---:|---:|
+| TTFT p50 (ms) | 573.64 | 537.70 | 573.11 | 561.48 ± 16.82 |
+| TPOT p50 (ms/token) | 55.33 | 55.93 | 53.56 | 54.94 ± 1.01 |
+| Output throughput (tok/s) | 16.52 | 16.50 | 17.08 | 16.70 ± 0.27 |
+| Physical HBM peak / post-release | 91% / 5% | 91% / 5% | 91% / 5% | — |
 
-Context under the same memory budget:
-
-- Serving without offloading fails KV-cache allocation outright: the model
-  weights alone exceed the HBM budget.
-- Naive per-step on-demand staging in eager mode does produce tokens, but at
-  roughly 3 s/token TPOT — about 36× slower than LatchMoE — because every
-  decode step re-transfers the offloaded experts.
-- Slot hit rate warms from ~50% to 75–88% over the run under the deadline
-  staging policy.
+All starts recorded explicit PIECEWISE capture/replay, stable slot addresses,
+generation protection, H2D-before-consume, bounded multi-wave execution, raw
+timing/profile logs, and release ACKs. See the
+[Issue #7 evidence record](docs/evidence/issue-7-graph-lifecycle.md) and its
+checked-in raw bundle. These are graph-correctness and narrow-configuration
+service measurements, not a matched performance comparison. The former
+capture-off table is intentionally removed: it was a historical diagnostic
+without the repeated raw bundle required for a main claim.
 
 ---
 
@@ -110,7 +111,7 @@ LatchMoE is organized into four layers:
 ├────────────────────────────────────────┤
 │  Compute-Protected Slot Lifecycle      │  ← transfer stream + event ordering
 ├────────────────────────────────────────┤
-│  Correctness-First Overflow Staging    │  ← full-layer native MoE pass
+│  Capacity-Bounded Overflow Staging     │  ← multi-wave; full-layer fallback
 ├────────────────────────────────────────┤
 │  Slot-Stable Expert Virtualization     │  ← fixed slot bank + pinned host store
 └────────────────────────────────────────┘

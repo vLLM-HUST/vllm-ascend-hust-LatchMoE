@@ -29,13 +29,13 @@ an explicit transfer/compute lifecycle, and executes oversized prefill working
 sets in capacity-bounded waves.  The resulting data plane accepts placement
 plans without embedding a particular prediction policy.
 
-The implementation targets a hook-enabled vLLM-Ascend stack and includes
-host-side correctness tests and a manifest-oriented online benchmark harness.
-Historical capture-disabled diagnostics lack the raw, repeated evidence needed
-for a paper claim and are excluded from the submission matrix.  We therefore
-state the mechanism and correctness claims independently and require repeated
-graph-mode online comparisons against matched graph-compatible baselines before
-making a performance claim.
+The implementation targets a hook-enabled vLLM-Ascend stack.  A graph-only
+lifecycle qualification on Qwen3-30B-A3B records exact output agreement,
+stable addresses, transfer ordering, bounded residency, and service release
+across three independent starts.  Historical capture-disabled diagnostics are
+excluded.  We treat the online result as narrow mechanism evidence and still
+require matched graph-compatible baselines and a broader matrix before making
+a general performance claim.
 \end{abstract}
 
 \input{sections/00_intro}
@@ -180,11 +180,19 @@ submission claim.
 \subsection{Current evidence}
 
 The repository includes host-side tests for slot ownership, phase splitting,
-wave restoration, graph guards, and benchmark artifact collection.  These
-tests validate contracts but do not measure online performance.
-Historical capture-disabled diagnostics are excluded because they lack the raw,
-repeated bundle required for a paper claim and violate the graph-only evaluation
-boundary.  The current draft therefore makes no online performance claim.
+wave restoration, graph guards, and benchmark artifact collection.  It also
+includes the Issue~7 raw graph-only bundle for Qwen3-30B-A3B BF16 on one
+Ascend 910B2, TP1, and 	exttt{max\_num\_seqs=1}.  Three independent service
+starts each completed 11/11 ShareGPT requests and 1,408 output tokens; all
+request token arrays matched exactly.  The bundle records stable slot
+addresses for all 12 managed layers, generation and H2D ordering, bounded
+multi-wave execution, replay issue timing, physical HBM samples, and release
+acknowledgements.  Median TTFT across the starts was 537.70--573.64~ms and
+median TPOT was 53.56--55.93~ms/token.  These values qualify the narrow runtime
+path; they are not a matched performance comparison.
+
+Historical capture-disabled diagnostics remain excluded because they lack the
+raw, repeated contract and violate the graph-only evaluation boundary.
 
 \subsection{Submission experiment matrix}
 
@@ -226,9 +234,11 @@ because its transfers are device-to-device rather than host-to-device.  Higher
 concurrency can also change active-set size and overlap opportunities.
 
 \paragraph{Evidence gap.}
-The absence of checked-in raw artifacts is the primary submission blocker.
-Until the repeated matrix is complete, the paper supports a mechanism and
-correctness argument, not a general performance claim.
+The checked-in Issue~7 bundle closes the narrow graph replay and lifecycle
+gate.  The remaining submission blocker is breadth: matched graph-compatible
+baselines plus model, capacity, workload, and concurrency sensitivity.  Until
+that matrix is complete, the paper supports a mechanism and narrow correctness
+claim, not a general performance claim.
 
 \section{Related Work}
 
@@ -251,10 +261,10 @@ changes.
 
 \system decouples dynamic expert identity from the stable addresses required
 by graph replay.  Fixed slots, replay-boundary staging, protected ownership,
-and wave prefill form a graph-compatible offload data plane.  The current
-artifact establishes the design and its host-side contracts; repeated,
-manifest-backed online evaluation remains necessary to establish the breadth
-and magnitude of its performance benefit.
+and wave prefill form a graph-compatible offload data plane.  The checked-in
+Issue~7 artifact establishes its graph replay and lifecycle behavior across
+three independent starts; matched, broader online evaluation remains necessary
+to establish the breadth and magnitude of any performance benefit.
 
 \bibliographystyle{plain}
 \bibliography{references}

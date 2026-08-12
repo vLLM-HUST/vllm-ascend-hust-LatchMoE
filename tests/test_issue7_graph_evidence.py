@@ -168,6 +168,18 @@ def test_issue7_verifier_fails_closed_without_release_ack(tmp_path: Path) -> Non
     assert "release status is 'release-failed'" in report["failures"]
 
 
+def test_issue7_verifier_prefers_portable_local_release_ack(tmp_path: Path) -> None:
+    unit = _valid_unit(tmp_path)
+    result = json.loads((unit / "unit_result.json").read_text())
+    result["release_ack"] = "/missing/on/fresh/checkout.json"
+    _write_json(unit / "unit_result.json", result)
+    _write_json(unit / "release_ack.json", {"status": "released"})
+
+    report = _load_verifier().verify_unit(unit)
+
+    assert report["status"] == "passed"
+
+
 def test_issue7_verifier_fails_closed_on_over_capacity_wave(tmp_path: Path) -> None:
     unit = _valid_unit(tmp_path)
     records = [json.loads(line) for line in (unit / "moe_profile.jsonl").read_text().splitlines()]

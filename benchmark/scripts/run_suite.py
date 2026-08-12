@@ -657,6 +657,17 @@ def run_unit(
                         "status": release_status,
                     },
                 )
+                # Keep a unit-local copy so an archived evidence bundle remains
+                # verifiable after extraction into a fresh checkout.
+                write_json(
+                    unit_dir / "release_ack.json",
+                    {
+                        "custody_unit": managed_env["VLLM_ENGINE_SYSTEMD_UNIT"],
+                        "device": args.device,
+                        "released_at_ns": time.time_ns(),
+                        "status": release_status,
+                    },
+                )
         if sample_thread is not None:
             sample_stop.set()
             sample_thread.join(timeout=10.0)
