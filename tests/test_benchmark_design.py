@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SEW_BENCH_PATH = REPO_ROOT / "benchmark" / "scripts" / "sew_bench.py"
 RUN_SUITE_PATH = REPO_ROOT / "benchmark" / "scripts" / "run_suite.py"
 COLLECT_EVIDENCE_PATH = REPO_ROOT / "benchmark" / "scripts" / "collect_evidence.py"
+ISSUE4_RUNNER_PATH = REPO_ROOT / "benchmark" / "scripts" / "run_issue4_graph_repro.sh"
 
 
 def load_sew_bench():
@@ -84,6 +85,12 @@ def test_end_to_end_experiment_is_graph_only():
         "--enforce-eager" not in case.get("server_args", [])
         for case in config["cases"]
     )
+
+
+def test_issue4_runner_uses_spawn_worker_processes():
+    source = ISSUE4_RUNNER_PATH.read_text(encoding="utf-8")
+
+    assert "export VLLM_WORKER_MULTIPROC_METHOD=spawn" in source
 
 
 def test_validator_reports_unreadable_paths_instead_of_crashing(monkeypatch):

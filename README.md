@@ -149,15 +149,13 @@ tests/              host-side unit tests
 
 ## 固定兼容版本
 
-LatchMoE 当前只维护一条已验证兼容线。分支名不是版本锁，部署时必须同时
-checkout 下表中的完整 commit：
+LatchMoE 只维护一组宿主源码 commit，并对两套成对的 Ascend 基础运行时做了
+不同强度的验证。分支名不是版本锁，部署时必须 checkout 下表中的完整 commit：
 
 | Component | Repository / branch | Locked commit | Version |
 |---|---|---|---|
 | vLLM | `vLLM-HUST/vllm-hust` | `ad7125a431e176d4161099480a66f0169609a690` | `0.21.0` |
 | Ascend hook seam | `vLLM-HUST/vllm-ascend-hust`, `feature/latchmoe-offload-seam-v1-v021` | `4806367eeeb7d62b32078ae90cd929cc06d825fe` | seam ABI 1 |
-| Torch / Torch-NPU | environment packages | — | `2.10.0` / `2.10.0.post2` |
-| CANN | system runtime | — | `9.0.1` |
 
 `feature/latchmoe-offload-seam-v1-v021` 是唯一的 LatchMoE seam 分支。
 
@@ -171,50 +169,68 @@ checkout 下表中的完整 commit：
 `dependencies`：在 Ascend 环境中让 pip 自动解析依赖，可能下载 CUDA/上游包并
 覆盖已经匹配的 Torch-NPU 软件栈。
 
-以下命令假设 CANN 9.0.1、Torch 2.10.0 和 Torch-NPU 2.10.0.post2 已由基础镜像或运维环境
-提供：
+以下命令假设上述任一**完整 profile** 已由基础镜像或运维环境提供；不能跨行混搭
+Torch-NPU 和 CANN 版本。推荐在镜像 Python 上创建 overlay venv，这不会替换镜像
+持有的 Torch、Torch-NPU 或 CANN：
 
-推荐先 clone 本仓库，再用机器可读 lock 驱动安装。脚本会把两个宿主 checkout
-到固定 commit、补充 vLLM `v0.21.0` tag、始终调用当前 `sys.executable -m pip`、
-跳过与 LatchMoE seam 无关的自定义算子编译，并在最后执行环境检查：
+推荐先 clone 本仓库，再用机器可读 lock 驱动安装。自动安装与后面的手工安装是
+两条**二选一**的路径，不能顺序执行。脚本会把两个宿主 checkout 到固定 commit、
+补充 vLLM `v0.21.0` tag、始终调用当前 `sys.executable -m pip`、跳过与 LatchMoE
+seam 无关的自定义算子编译，并在最后执行环境检查：
 
 ```bash
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 cd vllm-ascend-hust-LatchMoE
 
+BASE_PYTHON=${BASE_PYTHON:-python3}
+LATCHMOE_HOME=${LATCHMOE_HOME:-"$HOME/.local/share/latchmoe"}
+"$BASE_PYTHON" -m venv --system-site-packages "$LATCHMOE_HOME/venv"
+source "$LATCHMOE_HOME/venv/bin/activate"
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 # 先检查将要执行的命令；不会 clone、checkout 或安装。
 python tools/install_locked_stack.py \
-  --workspace /path/to/latchmoe-stack --dry-run
+  --workspace "$LATCHMOE_HOME/stack" --dry-run
 
 # 安装到当前 python；目标目录必须不存在或是 clean Git checkout。
 python tools/install_locked_stack.py \
-  --workspace /path/to/latchmoe-stack
+  --workspace "$LATCHMOE_HOME/stack"
 ```
 
-需要手工安装时，等价步骤如下：
+执行到这里即安装完成。需要自行控制宿主 checkout 或排查安装器时，应跳过上面的
+两个 `install_locked_stack.py` 命令，复用当前 LatchMoE checkout，并执行下面的
+等价步骤：
 
 ```bash
+LATCHMOE_PLUGIN_ROOT=$PWD
+mkdir -p "$LATCHMOE_HOME/stack"
+
 # 1. 固定 vLLM-HUST
-git clone https://github.com/vLLM-HUST/vllm-hust.git
-git -C vllm-hust fetch origin ad7125a431e176d4161099480a66f0169609a690
-git -C vllm-hust fetch https://github.com/vllm-project/vllm.git \
+git clone https://github.com/vLLM-HUST/vllm-hust.git \
+  "$LATCHMOE_HOME/stack/vllm-hust"
+git -C "$LATCHMOE_HOME/stack/vllm-hust" fetch origin \
+  ad7125a431e176d4161099480a66f0169609a690
+git -C "$LATCHMOE_HOME/stack/vllm-hust" fetch \
+  https://github.com/vllm-project/vllm.git \
   refs/tags/v0.21.0:refs/tags/v0.21.0
-git -C vllm-hust checkout ad7125a431e176d4161099480a66f0169609a690
+git -C "$LATCHMOE_HOME/stack/vllm-hust" checkout \
+  ad7125a431e176d4161099480a66f0169609a690
 
 # 2. 固定唯一的 vLLM-Ascend hook seam
 git clone --branch feature/latchmoe-offload-seam-v1-v021 \
-  https://github.com/vLLM-HUST/vllm-ascend-hust.git
-git -C vllm-ascend-hust checkout 4806367eeeb7d62b32078ae90cd929cc06d825fe
+  https://github.com/vLLM-HUST/vllm-ascend-hust.git \
+  "$LATCHMOE_HOME/stack/vllm-ascend-hust"
+git -C "$LATCHMOE_HOME/stack/vllm-ascend-hust" checkout \
+  4806367eeeb7d62b32078ae90cd929cc06d825fe
 
 # 3. 在同一解释器中安装两个宿主和 LatchMoE
 VLLM_TARGET_DEVICE=empty python -m pip install \
-  --no-deps --no-build-isolation -e ./vllm-hust
+  --no-deps --no-build-isolation -e "$LATCHMOE_HOME/stack/vllm-hust"
 COMPILE_CUSTOM_KERNELS=0 python -m pip install \
-  --no-deps --no-build-isolation -e ./vllm-ascend-hust
+  --no-deps --no-build-isolation -e "$LATCHMOE_HOME/stack/vllm-ascend-hust"
 
-git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 python -m pip install --no-deps --no-build-isolation \
-  -e ./vllm-ascend-hust-LatchMoE
+  -e "$LATCHMOE_PLUGIN_ROOT"
 ```
 
 额外 fetch `v0.21.0` tag 是必要的：HUST 仓库当前没有公开这一 tag，但固定的
@@ -246,8 +262,9 @@ python -m vllm_moe_offload_ascend check
 ```
 
 `check` 会核验模块路径、vLLM platform/general 两组 entry point、固定版本与
-commit、seam ABI、CANN/Torch 版本以及 `VLLM_PLUGINS` 白名单。可编辑安装还会
-提供等价的 `latchmoe check` 命令。
+commit、seam ABI、成对的基础运行时 profile 以及 `VLLM_PLUGINS` 白名单，并输出
+当前 profile 的 qualification 范围。可编辑安装还会提供等价的 `latchmoe check`
+命令。`check PASS` 只验证安装契约；真实 NPU 图验证见中文 quickstart。
 
 See the [Chinese installation and launch guide](docs/quickstart_zh.md) for the
 complete source-install, existing-stack, overlay, and troubleshooting flows.

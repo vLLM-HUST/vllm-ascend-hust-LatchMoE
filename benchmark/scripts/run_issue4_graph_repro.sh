@@ -31,6 +31,7 @@ printf '\n' >> "${run_dir}/command.txt"
 
 export ASCEND_RT_VISIBLE_DEVICES="$device"
 export PYTHONPATH="${seam_root}:${runtime_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE=1
 export VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM=1
 export VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD=1

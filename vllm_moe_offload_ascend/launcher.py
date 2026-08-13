@@ -12,6 +12,12 @@ from importlib.metadata import PackageNotFoundError, entry_points, version
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from vllm_moe_offload_ascend.compatibility import (
+    describe_runtime_profiles,
+    match_runtime_profile,
+    public_version,
+)
+
 
 PLATFORM_PLUGIN_GROUP = "vllm.platform_plugins"
 GENERAL_PLUGIN_GROUP = "vllm.general_plugins"
@@ -57,6 +63,8 @@ class EnvironmentReport:
     compatibility_lock: str | None
     versions: tuple[tuple[str, str | None], ...]
     cann_root: str | None
+    runtime_profile: str | None
+    qualification: str | None
     runtime_checkout: GitCheckout | None
     vllm_checkout: GitCheckout | None
     seam_checkout: GitCheckout | None
@@ -134,12 +142,6 @@ def _distribution_version(distribution: str) -> str | None:
         return str(version(distribution))
     except PackageNotFoundError:
         return None
-
-
-def _public_version(raw_version: str | None) -> str | None:
-    if raw_version is None:
-        return None
-    return raw_version.split("+", 1)[0]
 
 
 def _run_git(root: Path, *args: str) -> str | None:
@@ -334,22 +336,27 @@ def inspect_environment(
         "torch": _distribution_version("torch"),
         "torch_npu": _distribution_version("torch-npu"),
     }
-    expected_versions = {
-        "vllm": compatibility.get("vllm_version"),
-        "torch": compatibility.get("torch_version"),
-        "torch_npu": compatibility.get("torch_npu_version"),
-    }
-    for name, expected in expected_versions.items():
-        actual = versions[name]
-        if expected and _public_version(actual) != expected:
-            errors.append(f"incompatible {name} version: expected {expected}, got {actual or '<missing>'}")
+    expected_vllm_version = compatibility.get("vllm_version")
+    if expected_vllm_version and public_version(versions["vllm"]) != expected_vllm_version:
+        errors.append(
+            "incompatible vllm version: "
+            f"expected {expected_vllm_version}, got {versions['vllm'] or '<missing>'}"
+        )
 
     cann_version, cann_root = _detect_cann(environment)
-    expected_cann = compatibility.get("cann_version")
-    if expected_cann and cann_version != expected_cann:
+    runtime_profile = match_runtime_profile(
+        compatibility,
+        torch_version=versions["torch"],
+        torch_npu_version=versions["torch_npu"],
+        cann_version=cann_version,
+    )
+    if compatibility and runtime_profile is None:
         errors.append(
-            f"incompatible CANN version: expected {expected_cann}, "
-            f"got {cann_version or '<missing>'}"
+            "incompatible base runtime: got "
+            f"torch={versions['torch'] or '<missing>'}, "
+            f"torch-npu={versions['torch_npu'] or '<missing>'}, "
+            f"CANN={cann_version or '<missing>'}; supported profiles: "
+            f"{describe_runtime_profiles(compatibility) or '<none>'}"
         )
 
     clean_paths = tuple(
@@ -424,6 +431,8 @@ def inspect_environment(
         compatibility_lock=lock_path,
         versions=tuple(sorted(versions.items())),
         cann_root=cann_root,
+        runtime_profile=None if runtime_profile is None else runtime_profile.name,
+        qualification=None if runtime_profile is None else runtime_profile.qualification,
         runtime_checkout=runtime_checkout,
         vllm_checkout=vllm_checkout,
         seam_checkout=seam_checkout,
@@ -454,6 +463,8 @@ def _print_report(report: EnvironmentReport, *, as_json: bool = False) -> None:
     print(f"compatibility_lock = {report.compatibility_lock or '<missing>'}")
     print("versions = " + ", ".join(f"{name}={value or '<missing>'}" for name, value in report.versions))
     print(f"CANN = {report.cann_root or '<missing>'}")
+    print(f"runtime_profile = {report.runtime_profile or '<unmatched>'}")
+    print(f"qualification = {report.qualification or '<none>'}")
     if report.runtime_checkout is not None:
         print(
             "runtime_git = "

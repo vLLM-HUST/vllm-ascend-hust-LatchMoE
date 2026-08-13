@@ -19,8 +19,22 @@ from typing import Mapping, Sequence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from vllm_moe_offload_ascend.compatibility import (
+    describe_runtime_profiles,
+    match_runtime_profile,
+)
+from vllm_moe_offload_ascend.launcher import _detect_cann
+
+
 DEFAULT_LOCK = REPOSITORY_ROOT / "vllm_moe_offload_ascend" / "compatibility.lock"
-_INSTALL_ENV_KEYS = ("VLLM_TARGET_DEVICE", "COMPILE_CUSTOM_KERNELS")
+_INSTALL_ENV_KEYS = (
+    "VLLM_TARGET_DEVICE",
+    "COMPILE_CUSTOM_KERNELS",
+    "LATCHMOE_COMPATIBILITY_LOCK",
+)
 
 
 def read_lock(path: Path) -> dict[str, str]:
@@ -90,8 +104,6 @@ class Installer:
         )
 
     def output(self, command: Sequence[str]) -> str:
-        if self.dry_run:
-            return ""
         return subprocess.run(
             [str(item) for item in command],
             check=True,
@@ -134,14 +146,31 @@ def _ensure_checkout(
                 f"expected {repository}, got {actual_origin}"
             )
     else:
-        clone = ["git", "clone"]
+        clone = [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--depth",
+            "1",
+        ]
         if branch:
             clone.extend(["--branch", branch, "--single-branch"])
         clone.extend([repository, str(destination)])
         installer.run(clone)
 
     installer.run(
-        ["git", "-C", str(destination), "fetch", "origin", commit]
+        [
+            "git",
+            "-C",
+            str(destination),
+            "fetch",
+            "--filter=blob:none",
+            "--depth",
+            "1",
+            "origin",
+            commit,
+        ]
     )
     if tag_repository and tag:
         installer.run(
@@ -150,6 +179,9 @@ def _ensure_checkout(
                 "-C",
                 str(destination),
                 "fetch",
+                "--filter=blob:none",
+                "--depth",
+                "1",
                 tag_repository,
                 f"refs/tags/{tag}:refs/tags/{tag}",
             ]
@@ -196,24 +228,29 @@ def base_runtime_errors(
     *,
     versions: Mapping[str, str | None],
     acl_origin: str | None,
+    cann_version: str | None,
 ) -> tuple[str, ...]:
     errors: list[str] = []
-    for distribution, lock_key in (
-        ("torch", "torch_version"),
-        ("torch-npu", "torch_npu_version"),
-    ):
-        expected = lock.get(lock_key)
-        actual = versions.get(distribution)
-        if actual is None:
+    for distribution in ("torch", "torch-npu"):
+        if versions.get(distribution) is None:
             errors.append(f"required base package is missing: {distribution}")
-        elif expected and actual.split("+", 1)[0] != expected:
-            errors.append(
-                f"incompatible {distribution}: expected {expected}, got {actual}"
-            )
     if acl_origin is None:
         errors.append(
             "CANN acl Python binding is not importable; source the CANN set_env.sh "
             "for this Python before installation"
+        )
+    if not errors and match_runtime_profile(
+        lock,
+        torch_version=versions.get("torch"),
+        torch_npu_version=versions.get("torch-npu"),
+        cann_version=cann_version,
+    ) is None:
+        errors.append(
+            "incompatible base runtime: got "
+            f"torch={versions.get('torch')}, "
+            f"torch-npu={versions.get('torch-npu')}, "
+            f"CANN={cann_version or '<missing>'}; supported profiles: "
+            f"{describe_runtime_profiles(lock) or '<none>'}"
         )
     return tuple(errors)
 
@@ -227,10 +264,12 @@ def validate_base_runtime(lock: Mapping[str, str]) -> None:
             installed[distribution] = None
     acl_spec = importlib.util.find_spec("acl")
     acl_origin = None if acl_spec is None else acl_spec.origin
+    cann_version, _cann_root = _detect_cann(os.environ)
     errors = base_runtime_errors(
         lock,
         versions=installed,
         acl_origin=acl_origin,
+        cann_version=cann_version,
     )
     if errors:
         raise RuntimeError("; ".join(errors))
@@ -270,8 +309,11 @@ def install_locked_stack(
         lock=lock,
     ):
         installer.run(command, env=environment)
+    check_env = dict(os.environ)
+    check_env["LATCHMOE_COMPATIBILITY_LOCK"] = str(lock_path)
     installer.run(
-        [sys.executable, "-m", "vllm_moe_offload_ascend", "check"]
+        [sys.executable, "-m", "vllm_moe_offload_ascend", "check"],
+        env=check_env,
     )
 
 
