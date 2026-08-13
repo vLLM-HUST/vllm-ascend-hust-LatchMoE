@@ -1940,6 +1940,7 @@ def test_seam_guard_returns_false_when_layer_has_no_layer_id(monkeypatch):
     )
 
 def test_graph_tools_default_to_graph_mode_and_reject_forced_eager(monkeypatch):
+    from benchmark.scripts import run_fixed_slot_smoke as benchmark_smoke
     from tools import collect_moe_trace, run_fixed_slot_smoke
 
     for parser, args in ((collect_moe_trace.parse_args, ["tool", "--output", "/tmp/moe-trace.jsonl"]), (run_fixed_slot_smoke.parse_args, ["tool", "--output-dir", "/tmp/smoke"])):
@@ -1948,3 +1949,38 @@ def test_graph_tools_default_to_graph_mode_and_reject_forced_eager(monkeypatch):
         monkeypatch.setattr(sys, "argv", [*args, "--enforce-eager"])
         with pytest.raises(SystemExit):
             parser()
+
+    assert benchmark_smoke._smoke_compilation_config(
+        mode="fixed_slot_sync",
+        enforce_eager=False,
+        disable_ascend_norm_quant_fusion=True,
+    ) == {
+        "cudagraph_mode": "PIECEWISE",
+        "pass_config": {"fuse_norm_quant": False},
+    }
+    assert benchmark_smoke._smoke_compilation_config(
+        mode="fixed_slot_sync",
+        enforce_eager=True,
+        disable_ascend_norm_quant_fusion=False,
+    ) is None
+
+    llm_kwargs = benchmark_smoke._build_llm_kwargs(
+        SimpleNamespace(
+            model="/models/qwen",
+            enforce_eager=False,
+            gpu_memory_utilization=0.4,
+            kv_cache_memory_mb=256,
+            max_model_len=64,
+            max_num_seqs=1,
+            max_num_batched_tokens=2,
+            with_native_offload_backend=False,
+            disable_ascend_norm_quant_fusion=True,
+        ),
+        {
+            "model": {"path": "/unused", "tensor_parallel_size": 1},
+            "dataset": {"seed": 42},
+        },
+        "fixed_slot_sync",
+    )
+    assert llm_kwargs["enable_prefix_caching"] is False
+    assert llm_kwargs["compilation_config"]["cudagraph_mode"] == "PIECEWISE"

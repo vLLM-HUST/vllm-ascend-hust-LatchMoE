@@ -272,6 +272,20 @@ def _summarize(values: list[float]) -> dict[str, float]:
     }
 
 
+def _smoke_compilation_config(
+    *,
+    mode: str,
+    enforce_eager: bool,
+    disable_ascend_norm_quant_fusion: bool,
+) -> dict[str, Any] | None:
+    config: dict[str, Any] = {}
+    if mode == "fixed_slot_sync" and not enforce_eager:
+        config["cudagraph_mode"] = "PIECEWISE"
+    if disable_ascend_norm_quant_fusion:
+        config["pass_config"] = {"fuse_norm_quant": False}
+    return config or None
+
+
 def _metrics_from_outputs(outputs: list[Any], duration_s: float) -> dict[str, Any]:
     total_output_tokens = 0
     ttfts_ms: list[float] = []
@@ -328,6 +342,7 @@ def _build_llm_kwargs(args: argparse.Namespace, config: dict[str, Any], mode: st
         "enable_expert_parallel": False,
         "seed": int(config["dataset"]["seed"]),
         "disable_log_stats": False,
+        "enable_prefix_caching": False,
     }
     if mode == "fixed_slot_sync" and getattr(args, "with_native_offload_backend", False):
         # SEW manages its own offloading via host store + slot bank + original
@@ -344,13 +359,20 @@ def _build_llm_kwargs(args: argparse.Namespace, config: dict[str, Any], mode: st
                 "offload_params": _csv_set(args.offload_params),
             }
         )
-    if getattr(args, "disable_ascend_norm_quant_fusion", False):
+    disable_norm_quant = bool(
+        getattr(args, "disable_ascend_norm_quant_fusion", False)
+    )
+    if disable_norm_quant:
         kwargs["additional_config"] = {
             "ascend_compilation_config": {"fuse_norm_quant": False}
         }
-        kwargs["compilation_config"] = {
-            "pass_config": {"fuse_norm_quant": False}
-        }
+    compilation_config = _smoke_compilation_config(
+        mode=mode,
+        enforce_eager=bool(args.enforce_eager),
+        disable_ascend_norm_quant_fusion=disable_norm_quant,
+    )
+    if compilation_config is not None:
+        kwargs["compilation_config"] = compilation_config
     return kwargs
 
 

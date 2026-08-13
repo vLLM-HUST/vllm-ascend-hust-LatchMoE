@@ -3,11 +3,6 @@
 本文档面向希望在已有 Ascend vLLM 软件栈上安装和启动 LatchMoE 的开发者。
 核心原则只有一条：**始终用安装 LatchMoE 的同一个 Python 启动 vLLM**。
 
-LatchMoE 当前不兼容 vLLM 的 prefix cache（前缀复用）。它固定使用完整
-prompt prefill；启动入口会自动加入 `--no-enable-prefix-caching`，如果显式
-传入 `--enable-prefix-caching` 则直接拒绝启动。prefix cache 的命中路径属于
-独立的 vLLM-Ascend 兼容性问题，不纳入 LatchMoE 的正确性和性能结论。
-
 安装后推荐使用下面的统一入口：
 
 ```bash
@@ -29,26 +24,17 @@ latchmoe serve <model> [vLLM 参数...]
 
 ## 环境要求
 
-- Ascend 910B-class NPU，以及可用的 CANN 和 torch-npu 环境；
+- Ascend NPU，以及可用的 CANN 和 torch-npu 环境；
 - `vLLM-HUST/vllm-hust` commit
   `ad7125a431e176d4161099480a66f0169609a690`（vLLM 0.21.0）；
 - hook-enabled `vllm-ascend-hust`：
   `feature/latchmoe-offload-seam-v1-v021`；
 - seam commit：`4806367eeeb7d62b32078ae90cd929cc06d825fe`；
-- Torch 2.10.0、Torch-NPU 2.10.0.post2、CANN 9.0.1；
 - Python 3.10 或更高版本。
-
-项目只维护上述一条已验证宿主线。不要使用未经 LatchMoE 正确性门禁验证的
-`feature/latchmoe-offload-seam-v1`。对应的 `vllm-ascend-hust#214` 已关闭，
-该远端分支也已删除。完整机器可读锁见
-`vllm_moe_offload_ascend/compatibility.lock`；安装脚本和环境检查都以该文件为准。
-
-不要在已经验证的 Ascend 环境中执行 `pip install vllm` 或
-`pip install vllm-ascend`。它们可能引入 PyPI CUDA/上游依赖并替换 HUST 软件栈。
 
 ## 方式一：源码可编辑安装（研究开发推荐）
 
-### 自动安装固定宿主（推荐）
+### 自动安装固定宿主（推荐，可直接执行）
 
 在已经提供 CANN、Torch 与 Torch-NPU 的 Ascend Python 环境中执行：
 
@@ -56,16 +42,23 @@ latchmoe serve <model> [vLLM 参数...]
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
 cd vllm-ascend-hust-LatchMoE
 
+BASE_PYTHON=${BASE_PYTHON:-python3}
+LATCHMOE_HOME=${LATCHMOE_HOME:-"$HOME/.local/share/latchmoe"}
+"$BASE_PYTHON" -m venv --system-site-packages "$LATCHMOE_HOME/venv"
+source "$LATCHMOE_HOME/venv/bin/activate"
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 python tools/install_locked_stack.py \
-  --workspace /path/to/latchmoe-stack --dry-run
+  --workspace "$LATCHMOE_HOME/stack" --dry-run
 python tools/install_locked_stack.py \
-  --workspace /path/to/latchmoe-stack
+  --workspace "$LATCHMOE_HOME/stack"
 ```
 
 安装器直接读取 `compatibility.lock`，拒绝覆盖 dirty checkout，并完成以下容易
 出错的步骤：
 
 - 固定 vLLM-HUST 与唯一 seam 分支的完整 commit；
+- 使用 filtered shallow fetch，只下载固定快照需要的 Git 对象；
 - 从上游补充 vLLM `v0.21.0` tag，保证 setuptools-scm 版本正确；
 - 全程使用当前 `sys.executable -m pip`，防止 venv 与系统 Python 混用；
 - 以 `VLLM_TARGET_DEVICE=empty` 安装 vLLM-HUST；
@@ -74,9 +67,8 @@ python tools/install_locked_stack.py \
 - 使用 `--no-deps --no-build-isolation` 保护镜像中的 Torch-NPU 软件栈；
 - 最后自动运行 `python -m vllm_moe_offload_ascend check`。
 
-下面保留手工步骤，供离线环境或安装器排障使用。
-
-### 步骤 1：安装固定的 vLLM-HUST
+### 手动安装步骤
+#### 步骤 1：安装固定的 vLLM-HUST
 
 ```bash
 git clone https://github.com/vLLM-HUST/vllm-hust.git
@@ -91,7 +83,7 @@ VLLM_TARGET_DEVICE=empty python -m pip install \
 第二次 fetch 用于补充 HUST 仓库当前没有发布的 `v0.21.0` tag；固定 commit 与
 该上游 tag 完全相同，setuptools-scm 需要它生成正确的 `0.21.0` 包版本。
 
-### 步骤 2：安装固定的 vLLM-Ascend hook seam
+#### 步骤 2：安装固定的 vLLM-Ascend hook seam
 
 ```bash
 git clone --branch feature/latchmoe-offload-seam-v1-v021 \
@@ -116,7 +108,7 @@ print("vllm_ascend =", vllm_ascend.__file__)
 PY
 ```
 
-### 步骤 3：安装 LatchMoE
+#### 步骤 3：安装 LatchMoE
 
 ```bash
 git clone https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE.git
@@ -141,7 +133,7 @@ Python。确有其他模型需要额外算子时，应在基础镜像层独立�
 `vllm.general_plugins`；LatchMoE 的 `register()` 会先把插件配置注册到
 `vllm.envs` 与 `vllm_ascend.envs`，再安装 seam adapter。
 
-### 步骤 4：安装后核查
+#### 步骤 4：安装后核查
 
 ```bash
 python -m vllm_moe_offload_ascend check
@@ -157,6 +149,8 @@ vllm_ascend = <hook seam 模块路径>
 plugin = <LatchMoE 模块路径>
 platform_plugins = ascend
 general_plugins = moe_offload_ascend
+runtime_profile = issue7 或 cann9_legacy
+qualification = 对应 profile 的验证范围
 ```
 
 机器部署脚本可以读取 JSON：
@@ -165,23 +159,24 @@ general_plugins = moe_offload_ascend
 python -m vllm_moe_offload_ascend check --json
 ```
 
-## 本次实机部署暴露的问题
+### 真实 NPU graph smoke
 
-在 NPU 5 上完成 Qwen3-30B-A3B 端到端验证时，实际遇到的问题及项目侧处理如下：
+`check PASS` 只证明安装、版本和插件发现契约正确。确认目标卡空闲后，用已安装的
+固定 seam 和本地 Qwen3-30B-A3B 跑真实 graph smoke：
 
-| 问题 | 根因 | 当前处理 |
-|---|---|---|
-| vLLM 显示错误或不稳定的源码版本 | HUST checkout 缺少上游 `v0.21.0` tag | 锁定安装器自动补 tag，并由 `check` 核验版本和 commit |
-| seam 安装尝试编译 37 个算子，且在无关 compressor 算子失败 | 默认走了 vLLM-Ascend 全量 custom-kernel build | 安装器固定 `COMPILE_CUSTOM_KERNELS=0`；LatchMoE seam 不以全量算子构建为门禁 |
-| CANN 构建子进程使用另一个 Python，缺少当前 venv 的 NumPy | 全量算子构建通过 PATH 解析子进程解释器 | 跳过无关构建；pip 和启动均固定使用当前 Python |
-| API 进程能导入插件，但 EngineCore/Worker 配置未注册 | 插件曾错误混入 platform plugin 生命周期 | 仅注册 `vllm.general_plugins`，`register()` 在每个进程注册全部环境变量 |
-| Worker 报 “Cannot re-initialize NPU in forked subprocess” | Torch-NPU 不支持已经初始化后的 fork | 启动文档固定 `VLLM_WORKER_MULTIPROC_METHOD=spawn` |
-| SEW 默认落入不安全的组合 Graph 模式 | vLLM 默认值不是纯 `PIECEWISE` | 插件在用户未显式指定时自动选择 `PIECEWISE` 并 fail-close |
-| NPU 空闲显存检查失败或模型构造 OOM | 目标卡被其他容器占用；降低 utilization 不能创造实际显存 | 启动前检查目标卡，资源不足时等待或换卡，不终止未知任务 |
-| 误以为 `OFFLOAD_GB=14` 代表整模只占 14 GiB | 该值是目标 expert offload 容量，默认仍保留部分常驻层 | 文档明确容量语义，并提供显存受限验证用的全层卸载配置 |
+```bash
+npu-smi info
+benchmark/scripts/run_issue4_graph_repro.sh \
+  --seam-root "$LATCHMOE_HOME/stack/vllm-ascend-hust" \
+  --model /path/to/Qwen3-30B-A3B \
+  --device 0 \
+  --output-root ./latchmoe-evidence
+```
 
-安装器能够消除前六项中的安装和默认配置错误；NPU 资源竞争不能由安装过程
-“自动修复”，只能在启动前发现并拒绝给出误导性的性能结论。
+成功不能只看退出码；最新 run 的 `graph_verification.json` 必须包含
+`"status": "passed"`、非零 `aclgraph_replay`、`h2d_events` 和
+`graph_slot_probe`，且 `failures` 为空。该 smoke 固定关闭 prefix cache 并使用纯
+`PIECEWISE` ACLGraph。
 
 ## 方式二：在已有 HUST 软件栈中直接安装
 
@@ -196,37 +191,6 @@ python -m vllm_moe_offload_ascend check
 ```
 
 这条命令只安装 LatchMoE，不负责安装或切换 vLLM-Ascend hook seam。
-
-## 方式三：Ascend 镜像上的 venv overlay
-
-如果 Torch、Torch-NPU、vLLM 和 CANN 来自服务器镜像，建议基于镜像 Python
-创建 `--system-site-packages` venv：
-
-```bash
-/usr/local/python3.12.13/bin/python -m venv \
-  --system-site-packages "$HOME/venvs/latchmoe-v021"
-
-source "$HOME/venvs/latchmoe-v021/bin/activate"
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-python -m pip install \
-  --no-deps \
-  --no-build-isolation \
-  -e /path/to/vllm-ascend-hust-LatchMoE
-```
-
-如果 hook seam 仅以源码 overlay 形式提供，把它放在 `PYTHONPATH` 最前面：
-
-```bash
-export PYTHONPATH="/path/to/vllm-ascend-hust:${PYTHONPATH:-}"
-python -m vllm_moe_offload_ascend check
-```
-
-这种环境中不要依赖裸 `vllm` 命令。它可能仍然带有系统 Python shebang。统一使用：
-
-```bash
-python -m vllm_moe_offload_ascend serve <model> [vLLM 参数...]
-```
 
 ## 启动服务
 

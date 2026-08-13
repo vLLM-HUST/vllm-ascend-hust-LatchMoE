@@ -102,6 +102,8 @@ def test_environment_check_accepts_complete_overlay(monkeypatch):
 
     assert report.ok
     assert report.errors == ()
+    assert report.runtime_profile == "default"
+    assert report.qualification == "legacy_lock"
 
 
 def test_environment_check_rejects_filtered_plugin(monkeypatch):
@@ -223,7 +225,7 @@ def test_environment_check_rejects_incompatible_stack_version(monkeypatch):
     report = launcher.inspect_environment({})
 
     assert not report.ok
-    assert "incompatible torch_npu version: expected 2.10.0, got 2.9.0" in report.errors
+    assert any("incompatible base runtime" in error for error in report.errors)
 
 
 def test_bundled_compatibility_lock_declares_current_seam_contract():
@@ -236,6 +238,12 @@ def test_bundled_compatibility_lock_declares_current_seam_contract():
     assert lock["vllm_commit"] == "ad7125a431e176d4161099480a66f0169609a690"
     assert lock["vllm_tag"] == "v0.21.0"
     assert lock["vllm_version"] == "0.21.0"
+    assert lock["runtime_profile.issue7"].startswith(
+        "2.10.0|2.10.0.post2|9.0.1|"
+    )
+    assert lock["runtime_profile.cann9_legacy"].startswith(
+        "2.10.0|2.10.0|9.0.0|"
+    )
 
 
 def test_check_json_reports_result(monkeypatch, capsys):
@@ -247,6 +255,7 @@ def test_check_json_reports_result(monkeypatch, capsys):
     assert payload["ok"] is True
     assert payload["general_plugins"][0][0] == "moe_offload_ascend"
     assert payload["seam_checkout"]["commit"] == "seam-commit"
+    assert payload["runtime_profile"] == "default"
 
 
 def test_launcher_delegates_to_vllm_after_check(monkeypatch):

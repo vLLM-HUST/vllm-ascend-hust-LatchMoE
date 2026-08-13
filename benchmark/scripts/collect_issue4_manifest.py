@@ -83,6 +83,7 @@ def main() -> None:
         for key, value in sorted(os.environ.items())
         if key == "ASCEND_RT_VISIBLE_DEVICES"
         or key == "PYTHONPATH"
+        or key == "VLLM_WORKER_MULTIPROC_METHOD"
         or key.startswith("VLLM_ASCEND_MOE_")
         or key.startswith("SEW_")
     }
