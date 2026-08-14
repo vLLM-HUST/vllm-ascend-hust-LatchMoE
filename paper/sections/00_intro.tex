@@ -18,7 +18,7 @@ Thus, existing data-movement optimizations improve which experts are moved and w
 Such runtime changes can be naturally accommodated under eager execution, where the host resolves the current expert placement and dispatches the corresponding kernels at each decoding step. 
 This flexibility, however, comes at a substantial performance cost. 
 Autoregressive decoding repeatedly executes a largely recurring sequence of fine-grained accelerator kernels, and launching these kernels individually incurs repeated host-side scheduling, dispatch, and synchronization overhead. 
-\textbf{Graph replay} mitigates this overhead by capturing the recurring execution sequence once and replaying it as a unit, thereby reducing host-induced gaps between kernel executions~\cite{kwon2020nimble,ye2025flashinfer}. 
+\textbf{Graph replay} captures the recurring execution sequence once and replays it as a unit~\cite{ye2025flashinfer}.
 
 As shown in Figure~\ref{fig:graph_breakdown}, graph replay reduces average decode latency by approximately 75\% across four workloads, from 133.7--137.4~ms/token under eager execution to 32.6--33.6~ms/token, while device execution time remains nearly unchanged. 
 This result indicates that most of the improvement comes from eliminating host-induced device idle time rather than accelerating the underlying kernels. Therefore, falling back to eager execution is not merely a compatibility inconvenience; it forfeits a major source of decoding efficiency.
@@ -71,64 +71,21 @@ By staging upcoming experts while already prepared experts are being executed, \
 Explicit slot ownership, versioning, and transfer--compute dependencies ensure that a slot is neither overwritten while its current contents are still in use nor exposed to computation before newly staged weights are ready.
 Together, these mechanisms preserve a stable graph-visible execution interface while allowing expert residency to evolve dynamically and efficiently.
 
-Our goal is to preserve graph replay while allowing the resident expert set to
-change within a fixed HBM budget.  The key observation is that expert
-\emph{identity} may change without changing the addresses consumed by captured
-kernels.  A captured MoE computation does not need each logical expert to keep
-its original allocation; it needs fixed physical storage containing the right
-weights and a consistent logical-to-physical mapping at replay time.  This
-observation turns dynamic residency into an inter-replay state transition:
-weight contents and mapping values may be updated at an explicit replay
-boundary, while the slot tensors and mapping buffers visible to the graph keep
-their addresses.  It also separates the data plane that enforces residency
-from the control policy that prioritizes expert placement.
-
-Realizing this separation raises three challenges.  First, the fused MoE
-operator hides the routing decision inside an opaque computation, leaving no
-graph-visible boundary at which data-dependent staging can legally execute;
-exposing such a boundary must not change routing or the tensors passed between
-captured regions.  Second, asynchronous transfers and expert computation share
-the same bounded slot bank.  A new load must not overwrite a slot used by
-in-flight compute, and a mapping must not expose a new owner before its transfer
-has completed.  Third, a prefill or mixed batch can activate more experts than
-the slot bank can hold simultaneously.  Full residency would violate the HBM
-budget, while dropping routed experts or approximating their outputs would
-change model semantics.  The runtime must therefore execute an oversized
-working set exactly in capacity-bounded phases while retaining opportunities
-to overlap transfer and computation.
-
-We present \system, a graph-compatible expert-offloading data plane for
-vLLM-Ascend.  \system decomposes the opaque MoE forward path into a captured
-router, an eager staging seam, and a captured expert MLP.  At the seam, it reads
-the active expert set, applies a placement plan, loads misses into a
-preallocated slot bank, and updates a persistent logical-to-physical mapping in
-place; the captured MLP continues to consume the same slot and metadata
-addresses.  Each slot carries an owner and version, and transfer and compute
-events protect that ownership until all users of the version have completed.
-When an active set exceeds capacity, \system partitions routed token-expert
-pairs into exact waves, stages and computes one bounded wave at a time, and
-restores outputs to their original token positions.  Multiple staging buffers
-permit the next wave's transfers to overlap the current wave's compute.  An
-HBM- and KV-aware startup configuration selects resident layers and slot
-capacity, while a policy-neutral placement-plan interface allows external
-controllers to reuse the same data plane.
-
-In summary, this paper makes four contributions:
+In summary, this paper makes the following contributions:
 
 \begin{itemize}
-  \item We characterize the address-binding conflict between dynamic expert
-    residency and accelerator graph replay, and derive the requirements for a
-    replay-stable offloading data plane (\S\ref{sec:background}).
-  \item We design \system's three-stage decomposition with a captured router,
-    eager staging seam, and captured MLP, together with fixed-slot expert
-    virtualization.  These mechanisms move
-    data-dependent placement outside captured regions while preserving stable
-    graph-visible addresses (\S\S\ref{sec:design}--\ref{sec:implementation}).
-  \item We introduce a versioned, compute-protected slot lifecycle and exact
-    capacity-bounded wave execution for working sets that exceed slot capacity
-    (\S\S\ref{sec:design}--\ref{sec:implementation}).
-  \item We implement \system as a vLLM-Ascend platform plugin and define a
-    graph-only evaluation methodology that records graph execution, HBM use,
-    expert transfers, and service metrics while rejecting eager fallback as a
-    successful run (\S\ref{sec:evaluation}).
+
+\item We identify and characterize a fundamental tension between dynamic expert offloading and graph replay in memory-constrained MoE inference.
+Routing-driven expert replacement changes logical-to-physical weight bindings, whereas efficient graph replay relies on a stable graph-visible execution state. 
+This observation shows that replayability requires stable physical storage rather than static expert residency.
+
+\item We introduce a replay-stable expert-slot abstraction that decouples dynamic logical expert placement from the physical storage exposed to captured computation. 
+By virtualizing logical experts over preallocated physical slots and persistent mappings, \system allows expert residency to change at runtime while preserving the graph-visible addresses required for replay.
+
+\item We design a graph-compatible execution framework that combines routing-dependent expert staging with pipelined and concurrency-safe slot reuse. 
+\system isolates dynamic staging from captured computation, overlaps expert transfer with computation through wave-based execution, and coordinates slot ownership and readiness to preserve correctness under asynchronous execution.
+
+\item We implement \system on top of vLLM-Ascend and evaluate it with representative MoE workloads under constrained HBM. 
+Within a matched single-device configuration, \system preserves exact outputs and graph replay under dynamic expert offloading, while capacity-bounded multi-wave prefill reduces repeat-median TTFT p50 by 35.21\% relative to graph-compatible full-layer staging.
+
 \end{itemize}

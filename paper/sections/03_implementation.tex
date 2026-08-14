@@ -1,0 +1,76 @@
+\section{Implementation}
+\label{sec:implementation}
+
+We implement LatchMoE as a Python package that registers through vLLM's general
+plugin entry point. The package integrates with a hook-enabled vLLM-Ascend
+runtime; the upstream request scheduler and OpenAI-compatible serving API
+remain unchanged. The host runtime and the Ascend platform plugin are pinned as
+a compatible stack because the staging boundary changes the internal fused-MoE
+execution contract rather than the public serving interface.
+
+\subsection{Graph integration}
+
+The integration decomposes a managed MoE layer into a captured router, the
+custom \texttt{vllm::moe\_offload\_stage} splitting operation, and a captured
+expert MLP. The splitting operation returns control to the host after routing
+so that LatchMoE can stage the active experts. The subsequent graph piece reads
+the persistent slot weights and logical-to-slot buffer. The runtime locks their
+data pointers at capture and validates them before replay.
+
+Graph-compatible runs use PIECEWISE ACLGraph. The benchmark validator requires
+explicit capture and replay records and rejects forced eager execution, eager
+fallback, graph errors, address changes, stale H2D completion, and slot-version
+violations. Disabling LatchMoE restores the host runtime's null hooks. The
+launcher also rejects simultaneous use of the native weight-offload path and
+LatchMoE because two independent owners of expert storage would violate the
+slot lifecycle.
+
+\subsection{Loading and memory management}
+
+CPU-first loading creates managed expert tensors in host memory during model
+initialization. The host store keeps one contiguous $W_{13}$ tensor and one
+contiguous $W_2$ tensor per layer and exposes per-expert views to the transfer
+engine. It checks shape, dtype, stride, device, layer coverage, and expert
+coverage before releasing the original device expert banks. Host pinning is
+used when the runtime supports it and reports failures explicitly.
+
+Automatic configuration derives the resident-layer selection and slot count
+from the requested offload amount, physical HBM, a KV-cache reserve, and a cap
+on the fraction of HBM assigned to slot storage. Explicit overrides remain
+available for controlled sensitivity experiments. The memory ledger accounts
+separately for the host store, persistent slots, transient prefill stage banks,
+mapping tensors, full-layer fallback storage, and any original weights that
+remain allocated.
+
+\subsection{Transfers and lifecycle enforcement}
+
+The transfer engine maintains a dedicated H2D stream. It validates layout
+compatibility before copying and batches consecutive host and slot slices when
+their storage is contiguous. Each asynchronous load returns a readiness object
+that contains the NPU event and the exact slot leases made consumable by that
+event. The consumer installs the event dependency before the object marks the
+leases ready. The runtime then publishes mapping values.
+
+Compute protection uses an event recorded after the expert operation. Slots
+remain in the computing state until the event completes and every recorded
+lease still matches its current owner and version. Shutdown drains pending
+transfer and compute work, closes profiling writers, releases managed storage,
+and emits a release acknowledgement for the benchmark harness.
+
+\subsection{Wave execution and profiling}
+
+The prefill path supports a configurable number of stage banks and prefetch
+depth. The qualified configuration uses two stage banks and depth one. Wave
+plans carry the original pair offsets needed for one native recombination, and
+strict validation rejects duplicate or missing coverage. A recoverable
+preflight or native-recombination qualification failure may select the explicit
+full-layer overflow mode; NPU, ACL, memory, address, and lifecycle failures are
+not swallowed by that path.
+
+Profiling records JSONL events for layer registration, slot ownership,
+transfers, mapping publication, wave staging and compute, graph replay issue,
+memory accounting, and service release. Benchmark manifests bind each run to
+the runtime revisions, model and workload digests, device, command line,
+environment, graph mode, and raw client/server artifacts. These records support
+the fail-closed checks used in Section~\ref{sec:evaluation}.
+

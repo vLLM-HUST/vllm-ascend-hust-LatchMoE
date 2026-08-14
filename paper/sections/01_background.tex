@@ -1,0 +1,72 @@
+\section{Background and Problem Formulation}
+\label{sec:background}
+
+\subsection{Sparse activation and expert residency}
+
+An MoE layer contains a set of expert MLPs and a router that assigns each
+token to a small subset of them. Sparse routing limits the expert computation
+performed for one token, but it does not remove the requirement that any
+expert selected by the router must be available to the runtime
+\cite{shazeer2017outrageously,fedus2022switch}. Expert-offloading systems
+therefore keep a bounded resident set in accelerator memory and retain the
+remaining expert weights in host memory. A cache hit can proceed from the
+resident copy, whereas a miss requires host-to-device transfer and may require
+evicting a resident expert. Prior systems reduce this cost through caching,
+prediction, prefetching, and transfer--computation overlap
+\cite{hwang2024pregated,xue2024moeinfinity,kong2024swapmoe,cao2025moelightning,fang2025klotski}.
+
+This data path has two forms of state. The \emph{logical state} records which
+experts are currently resident. The \emph{physical state} records the device
+allocations and indices through which kernels access their weights. Eager
+execution can resolve both forms before every kernel launch. Expert eviction
+can change a pointer or an index because the host constructs the next launch
+from the current residency state. This flexibility also places routing,
+placement, launch, and synchronization decisions on the host path.
+
+\subsection{Graph replay and the binding conflict}
+
+Accelerator graph replay captures a repeated operation sequence and reissues it
+with reusable execution state. Nimble compiles dynamic neural-network
+execution, while FlashInfer applies graph capture and replay to LLM inference
+\cite{kwon2020nimble,ye2025flashinfer}. The graph
+breakdown in Figure~\ref{fig:graph_breakdown} motivates why LatchMoE treats
+replay as a requirement rather than an optional optimization: in the measured
+workloads, eager execution spends most decode time in host-induced gaps.
+
+Dynamic expert replacement conflicts with replay when captured computation
+observes the placement decision through changing tensor bindings. Reallocating
+an expert or changing the weight object passed to the fused MoE operation makes
+the next iteration differ from the captured state. Moving the entire MoE path
+back to eager execution restores dynamic placement but also restores the host
+overhead that replay removes. Keeping all experts resident avoids replacement
+but defeats offloading under a constrained HBM budget.
+
+The conflict is narrower than requiring static residency. Captured computation
+needs stable graph-visible storage and metadata addresses. The logical expert
+stored at each address may change between replays if three conditions hold:
+the required bytes arrive before they are consumed, the mapping names the new
+owner only after that transfer is ready, and no slot is reused while an older
+owner is still in flight. This distinction between stable storage and dynamic
+contents is the basis of LatchMoE.
+
+\subsection{Requirements}
+
+We derive five requirements for a graph-compatible offloading data plane.
+
+\begin{enumerate}
+  \item \textbf{Stable graph-visible allocations.} The expert-weight tensors
+    and mapping buffers referenced by captured computation retain their
+    addresses across replay.
+  \item \textbf{Explicit dynamic boundary.} Routing-dependent placement and
+    weight transfer execute outside captured regions without changing the
+    model's routing decisions.
+  \item \textbf{Safe publication and reuse.} A mapping becomes visible only
+    after the corresponding transfer is ordered before its consumer, and a
+    slot cannot be reassigned while compute still holds its current version.
+  \item \textbf{Bounded exact execution.} If a routed working set exceeds slot
+    capacity, execution remains within the configured storage bound without
+    dropping or approximating routed token--expert pairs.
+  \item \textbf{Fail-closed observability.} Capture, replay, fallback,
+    transfers, ownership, memory, and service release remain observable. An
+    eager fallback cannot be reported as a successful graph-compatible run.
+\end{enumerate}

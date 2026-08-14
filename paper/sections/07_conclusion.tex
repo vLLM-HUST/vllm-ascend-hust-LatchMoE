@@ -1,0 +1,17 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+LatchMoE decouples dynamic logical expert residency from the stable physical
+storage required by graph replay. Fixed expert slots and persistent mappings
+form the replay-visible interface; an eager staging boundary updates their
+contents; versioned transfer and compute dependencies make reuse safe; and
+capacity-bounded waves execute oversized prefill working sets with one native
+recombination. In the qualified single-NPU configuration, three independent
+starts preserve exact outputs, stable addresses, transfer ordering, bounded
+residency, graph replay, and resource release. A matched six-unit experiment
+shows that multi-wave staging reduces repeat-median TTFT p50 by 35.21\% and
+TTFT p95 by 22.96\% relative to full-layer staging, while TPOT remains
+comparable. These results support the replay-stable storage abstraction and its
+scoped prefill benefit; broader serving claims require the remaining baseline
+and sensitivity matrix.
+
