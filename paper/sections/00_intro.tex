@@ -49,19 +49,27 @@ This allows us to preallocate a fixed set of physical expert slots and reuse the
 Before the corresponding expert computation is replayed, the runtime places the required experts into these slots and updates the logical-to-slot mapping, while the captured computation continues to access the same physical storage. 
 In this way, expert replacement changes \emph{what is stored} in the replay-visible slots rather than \emph{where the captured computation accesses}, allowing dynamic expert offloading to coexist with graph replay under a bounded HBM budget.
 
+Realizing this design raises three systems challenges. 
+\textbf{First, the fixed slot interface must support runtime expert staging without invalidating graph replay.} 
+The active experts are known only after routing, while expert loading and replacement depend on this runtime information. 
+These dynamic operations must therefore occur outside captured computation without changing the tensors, addresses, or execution structure expected by subsequent replayed MoE computation. 
+\textbf{Second, the fixed slot set must be updated efficiently as routing changes, without turning expert transfers into serial stalls.} 
+A naive runtime can stage all missing experts before starting expert computation, placing host-to-device transfer latency directly on the inference critical path. 
+This problem becomes more pronounced when the routed working set exceeds the available slots, because the required experts cannot be materialized simultaneously. 
+The runtime must therefore update the bounded slot set while retaining opportunities to overlap staging for upcoming experts with computation on experts that are already ready.
+\textbf{Third, slot reuse must remain correct under asynchronous transfer and computation.} 
+A slot cannot be overwritten while its current expert is still being consumed by in-flight computation, and a newly assigned expert cannot become visible before its weight transfer has completed.
 
-Realizing this abstraction introduces three systems challenges. 
-\textbf{First, dynamic expert staging must be separated from captured computation without changing MoE execution semantics.} 
-Conventional fused MoE implementations tightly couple routing, expert selection, and expert computation. 
-As a result, there is no explicit boundary where routing-dependent placement and weight transfers can occur outside captured execution without changing the inputs consumed by subsequent expert computation.
-\textbf{Second, dynamically reused expert storage must remain correct under asynchronous transfer and computation.} 
-A slot cannot be overwritten while its current weights are still consumed by in-flight computation. 
-Likewise, a newly assigned expert cannot become visible until its transfer has completed.
-\textbf{Third, execution must remain exact when the routed expert working set exceeds the available HBM capacity.} Requiring all active experts to reside simultaneously would violate the memory budget, while dropping experts or approximating their outputs would alter model semantics. 
-The runtime must therefore bound physical residency without sacrificing correctness, while still retaining opportunities to overlap expert transfer with computation.
-
-
-
+We present \system, a graph-compatible MoE offloading system that virtualizes dynamic logical experts over a fixed physical slot interface. 
+\textbf{First, \system isolates routing-dependent expert staging at an explicit eager boundary between a captured router and captured expert computation.} 
+Each offloaded layer preallocates a fixed slot bank and a persistent logical-to-slot mapping before graph capture. 
+At replay time, the staging boundary loads the required experts and updates the mapping in place, while the downstream captured computation continues to access the same slot and mapping addresses. 
+\textbf{Second, \system pipelines expert staging and computation through wave-based execution.}
+Each wave stages only a subset of the routed experts into the fixed slot space, allowing the same physical storage to be reused as the active expert set changes.
+By staging upcoming experts while already prepared experts are being executed, \system overlaps host-to-device transfers with expert computation and reduces transfer-induced device bubbles.
+\textbf{Third, \system coordinates this overlapped execution through a version-controlled slot lifecycle.}
+Explicit slot ownership, versioning, and transfer--compute dependencies ensure that a slot is neither overwritten while its current contents are still in use nor exposed to computation before newly staged weights are ready.
+Together, these mechanisms preserve a stable graph-visible execution interface while allowing expert residency to evolve dynamically and efficiently.
 
 Our goal is to preserve graph replay while allowing the resident expert set to
 change within a fixed HBM budget.  The key observation is that expert
