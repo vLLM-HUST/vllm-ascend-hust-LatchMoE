@@ -1,21 +1,19 @@
-\documentclass[letterpaper,twocolumn,10pt]{article}
-\usepackage{usenix-2020-09}
+\documentclass[sigplan,anonymous,review,nonacm]{acmart}
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{tikz}
 \usepackage{xspace}
-\usepackage{url}
 \usetikzlibrary{arrows.meta,fit,positioning}
+
+\emergencystretch=1em
 
 \newcommand{\system}{LatchMoE\xspace}
 
 \title{LatchMoE: Graph-Compatible Expert Offloading through Address-Stable Residency}
 
-\author{Anonymous submission}
+\author{Anonymous Author(s)}
 
 \begin{document}
-\maketitle
-
 \begin{abstract}
 Sparse mixture-of-experts (MoE) models reduce arithmetic per token but retain a
 large parameter footprint.  Expert offloading can fit such models on a
@@ -31,14 +29,15 @@ an explicit transfer/compute lifecycle, and executes oversized prefill working
 sets in capacity-bounded waves.  The resulting data plane accepts placement
 plans without embedding a particular prediction policy.
 
-The implementation targets a hook-enabled vLLM-Ascend stack.  A graph-only
-qualification on Qwen3-30B-A3B records exact output agreement, stable addresses,
-transfer ordering, bounded residency, and service release across three
-independent starts.  In three matched pairs, capacity-bounded multi-wave
+Our implementation uses vLLM-Ascend hooks. Three graph-only
+starts with Qwen3-30B-A3B verify exact outputs, stable addresses, transfer
+ordering, bounded residency, and service release. In three matched pairs,
+capacity-bounded multi-wave
 prefill reduces repeat-median TTFT p50 and p95 by 35.21\% and 22.96\%,
 respectively, relative to graph-compatible full-layer staging.  We bound this
 result to one model, device, memory configuration, and low-concurrency workload.
 \end{abstract}
+\maketitle
 
 \input{sections/00_intro}
 \input{sections/01_background}
@@ -49,7 +48,12 @@ result to one model, device, memory configuration, and low-concurrency workload.
 \input{sections/06_related_work}
 \input{sections/07_conclusion}
 
-\bibliographystyle{plain}
+\begin{acks}
+OpenAI Codex was used to assist with manuscript structuring, prose drafting
+and editing, citation checking, and generation of figure plotting code.
+\end{acks}
+
+\bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
 \end{document}
