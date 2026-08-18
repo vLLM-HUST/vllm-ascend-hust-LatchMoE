@@ -1,110 +1,64 @@
 \section{Background and Problem Formulation}
 \label{sec:background}
 
-\subsection{MoE Inference and Expert Offloading}
+\subsection{MoE Inference and Dynamic Expert Caching}
 \label{sec:background_moe}
 
-A Mixture-of-Experts (MoE) layer replaces the dense feed-forward network
-with a set of experts and a router. For each input token, the router selects
-a small subset of experts and combines their outputs according to the routing
-weights~\cite{shazeer2017outrageously,fedus2022switch,
-jiang2024mixtral,dai2024deepseekmoe}. We refer to an expert's model-defined
-identity as its \emph{logical expert ID}. For an MoE invocation at step $t$,
-we denote by $\mathcal{A}_t$ the set of logical experts selected by the
-router across all participating tokens. Because routing is data dependent,
-$\mathcal{A}_t$ can change across inference steps. The effect is particularly
-pronounced during prefill, where many prompt tokens are processed together
-and their routed experts may form a much larger active set than in a typical
-decoding step~\cite{fang2025klotski}.
+A Mixture-of-Experts (MoE) layer replaces the dense feed-forward network with a set of experts and a router. 
+For each input token, the router selects
+a small subset of experts and combines their outputs according to the routing weights~\cite{shazeer2017outrageously,fedus2022switch, jiang2024mixtral,dai2024deepseekmoe}. 
+We refer to an expert's model-defined identity as its \emph{logical expert ID}. 
+For an MoE invocation at step $t$, let $\mathcal{A}_t$ denote the set of logical experts selected across all participating tokens. 
+Because routing is input-dependent, $\mathcal{A}_t$ varies across inference steps.
+This active-set variability is especially pronounced during prefill, where many prompt tokens are processed together and may collectively activate substantially more experts than a typical decoding step~\cite{fang2025klotski}.
 
-When the complete expert pool does not fit in accelerator HBM, expert
-offloading keeps the expert weights in host memory and maintains only a
-bounded resident working set on the accelerator
-~\cite{xue2024moeinfinity,hwang2024pregated,cao2025moelightning,
-fang2025klotski}. Let $\mathcal{H}_t$ denote the set of experts resident in
-HBM at step $t$, with $|\mathcal{H}_t| \leq C$ for an HBM capacity of $C$
-experts. A routed expert in $\mathcal{A}_t \cap \mathcal{H}_t$ can be used
-directly, whereas an expert in
-$\mathcal{A}_t \setminus \mathcal{H}_t$ incurs an offloading miss and must
-be transferred from host memory. If the HBM working set is already full,
-loading the missing expert requires replacing an existing resident expert.
+When the complete expert pool does not fit in accelerator HBM, expert offloading places part of the expert weights in host memory. 
+We focus on \emph{cache-based expert offloading}, which maintains a bounded expert cache in HBM and stages non-resident experts from host memory on demand~\cite{xue2024moeinfinity,hwang2024pregated,cao2025moelightning,fang2025klotski}.
+Let $\mathcal{H}_t$ denote the set of experts resident in HBM at step $t$, with $|\mathcal{H}_t| \leq C$, where $C$ is the cache capacity measured in experts. 
+A requested expert $e \in \mathcal{A}_t \cap \mathcal{H}_t$ is a cache hit, whereas $e \in \mathcal{A}_t \setminus \mathcal{H}_t$ incurs an expert cache miss and must be staged from host memory. 
+If the cache is full, admitting a missing expert requires evicting or replacing an existing resident expert.
 
-Importantly, offloading makes expert \emph{placement} a runtime-managed
-state. Although the logical identity of expert $e$ is fixed by the model,
-the physical storage containing its weights need not be fixed across
-inference steps. We denote the physical location of a resident expert $e$
-at step $t$ by $\pi_t(e)$. Expert loading and replacement can therefore
-change both the resident set $\mathcal{H}_t$ and the placement mapping
-$\pi_t$ as routing evolves. This distinction between stable logical expert
-identity and dynamic physical placement is central to the interaction
-between expert offloading and graph replay discussed next.
+Cache-based offloading therefore makes expert residency and placement runtime-managed state. 
+For each resident expert $e \in \mathcal{H}_t$, let $\pi_t(e)$ denote the physical HBM location containing its weights at step $t$. 
+As routing decisions trigger admission, eviction, and replacement, both the resident set $\mathcal{H}_t$ and the placement mapping $\pi_t$ may evolve over time. 
+Thus, a logical expert has a fixed model identity, while its HBM residency and physical placement are dynamic.
 
 \subsection{Graph Replay and Replay-Stable Execution State}
 \label{sec:background_graph}
 
-Graph replay reduces repeated host-side scheduling and launch overhead by
-capturing a recurring accelerator execution sequence and reusing it across
-subsequent invocations. Once captured, however, the replayed computation is
-tied to the execution structure and graph-visible storage bindings recorded
-during capture. We refer to these reusable properties collectively as the
-\emph{replay-stable execution state}. In this paper, this state includes the
-captured operation topology and the physical storage referenced by captured
-computation.
+Graph replay reduces repeated host-side scheduling and kernel-launch overhead by capturing a recurring accelerator execution sequence and replaying it as a unit~\cite{kwon2020nimble,ye2025flashinfer}.
+Under conventional replay, the captured operation structure, kernel parameters, and referenced memory addresses are reused across invocations~\cite{nvidiaCudaGraph}.
+We refer to the reusable execution structure and graph-visible storage bindings collectively as the \emph{replay-stable execution state}, and denote the graph-visible physical bindings by $\mathcal{B}$.
 
-Replay stability does not imply that all runtime data must remain unchanged.
-The contents of graph-visible buffers may evolve between replays as long as
-the captured computation continues to access the same storage. For example,
-FlashInfer accommodates request-dependent scheduling under CUDA Graph by
-placing scheduler metadata in preallocated device workspaces and updating
-their contents between invocations, while preserving the addresses referenced
-by captured kernels~\cite{ye2025flashinfer}. This distinction separates
-\emph{dynamic values} from \emph{dynamic bindings}: the former can be written
-into replay-stable storage, whereas changing the physical storage referenced
-by captured computation changes the execution state on which replay depends.
-
-We therefore model a captured region by its operation topology
-$\mathcal{O}$ and graph-visible physical bindings $\mathcal{B}$. Across
-replays, runtime values may evolve from $V_t$ to $V_{t+1}$, while
-$\mathcal{O}$ and $\mathcal{B}$ remain reusable:
-\[
-    (\mathcal{O}, \mathcal{B}, V_t)
-    \;\longrightarrow\;
-    (\mathcal{O}, \mathcal{B}, V_{t+1}).
-\]
-The key requirement is thus not immutable data, but a stable execution
-interface through which changing runtime data can be consumed. Conventional expert offloading violates this separation because expert replacement can change the physical weight binding itself rather than merely
-the contents stored behind a stable binding.
+Replay stability does not require runtime data to remain unchanged. 
+Values stored in preallocated graph-visible buffers may be updated between replays as long as the captured computation continues to access the same storage. 
+For example, FlashInfer accommodates request-dependent scheduling while maintaining CUDA Graph compatibility by expressing runtime scheduling information through reusable device-side state~\cite{ye2025flashinfer}. 
+This distinction separates \emph{dynamic values} from \emph{dynamic bindings}: runtime values may evolve behind a stable graph-visible interface, whereas changing the physical storage referenced by captured computation changes $\mathcal{B}$.
+Thus, graph replay requires a stable execution interface, rather than immutable runtime data.
 
 \subsection{Dynamic Expert Placement Meets Graph Replay}
 \label{sec:background_conflict}
 
-The interaction between expert offloading and graph replay becomes problematic
-when captured computation directly references the physical storage of expert
-weights. Consider a logical expert $e$ that is resident at physical location
-$\pi_t(e)$ during step $t$. If $e$ is later evicted and subsequently reloaded,
-the runtime may place it at a different location $\pi_{t+1}(e)$. Thus,
-although the logical expert remains unchanged, its physical binding may evolve
-across inference steps:
-\[
-    \pi_t(e) \neq \pi_{t+1}(e).
+The conflict arises when cache-based expert offloading exposes the current HBM placement of expert weights directly to captured computation. 
+Consider a logical expert $e$ that is resident at two inference steps $t$ and $t' > t$. 
+If $e$ is evicted after step $t$ and later reloaded, it may occupy a different HBM location: 
+\[ 
+  \pi_t(e) \neq \pi_{t'}(e). 
+\] 
+Such placement changes are natural under a bounded expert cache, whose contents evolve with routing decisions.
+
+If captured expert computation directly binds $e$ to its current HBM location, a change in $\pi_t(e)$ also changes the graph-visible binding $\mathcal{B}$. 
+Dynamic expert caching may therefore require the resident set $\mathcal{H}_t$ and placement mapping $\pi_t$ to evolve, while conventional graph replay expects its graph-visible bindings $\mathcal{B}$ to remain reusable. 
+The desired execution abstraction must decouple these two requirements: 
+\[ 
+ (\mathcal{H}_t, \pi_t) \;\text{may evolve}, 
+ \qquad 
+ \mathcal{B} \;\text{remains replay-stable}. 
 \]
 
-This behavior conflicts with the replay model in
-Section~\ref{sec:background_graph}. If captured expert computation directly
-binds logical expert $e$ to its current physical weight storage, then changing
-$\pi_t(e)$ also changes the graph-visible binding $\mathcal{B}$ on which the
-captured execution depends. In other words, conventional offloading couples
-two forms of state that have different stability requirements: logical expert
-placement must evolve with routing and HBM residency, whereas graph-visible
-physical bindings must remain reusable across replay.
+Several straightforward alternatives avoid one side of this conflict only by sacrificing another system objective. 
+Keeping all experts permanently resident would stabilize their physical bindings but defeats offloading under a bounded HBM budget. 
+Falling back to eager execution accommodates arbitrary placement changes but forfeits the host-overhead savings of graph replay. 
+Rebuilding or repairing captured execution after placement changes similarly reintroduces runtime intervention into the repeated inference path. 
 
-Several straightforward alternatives avoid one side of this conflict only by
-sacrificing another system objective. Keeping all experts permanently resident
-would stabilize their physical bindings but defeats offloading under a bounded
-HBM budget. Falling back to eager execution accommodates arbitrary placement
-changes but forfeits the host-overhead savings of graph replay. Rebuilding or
-repairing captured execution after placement changes similarly reintroduces
-runtime intervention into the repeated inference path. The desired execution
-model must therefore allow expert identity and residency to evolve while
-preventing those changes from propagating into the physical bindings observed
-by captured computation.
+Therefore, our goal is to support dynamic expert residency and placement within a bounded HBM cache without exposing those changes to the graph-visible bindings used by replayed computation.
