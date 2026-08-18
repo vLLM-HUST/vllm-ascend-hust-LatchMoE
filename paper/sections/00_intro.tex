@@ -3,9 +3,9 @@
 
 Mixture-of-Experts (MoE) architectures have emerged as a prominent approach for scaling Large Language Models (LLMs) to hundreds of billions of parameters~\cite{shazeer2017outrageously,fedus2022switch, jiang2024mixtral,dai2024deepseekmoe}. 
 By dynamically routing each token to only a sparse subset of experts, MoE models substantially increase model capacity while keeping per-token computation bounded~\cite{du2022glam,rajbhandari2022deepspeedmoe}. 
-However, sparse activation reduces computation rather than model storage: although only a small number of experts are activated for each token, the runtime must still make the entire expert pool available for routing. 
+However, sparse activation reduces computation rather than model storage: although only a few experts are executed for a given token, the weights of all experts must remain accessible because any expert may be selected at runtime.
 As MoE models scale, the simultaneous residency of all expert weights in accelerator High-Bandwidth Memory (HBM) places significant strain on memory capacity.
-To serve such models on memory-constrained accelerators, \textbf{expert offloading} has become an important strategy: the runtime keeps non-expert layers and a bounded subset of frequently used experts in local HBM, while fetching non-resident experts from host memory on demand~\cite{hwang2024pregated,xue2024moeinfinity,li2026commitmoe}. 
+To serve such models on memory-constrained accelerators, \textbf{expert offloading} has become an important strategy: the runtime keeps a portion of expert weights in host memory and accesses or stages them on demand during inference~\cite{hwang2024pregated,xue2024moeinfinity,li2026commitmoe}. 
 
 To make expert offloading practical, prior systems reduce its data-movement overhead through expert caching, routing-aware prediction and prefetching, and transfer--computation overlap~\cite{hwang2024pregated,kong2024swapmoe,cao2025moelightning,fang2025klotski,xue2024moeinfinity}. 
 These techniques reduce the frequency of host-to-device transfers or hide part of their latency, substantially improving the efficiency of offloaded MoE inference. 
@@ -25,19 +25,23 @@ This result indicates that most of the improvement comes from eliminating host-i
   \label{fig:graph_breakdown} 
 \end{figure} 
 
-However, graph replay is effective only when the captured execution state, including its memory bindings, remains stable. 
-Dynamic expert offloading can violate this condition. 
+However, graph replay is effective when the captured execution state remains stable. 
+The dynamically managed HBM expert cache can violate this condition. 
 A cache miss may trigger expert eviction and replacement, causing the logical-to-physical weight binding to change across decoding steps.
-The captured computation then cannot safely reuse its previous bindings without repairing the graph or falling back to eager execution. 
+Consequently, safely reusing the captured computation requires either repairing the graph to reflect the new bindings, or falling back to eager execution. 
 Both options add host work and reduce the benefit of graph replay. 
-The resulting systems problem is to \textbf{enable dynamic expert residency and placement without sacrificing graph replay under a bounded HBM budget }.
+The resulting systems problem is to \textbf{enable dynamic expert residency and placement within a bounded HBM cache without sacrificing graph replay}.
 
-Graph-compatible inference runtimes take a different approach: they keep graph-visible workspaces, metadata, and execution configurations reusable across replays~\cite{ye2025flashinfer}. However, they do not support a bounded expert pool whose contents change dynamically. Therefore, existing systems lack an execution abstraction that supports dynamic expert replacement while preserving graph replay.
+Existing graph-compatible offloading approaches, such as UVA, preserve graph replay by mapping pinned host-resident expert weights to stable accelerator-visible addresses that remain valid across replays~\cite{vllmUVA,nvidiaCudaBestPractices}.
+However, this approach does not address dynamic HBM expert caching, where routing-driven replacement changes the logical experts associated with graph-visible HBM storage.
+Thus, preserving graph replay under a dynamically managed HBM expert cache remains challenging.
 
-Our key insight is that \textbf{graph replay requires stable physical storage, not static expert residency}. Captured computation only requires its graph-visible storage addresses to remain valid. The runtime can therefore reuse a fixed set of physical slots for different logical experts: replacement changes slot contents and mapping values, not the addresses visible to the graph. This separation allows expert residency to evolve under a bounded HBM budget without invalidating replay.
+Our key insight is that \textbf{graph replay requires stable graph-visible storage, not static expert residency}. 
+A fixed set of HBM slots can therefore serve as a stable interface to replayed computation, while different logical experts are dynamically loaded into these slots as routing decisions evolve.
+By decoupling logical expert identity from graph-visible physical storage, expert residency can change at runtime.
 
 Realizing this abstraction raises three systems challenges.
-First, routing-dependent expert staging must occur without invalidating captured computation.
+First, routing-dependent expert staging must be isolated from captured execution.
 Active experts are known only after routing, yet loading and replacement must not alter the replay-visible storage or execution structure.
 Second, bounded slot storage must be updated without placing expert transfer entirely on the critical path.
 Changing routing decisions may require repeated expert movement, and the routed working set may exceed the available slots, making transfer--computation overlap essential for efficient execution.
@@ -45,16 +49,16 @@ Third, slot reuse must remain correct under asynchronous transfer and computatio
 A slot cannot be reassigned while its previous contents are still in use, nor can a new assignment become visible before the staged weights are ready.
 
 We present \system, a graph-compatible MoE offloading system that virtualizes dynamic logical experts over a fixed physical slot interface.
-To isolate routing-dependent dynamism from captured computation, \system places expert staging at an eager boundary while keeping the physical storage seen by replayed kernels stable.
-It further pipelines expert staging and computation through wave-based execution, allowing bounded slot storage to be reused while overlapping transfers for upcoming experts with ongoing computation.
-Finally, a version-controlled handoff protocol coordinates transfer readiness,computation, and mapping publication to ensure safe slot reuse.
-Together, these mechanisms preserve replay-stable execution while allowing expert residency and placement to evolve dynamically under constrained HBM.
+\system isolates routing-dependent dynamism from captured execution by performing expert staging outside the replayed computation while keeping the slot interface seen by graph kernels unchanged.
+For efficient reuse of bounded slot storage, \system organizes expert execution into waves and overlaps the staging of upcoming experts with ongoing computation.
+Finally, \system coordinates asynchronous transfer, computation, and slot reassignment through a version-controlled handoff protocol, ensuring that each slot is reused only when its previous use has completed and its new contents are ready.
+Together, these mechanisms enable dynamic expert residency and placement within a bounded HBM cache while preserving graph replay.
 
 In summary, this paper makes the following contributions:
 
 \begin{itemize}
 
-\item We identify a cross-layer conflict between dynamic expert offloading and graph replay in memory-constrained MoE inference: routing-driven expert replacement changes logical-to-physical weight bindings, whereas graph replay depends on a stable graph-visible execution state. 
+\item We identify a cross-layer conflict between dynamic HBM expert caching and graph replay in memory-constrained MoE inference: routing-driven expert replacement changes logical-to-physical weight bindings, whereas graph replay depends on a stable graph-visible execution state. 
 From this conflict, we derive the key insight that replayability requires stable physical storage rather than static expert residency.
 
 \item We design \system, a graph-compatible MoE offloading runtime that virtualizes dynamic logical experts over replay-stable physical slots.
