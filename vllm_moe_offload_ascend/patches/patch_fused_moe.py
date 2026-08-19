@@ -1783,7 +1783,22 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             topk_ids=shared_ids,
             topk_weights=shared_weights,
         )
-        shared_result = original_fused_experts(self, shared_input)
+        # Ascend's AllGather dispatcher derives its ``active_num`` from the
+        # instance-level top_k rather than the input tensor width. The routed
+        # path keeps that value at the model's routed top-k, while this native
+        # call deliberately contains only the pinned shared suffix. Set it for
+        # this call only, then restore it before the next routed wave.
+        dispatcher = getattr(self, "token_dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "top_k"):
+            raise RuntimeError(
+                "fused shared B2 requires a token dispatcher with a mutable top_k"
+            )
+        original_dispatch_top_k = int(dispatcher.top_k)
+        dispatcher.top_k = shared_count
+        try:
+            shared_result = original_fused_experts(self, shared_input)
+        finally:
+            dispatcher.top_k = original_dispatch_top_k
         combined_out = routed_result.routed_out + shared_result.routed_out
         runtime._record_profile_event(
             "fused_shared_b2_once",

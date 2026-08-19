@@ -1594,7 +1594,7 @@ def test_b2_fused_shared_executes_pinned_suffix_once_and_combines_outputs(monkey
         _ascend_moe_offload_runtime_patch = False
 
         def fused_experts(self, fused_experts_input):
-            shared_calls.append(fused_experts_input)
+            shared_calls.append((fused_experts_input, self.token_dispatcher.top_k))
             return FakeFusedExpertsResult(
                 routed_out=torch.full_like(fused_experts_input.hidden_states, 3.0),
                 dispatch_marker="shared",
@@ -1637,6 +1637,7 @@ def test_b2_fused_shared_executes_pinned_suffix_once_and_combines_outputs(monkey
     patch_fused_moe._patch_moe_comm_method_runtime_hooks(fake_comm)
 
     comm = FakeCommMethod()
+    comm.token_dispatcher = SimpleNamespace(top_k=2)
     routed_calls = []
 
     def run_routed_b2(**kwargs):
@@ -1681,8 +1682,11 @@ def test_b2_fused_shared_executes_pinned_suffix_once_and_combines_outputs(monkey
     assert routed_calls[0]["fused_experts_input"].topk_ids.tolist() == [[0, 1], [1, 0]]
     assert routed_calls[0]["control_profile"]["pair_offsets_by_expert"] is None
     assert len(shared_calls) == 1
-    assert shared_calls[0].topk_ids.tolist() == [[2], [2]]
-    assert shared_calls[0].topk_weights.tolist() == [[1.0], [1.0]]
+    shared_input, dispatch_top_k = shared_calls[0]
+    assert dispatch_top_k == 1
+    assert shared_input.topk_ids.tolist() == [[2], [2]]
+    assert shared_input.topk_weights.tolist() == [[1.0], [1.0]]
+    assert comm.token_dispatcher.top_k == 2
     assert pinned_weights.expected_device_types == ["cpu"]
     assert torch.equal(result.routed_out, torch.full((2, 4), 5.0))
     assert result.dispatch_marker == "routed"
