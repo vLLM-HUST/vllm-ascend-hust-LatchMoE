@@ -2951,3 +2951,45 @@ def test_graph_tools_default_to_graph_mode_and_reject_forced_eager(monkeypatch):
     )
     assert llm_kwargs["enable_prefix_caching"] is False
     assert llm_kwargs["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+    assert llm_kwargs["additional_config"] == {
+        "ascend_compilation_config": {"fuse_norm_quant": False}
+    }
+
+
+def test_smoke_runner_records_validated_ascend_additional_config(monkeypatch):
+    from benchmark.scripts import run_fixed_slot_smoke as benchmark_smoke
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_fixed_slot_smoke.py",
+            "--output-dir",
+            "/tmp/smoke",
+            "--ascend-additional-config-json",
+            '{"mix_placement": true}',
+        ],
+    )
+
+    args = benchmark_smoke.parse_args()
+    assert args.ascend_additional_config == {"mix_placement": True}
+    llm_kwargs = benchmark_smoke._build_llm_kwargs(
+        SimpleNamespace(
+            model="/models/deepseek",
+            enforce_eager=False,
+            gpu_memory_utilization=0.4,
+            kv_cache_memory_mb=256,
+            max_model_len=64,
+            max_num_seqs=1,
+            max_num_batched_tokens=2,
+            with_native_offload_backend=False,
+            disable_ascend_norm_quant_fusion=False,
+            ascend_additional_config=args.ascend_additional_config,
+        ),
+        {
+            "model": {"path": "/unused", "tensor_parallel_size": 1},
+            "dataset": {"seed": 42},
+        },
+        "fixed_slot_sync",
+    )
+    assert llm_kwargs["additional_config"] == {"mix_placement": True}
