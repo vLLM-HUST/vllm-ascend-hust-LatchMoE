@@ -1,0 +1,101 @@
+\section{Motivation}
+\label{sec:motivation}
+
+Section~\ref{sec:background} identifies a structural mismatch between
+cache-based expert offloading and ordinary graph replay. We next examine how
+often the underlying conditions arise in a realistic serving workload. Our
+characterization asks two questions: whether a small decode-time active set
+actually produces stable expert residency, and whether a bounded expert cache
+can hold the much larger active set observed during prefill.
+
+We analyze the retained router and expert-cache profile from a 200-request
+ShareGPT mixed-chat run of Qwen3-30B-A3B in BF16 on one Ascend 910B2. The run
+uses tensor parallelism one, client concurrency one, 12 managed MoE layers,
+and a 32-expert cache for each managed layer. Prefill statistics cover all
+2,400 layer invocations. Decode events are sampled once every eight layer
+invocations and contain 38,098 samples. Table~\ref{tab:motivation-profile}
+summarizes the results. The active-set measurements reflect the model's routing
+decisions, whereas cache misses and device storage assignment updates are
+specific to this cache configuration and residency policy.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Routing pressure in a 200-request ShareGPT run with 12 managed
+  layers and a 32-expert cache per layer. Decode statistics use a fixed 1/8
+  sampling rate. Even though decode activates only eight experts per sampled
+  invocation, device storage assignments change frequently; every prefill
+  invocation exceeds the cache capacity.}
+  \label{tab:motivation-profile}
+  \begin{tabular}{@{}lrr@{}}
+    \toprule
+    Metric & Prefill & Decode \\
+    \midrule
+    Profiled layer invocations & 2,400 & 38,098 \\
+    Active experts, p50/p95/max & 99/117/126 & 8/8/8 \\
+    Invocations with $|\mathcal{A}_t| > 32$ & 100.00\% & 0.00\% \\
+    Expert cache miss rate & -- & 20.26\% \\
+    Invocations with a cache miss & -- & 68.25\% \\
+    Invocations with an assignment update & -- & 67.59\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Decode Repeatedly Changes Device Storage Assignments}
+
+A small instantaneous active set does not imply stable residency. Each sampled
+decode invocation activates eight experts, one quarter of the configured
+cache capacity. Nevertheless, 68.25\% of sampled layer invocations contain at
+least one expert cache miss, and 20.26\% of the requested experts miss in the
+cache. Moreover, 67.59\% of sampled invocations update at least one
+device storage assignment. Thus, capacity sufficient for one decode
+invocation does not stabilize assignments across invocations. Ordinary
+graph replay cannot directly bind logical experts to these changing device
+storage assignments without graph update or recapture.
+
+This observation is deliberately scoped to the evaluated model, workload,
+and cache configuration. The exact miss rate depends on routing locality,
+cache capacity, and the residency policy. The important systems property is
+that decode-time routing repeatedly changes the device storage assignment even
+when the active set is much smaller than the cache.
+
+\subsection{Prefill Exceeds the Bounded Expert Cache}
+
+Prefill creates a different form of pressure. Its median invocation activates
+99 distinct experts, while the p95 and maximum reach 117 and 126 experts,
+respectively. All 2,400 profiled layer invocations exceed the 32-expert cache
+capacity. This overflow is independent of the cache replacement policy: the
+experts in one invocation cannot be materialized simultaneously within the
+configured bound. Even an ideal partition would require at least three
+capacity-sized groups for 99.29\% of the profiled invocations.
+
+The runtime must therefore support two operating regimes. During decode, it
+must preserve replay while individual cache misses continually change expert
+residency. During prefill, it must execute an active set that can be several
+times larger than the available cache. A bounded implementation must therefore
+stage and compute these groups over time. Staging each group synchronously
+would expose transfer latency, so the execution model should retain
+opportunities to overlap transfer with useful computation.
+
+\subsection{Requirements for Graph-Compatible Offloading}
+
+Straightforward alternatives satisfy only part of this objective. Permanent
+expert residency preserves graph-visible storage bindings but violates the
+bounded-HBM premise. Eager offloading accommodates arbitrary assignment changes
+but gives up the graph-replay savings shown in
+Figure~\ref{fig:graph_breakdown}. Updating or recapturing the graph after
+assignment changes likewise reintroduces host intervention. Finally, exposing
+host-resident weights through stable addresses preserves replay but does not
+provide a dynamically managed HBM expert cache
+~\cite{vllmUVA,nvidiaCudaBestPractices}.
+
+These observations lead to three requirements. \textbf{First, binding
+stability:} runtime changes in device storage assignment must not change the
+graph-visible storage bindings used by ordinary replay. \textbf{Second,
+capacity-bounded execution:} the runtime must preserve the model's routing
+semantics when the active set exceeds the expert-cache capacity, while
+allowing transfer to overlap with computation. \textbf{Third, safe
+asynchrony:} storage cannot be reassigned until its previous consumer has
+finished, and a new assignment cannot be published before the corresponding
+expert transfer is ready. The next section presents an execution abstraction
+that satisfies these requirements.

@@ -1,0 +1,82 @@
+{
+  "decode": {
+    "active_experts": {
+      "max": 8,
+      "min": 8,
+      "p50_nearest_rank": 8,
+      "p95_nearest_rank": 8
+    },
+    "expert_cache_accesses": {
+      "hits": 1937257,
+      "miss_rate_pct": 20.5521,
+      "misses": 501143
+    },
+    "layer_invocation_imbalance": {
+      "max": 25400,
+      "max_minus_min": 0,
+      "min": 25400
+    },
+    "layer_invocations": {
+      "11": 25400,
+      "15": 25400,
+      "19": 25400,
+      "23": 25400,
+      "27": 25400,
+      "3": 25400,
+      "31": 25400,
+      "35": 25400,
+      "39": 25400,
+      "43": 25400,
+      "47": 25400,
+      "7": 25400
+    },
+    "mapping_updates": {
+      "count": 489636,
+      "update_bearing_invocations": 207550,
+      "update_bearing_rate_pct": 68.0938
+    },
+    "miss_bearing_invocations": {
+      "count": 209423,
+      "rate_pct": 68.7083
+    },
+    "profile_sample_rates": [
+      1
+    ],
+    "sampled_layer_invocations": 304800
+  },
+  "prefill": {
+    "active_experts": {
+      "max": 126,
+      "min": 58,
+      "p50_nearest_rank": 99,
+      "p95_nearest_rank": 117
+    },
+    "capacity_overflow": {
+      "capacity_experts": 32,
+      "overflow_invocations": 2400,
+      "overflow_rate_pct": 100.0
+    },
+    "layer_invocations": 2400,
+    "required_capacity_groups": {
+      "counts": {
+        "2": 17,
+        "3": 995,
+        "4": 1388
+      },
+      "three_or_more_invocations": 2383,
+      "three_or_more_rate_pct": 99.2917
+    }
+  },
+  "schema_version": 1,
+  "scope": {
+    "analyzed_requests": 200,
+    "cache_capacity_experts_per_layer": 32,
+    "filter": "Start at the first prefill event after the configured skipped request groups; retain all later prefill and decode events.",
+    "managed_layers": 12,
+    "skipped_prefill_requests": 1
+  },
+  "source": {
+    "profile": "benchmark/artifacts/motivation-fullrate-20260818/sew-offload-ascend-v1-20260818T145649Z/sew_14gb_autoslots/mixed_chat/moe_profile.jsonl",
+    "sha256": "74f15c23d5342d0bfe6035e2f3323a5e2b27d479ecb91a4929800318d3c1c279"
+  }
+}
