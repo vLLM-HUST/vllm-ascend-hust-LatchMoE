@@ -1,0 +1,188 @@
+{
+  "generated_at": "2026-08-19T05:38:06.979220+00:00",
+  "hbm_gib_for_estimate": 64.0,
+  "models": [
+    {
+      "architecture": [
+        "Qwen3MoeForCausalLM"
+      ],
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "routed_tensor",
+        "overlap_mode": "none",
+        "parallel_mode": "single_npu",
+        "routed_expert_count": 128,
+        "router_adapter": "unresolved_until_native_preflight",
+        "router_owner": "unknown",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": false,
+          "grouped_top_k": false,
+          "num_expert_group": null,
+          "renormalize": true,
+          "routed_scaling_factor": 1.0,
+          "scoring_function": "softmax",
+          "top_k": 8,
+          "topk_group": null
+        },
+        "shared_activation": "none",
+        "shared_expert_count": 0,
+        "shared_mode": "none",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "checkpoint_index_sha256": "df0d481ec595c55a0ba58426d517390c6214a566ec4ff1c8fc4bbce9f57b3c24",
+      "checkpoint_path": "/root/data/shared_models/strict-models/Qwen3-30B-A3B",
+      "checkpoint_weight_bytes": 61066575648,
+      "checkpoint_weight_files": 16,
+      "config_sha256": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+      "id": "qwen3-30b-a3b",
+      "memory_estimate": {
+        "dtype_bytes": 2,
+        "hbm_after_routed_slots_shared_stage_bytes": 67813507072,
+        "hbm_budget_bytes": 68719476736,
+        "moe_layers": 48,
+        "resident_shared_bytes": 0,
+        "routed_expert_bytes": 9437184,
+        "routed_full_bytes": 57982058496,
+        "shared_gate_bytes": 0,
+        "slot_bytes": 301989888,
+        "stage_buffer_bytes": 603979776
+      },
+      "model_type": "qwen3_moe",
+      "native_model_class_preflight": {
+        "architecture": "Qwen3MoeForCausalLM",
+        "blockers": [
+          "requires separate NPU weight-loading preflight"
+        ],
+        "full_native_construction": "not_run",
+        "model_class": "vllm.model_executor.models.qwen3_moe.Qwen3MoeForCausalLM",
+        "scope": "ModelConfig_and_ModelRegistry",
+        "status": "passed"
+      },
+      "qualification_status": "not_run"
+    },
+    {
+      "architecture": [
+        "Glm4MoeLiteForCausalLM"
+      ],
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "shared_routed_tuple",
+        "overlap_mode": "none",
+        "parallel_mode": "single_npu",
+        "routed_expert_count": 64,
+        "router_adapter": "unresolved_until_native_preflight",
+        "router_owner": "unknown",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": true,
+          "grouped_top_k": false,
+          "num_expert_group": 1,
+          "renormalize": true,
+          "routed_scaling_factor": 1.8,
+          "scoring_function": "sigmoid",
+          "top_k": 4,
+          "topk_group": 1
+        },
+        "shared_activation": "always_on",
+        "shared_expert_count": 1,
+        "shared_mode": "external_resident",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "checkpoint_index_sha256": "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791",
+      "checkpoint_path": "/workspace/shared_models/strict-models/GLM-4.7-Flash",
+      "checkpoint_weight_bytes": 62444175504,
+      "checkpoint_weight_files": 48,
+      "config_sha256": "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb",
+      "id": "glm-4.7-flash",
+      "memory_estimate": {
+        "dtype_bytes": 2,
+        "hbm_after_routed_slots_shared_stage_bytes": 66039316480,
+        "hbm_budget_bytes": 68719476736,
+        "moe_layers": 46,
+        "resident_shared_bytes": 868220928,
+        "routed_expert_bytes": 18874368,
+        "routed_full_bytes": 55566139392,
+        "shared_gate_bytes": 0,
+        "slot_bytes": 603979776,
+        "stage_buffer_bytes": 1207959552
+      },
+      "model_type": "glm4_moe_lite",
+      "native_model_class_preflight": {
+        "architecture": "Glm4MoeLiteForCausalLM",
+        "blockers": [
+          "requires separate NPU weight-loading preflight"
+        ],
+        "full_native_construction": "not_run",
+        "model_class": "vllm.model_executor.models.glm4_moe_lite.Glm4MoeLiteForCausalLM",
+        "scope": "ModelConfig_and_ModelRegistry",
+        "status": "passed"
+      },
+      "qualification_status": "not_run"
+    },
+    {
+      "architecture": [
+        "Qwen3NextForCausalLM"
+      ],
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "shared_routed_tuple",
+        "overlap_mode": "none",
+        "parallel_mode": "single_npu",
+        "routed_expert_count": 512,
+        "router_adapter": "unresolved_until_native_preflight",
+        "router_owner": "unknown",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": false,
+          "grouped_top_k": false,
+          "num_expert_group": null,
+          "renormalize": true,
+          "routed_scaling_factor": 1.0,
+          "scoring_function": "softmax",
+          "top_k": 10,
+          "topk_group": null
+        },
+        "shared_activation": "gated",
+        "shared_expert_count": 1,
+        "shared_mode": "external_resident",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "checkpoint_index_sha256": "0e5274f538d750abdd7fd55a36bad64100f9e881d59c65f6a59f364d2f8b6dd7",
+      "checkpoint_path": "/workspace/shared_models/strict-models/Qwen3-Next-80B-A3B-Instruct",
+      "checkpoint_weight_bytes": 162659161528,
+      "checkpoint_weight_files": 41,
+      "config_sha256": "2d483c7cabad7c8704478ed4038fa7e7b2eff840bc00a118eccbe38e2b488303",
+      "id": "qwen3-next-80b-a3b-instruct",
+      "memory_estimate": {
+        "dtype_bytes": 2,
+        "hbm_after_routed_slots_shared_stage_bytes": 67813310464,
+        "hbm_budget_bytes": 68719476736,
+        "moe_layers": 48,
+        "resident_shared_bytes": 301989888,
+        "routed_expert_bytes": 6291456,
+        "routed_full_bytes": 154618822656,
+        "shared_gate_bytes": 196608,
+        "slot_bytes": 201326592,
+        "stage_buffer_bytes": 402653184
+      },
+      "model_type": "qwen3_next",
+      "native_model_class_preflight": {
+        "architecture": "Qwen3NextForCausalLM",
+        "blockers": [
+          "requires separate NPU weight-loading preflight"
+        ],
+        "full_native_construction": "not_run",
+        "model_class": "vllm.model_executor.models.qwen3_next.Qwen3NextForCausalLM",
+        "scope": "ModelConfig_and_ModelRegistry",
+        "status": "passed"
+      },
+      "qualification_status": "not_run"
+    }
+  ],
+  "schema_version": "latchmoe-model-registry-v2",
+  "slot_count_for_estimate": 32
+}

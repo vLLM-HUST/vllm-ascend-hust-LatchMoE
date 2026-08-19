@@ -10,6 +10,11 @@ The benchmark is tailored to one systems question:
 > Can slot-stable expert offloading make MoE expert offloading feasible and
 > graph-compatible on a memory-constrained single Ascend 910B-class NPU?
 
+The canonical YAML remains the routed-only Qwen3 baseline. Shared-expert and
+complex-router runs must supply their checkpoint path explicitly and are only
+reportable after the qualification matrix records their native, parity,
+PIECEWISE, overflow, decode, and token gates as passed.
+
 ## Layout
 
 | Path | Purpose |
@@ -78,6 +83,21 @@ python benchmark/scripts/run_suite.py \
   --dry-run
 ```
 
+Record a shared/router qualification unit with the immutable Phase-A registry
+and bounded eager router artifacts. The parity verifier rejects missing native
+or seam records as well as the first ID/weight/logit mismatch:
+
+```bash
+python benchmark/scripts/run_suite.py \
+  --case sew_14gb_autoslots \
+  --workload smoke \
+  --model-path /root/data/shared_models/strict-models/GLM-4.7-Flash \
+  --dataset-path /root/data/benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --capability-registry benchmark/registry/model_registry_v2.json \
+  --router-parity \
+  --dry-run
+```
+
 Run one real unit in the configured vLLM/Ascend environment:
 
 ```bash
@@ -132,7 +152,17 @@ Each benchmark unit writes:
 - `release_ack.json`: portable unit-local release proof (the external custody
   directory retains the same acknowledgement).
 - `moe_trace.jsonl`: routed expert trace events when enabled.
+- `moe_router_parity.jsonl`: bounded eager native/seam router snapshots when
+  `--router-parity` is enabled.
+- `router_parity_report.json`: fail-closed parity result for the corresponding
+  unit; absent records are a failure, not a pass.
 - `PASSED.txt` or `FAILED.txt`: fail-closed unit disposition.
+
+Every `unit_manifest.json` also records a checkpoint-derived capability
+descriptor digest, Phase-A registry digest/row match, and router-parity
+coordinates. A config-derived descriptor can contain unresolved router
+ownership; it is provenance rather than a substitute for the materialized
+runner's capability guard.
 
 Failed units still write `unit_result.json` and `FAILED.txt`; expected OOM or
 graph-capture failures are evidence, not missing data. A request-success result

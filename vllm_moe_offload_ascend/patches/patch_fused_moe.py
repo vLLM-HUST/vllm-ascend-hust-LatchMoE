@@ -166,6 +166,38 @@ def _current_forward_phase() -> str | None:
     return None
 
 
+def _is_torch_compile_tracing() -> bool:
+    """Return tracing state without creating a Dynamo-unsafe closure."""
+
+    try:
+        import torch
+
+        compiler = getattr(torch, "compiler", None)
+        if compiler is not None and hasattr(compiler, "is_compiling"):
+            return bool(compiler.is_compiling())
+    except Exception:
+        pass
+    try:
+        import torch
+
+        return bool(torch._dynamo.is_compiling())
+    except Exception:
+        return False
+
+
+def _is_current_graph_capturing() -> bool:
+    """Read Ascend graph-capture state without a Dynamo-local closure."""
+
+    try:
+        from vllm_moe_offload_ascend.moe_offload.runtime import (
+            _is_current_graph_capturing as runtime_is_current_graph_capturing,
+        )
+
+        return bool(runtime_is_current_graph_capturing())
+    except Exception:
+        return False
+
+
 def _current_forward_is_prefill() -> bool | None:
     """Backward-compatible bool view; mixed contains prefill work."""
     phase = _current_forward_phase()
@@ -3056,6 +3088,8 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                     )
                     and hidden_states is not None
                     and int(hidden_states.shape[0]) <= 64
+                    and not _is_torch_compile_tracing()
+                    and not _is_current_graph_capturing()
                 ):
                     native_weights, native_ids = original_select_experts(
                         *args,
@@ -3079,6 +3113,21 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                         f"weight_mean_abs={float(weight_diff.mean().item())}",
                         flush=True,
                     )
+                    from vllm_moe_offload_ascend.moe_offload.router_parity import (
+                        record_router_snapshot,
+                    )
+
+                    native_logits = kwargs.get("router_logits")
+                    if native_logits is None and len(args) > 1:
+                        native_logits = args[1]
+                    if native_logits is not None:
+                        record_router_snapshot(
+                            role="native",
+                            layer_id=int(layer_id),
+                            router_logits=native_logits,
+                            topk_ids=native_ids,
+                            topk_weights=native_weights,
+                        )
                 return injected
         topk_weights, topk_ids = original_select_experts(*args, **kwargs)
         if layer_id is not None:
@@ -3182,18 +3231,6 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
 
     original_select_forward = cls._select_forward
 
-    def _is_torch_compile_tracing() -> bool:
-        try:
-            compiler = getattr(torch, "compiler", None)
-            if compiler is not None and hasattr(compiler, "is_compiling"):
-                return bool(compiler.is_compiling())
-        except Exception:
-            pass
-        try:
-            return bool(torch._dynamo.is_compiling())
-        except Exception:
-            return False
-
     def _seam_config_guards_pass(self) -> bool:
         from vllm_moe_offload_ascend.moe_offload.runtime import get_moe_offload_runtime
 
@@ -3208,9 +3245,6 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         runtime = get_moe_offload_runtime()
         if not runtime.config.offload_stage_seam:
             _probe("FAIL:offload_stage_seam_off")
-            return False
-        if self._shared_experts is not None:
-            _probe("FAIL:shared_experts")
             return False
         moe_config = self.moe_config
         if (
@@ -3230,9 +3264,17 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         return True
 
     def _select_forward(self):
+        from vllm_moe_offload_ascend.moe_offload.runtime import get_moe_offload_runtime
+
+        runtime = get_moe_offload_runtime()
+        if not runtime.config.offload_stage_seam:
+            return original_select_forward(self)
         if self._seam_config_guards_pass():
             return self._seam_forward_entry
-        return original_select_forward(self)
+        raise RuntimeError(
+            "LatchMoE offload-stage seam was requested with an unsupported "
+            "global configuration; refusing native/eager fallback"
+        )
 
     def _seam_forward_entry(
         self,
@@ -3266,6 +3308,9 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             ]
             if hidden_dim_unpadded is not None:
                 args.append(hidden_dim_unpadded)
+            capability = getattr(self, "_seam_capability", None)
+            if getattr(capability, "output_contract", "routed_tensor") == "shared_routed_tuple":
+                return torch.ops.vllm.moe_forward_shared(*args)
             return torch.ops.vllm.moe_forward(*args)
 
         decision = getattr(self, "_seam_active", None)
@@ -3274,7 +3319,22 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             self._seam_active = decision
 
         if not decision:
-            return _native_moe_forward()
+            from vllm_moe_offload_ascend.moe_offload.capabilities import (
+                CapabilitySupport,
+                LatchMoECapabilityError,
+                MoeCapabilityDescriptor,
+            )
+
+            descriptor = getattr(self, "_seam_capability", None)
+            support = getattr(self, "_seam_capability_support", None)
+            if isinstance(descriptor, MoeCapabilityDescriptor) and isinstance(
+                support, CapabilitySupport
+            ):
+                raise LatchMoECapabilityError(descriptor, support)
+            raise RuntimeError(
+                "LatchMoE seam was selected but the layer capability could not "
+                "be resolved; refusing native/eager fallback"
+            )
 
         from vllm_moe_offload_ascend.moe_offload.runtime import (
             get_moe_offload_runtime,
@@ -3345,11 +3405,18 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         native_routed_out = None
         if compare_layer_boundary:
             with runtime.suspend_fixed_slot_execution():
-                native_routed_out = _native_moe_forward(
+                native_result = _native_moe_forward(
                     native_hidden_states=hidden_states.clone(),
                     native_router_logits=router_logits.clone(),
                     native_layer_name=self.layer_name,
-                ).clone()
+                )
+                if isinstance(native_result, tuple):
+                    native_routed_out = (
+                        native_result[0].clone(),
+                        native_result[1].clone(),
+                    )
+                else:
+                    native_routed_out = native_result.clone()
 
         real_name = self.layer_name
         topk_weights, topk_ids = torch.ops.vllm.moe_router_indirect(
@@ -3363,22 +3430,50 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             self._seam_num_logical_experts,
             phase_int,
         )
-        routed_out = torch.ops.vllm.moe_mlp(
-            hidden_states,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            shared_experts_input,
-            input_ids,
-            real_name,
-        )
-        if native_routed_out is not None:
-            output_diff = (native_routed_out.float() - routed_out.float()).abs()
+        # Normal selection always resolves a descriptor before reaching this
+        # point.  Keep the historic routed-only default for test harnesses and
+        # explicit integrations that set ``_seam_active=True`` themselves.
+        capability = getattr(self, "_seam_capability", None)
+        if getattr(capability, "output_contract", "routed_tensor") == "shared_routed_tuple":
+            routed_out = torch.ops.vllm.moe_mlp_shared(
+                hidden_states,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                shared_experts_input,
+                input_ids,
+                real_name,
+            )
+        else:
+            routed_out = torch.ops.vllm.moe_mlp(
+                hidden_states,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                shared_experts_input,
+                input_ids,
+                real_name,
+            )
+        # Tensor-value comparisons are diagnostics only.  Dynamo cannot
+        # capture data-dependent operators such as ``torch.equal`` or scalar
+        # reductions, so defer the whole comparison until the eager boundary.
+        if (
+            native_routed_out is not None
+            and not _is_torch_compile_tracing()
+            and not _is_current_graph_capturing()
+        ):
+            native_compare = (
+                native_routed_out[1]
+                if isinstance(native_routed_out, tuple)
+                else native_routed_out
+            )
+            routed_compare = routed_out[1] if isinstance(routed_out, tuple) else routed_out
+            output_diff = (native_compare.float() - routed_compare.float()).abs()
             print(
                 "SEW_LAYER_BOUNDARY_COMPARE "
                 f"layer={int(self._seam_layer_id)} "
                 f"tokens={int(hidden_states.shape[0])} "
-                f"output_equal={bool(torch.equal(native_routed_out, routed_out))} "
+                f"output_equal={bool(torch.equal(native_compare, routed_compare))} "
                 f"output_max_abs={float(output_diff.max().item())} "
                 f"output_mean_abs={float(output_diff.mean().item())}",
                 flush=True,
@@ -3389,43 +3484,58 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
             get_layer_from_name,
         )
-        from vllm_ascend.quantization.methods.base import (
-            get_moe_num_logical_experts,
+        from vllm_moe_offload_ascend.moe_offload.capabilities import (
+            CapabilitySupport,
+            describe_layer_capability,
+            evaluate_support,
         )
 
         try:
             layer = get_layer_from_name(self.layer_name)
         except Exception:
             return False
-
-        if getattr(layer, "custom_routing_function", None) is not None:
-            return False
-        if getattr(layer, "multistream_overlap_gate", False):
-            return False
-        if getattr(layer, "enable_npugraph_ex_static_kernel", False):
-            return False
-        if (
-            getattr(layer, "zero_expert_num", 0)
-            and getattr(layer, "zero_expert_type", None) is not None
-        ):
-            return False
-
-        num_shared_experts = getattr(layer, "n_shared_experts", 0) or 0
         self._seam_layer_id = int(getattr(layer, "layer_id", -1))
         if self._seam_layer_id < 0:
             # Layer lacks a layer_id attribute; the seam cannot safely key its
             # injection/log2phy registry by -1 (all such layers would collide).
             return False
-        self._seam_num_logical_experts = get_moe_num_logical_experts(
-            layer,
-            layer.moe_config.num_experts,
-            global_redundant_expert_num=getattr(
-                layer,
-                "global_redundant_expert_num",
-                0,
-            ),
-            num_shared_experts=num_shared_experts,
+        descriptor = describe_layer_capability(layer, self)
+        support = evaluate_support(descriptor)
+        extra_blockers: list[str] = list(support.blockers)
+        if getattr(layer, "enable_npugraph_ex_static_kernel", False):
+            extra_blockers.append("unsupported_static_expert_kernel")
+        if (
+            getattr(layer, "zero_expert_num", 0)
+            and getattr(layer, "zero_expert_type", None) is not None
+        ):
+            extra_blockers.append("unsupported_zero_expert_path")
+        if extra_blockers != list(support.blockers):
+            support = CapabilitySupport(state="unsupported", blockers=tuple(extra_blockers))
+        self._seam_capability = descriptor
+        self._seam_capability_support = support
+        if not support.enabled:
+            return False
+        self._seam_num_logical_experts = descriptor.routed_expert_count
+        from vllm_moe_offload_ascend.moe_offload.runtime import (
+            get_moe_offload_runtime,
         )
+        runtime = get_moe_offload_runtime()
+        if descriptor.shared_mode == "external_resident":
+            shared_experts = getattr(self, "_shared_experts", None)
+            shared_gate = getattr(self, "shared_expert_gate", None)
+            if shared_gate is None:
+                shared_gate = getattr(shared_experts, "expert_gate", None)
+            if shared_gate is None:
+                shared_gate = getattr(
+                    getattr(shared_experts, "_experts", None),
+                    "expert_gate",
+                    None,
+                )
+            runtime.register_resident_shared_weights(
+                layer_id=self._seam_layer_id,
+                shared_experts=shared_experts,
+                shared_gate=shared_gate,
+            )
         return True
 
     cls._seam_config_guards_pass = _seam_config_guards_pass

@@ -1,0 +1,139 @@
+{
+  "generated_at": "2026-08-19T05:38:06.979220+00:00",
+  "registry_schema_version": "latchmoe-model-registry-v2",
+  "rows": [
+    {
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "routed_tensor",
+        "overlap_mode": "none",
+        "parallel_mode": "single_npu",
+        "routed_expert_count": 128,
+        "router_adapter": "unresolved_until_native_preflight",
+        "router_owner": "unknown",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": false,
+          "grouped_top_k": false,
+          "num_expert_group": null,
+          "renormalize": true,
+          "routed_scaling_factor": 1.0,
+          "scoring_function": "softmax",
+          "top_k": 8,
+          "topk_group": null
+        },
+        "shared_activation": "none",
+        "shared_expert_count": 0,
+        "shared_mode": "none",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "checkpoint_index_sha256": "df0d481ec595c55a0ba58426d517390c6214a566ec4ff1c8fc4bbce9f57b3c24",
+      "config_sha256": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+      "gates": {
+        "decode_cache_churn": "not_run",
+        "h2d_lease_release": "not_run",
+        "latchmoe_eager_diagnostic": "not_run",
+        "layer_boundary_parity": "not_run",
+        "native_oracle": "not_run",
+        "piecewise_capture": "not_run",
+        "piecewise_replay": "not_run",
+        "prefill_overflow": "not_run",
+        "router_parity": "not_run",
+        "token_exactness": "not_run",
+        "zero_eager_fallback": "not_run"
+      },
+      "id": "qwen3-30b-a3b",
+      "status": "not_run"
+    },
+    {
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "shared_routed_tuple",
+        "overlap_mode": "none",
+        "parallel_mode": "single_npu",
+        "routed_expert_count": 64,
+        "router_adapter": "unresolved_until_native_preflight",
+        "router_owner": "unknown",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": true,
+          "grouped_top_k": false,
+          "num_expert_group": 1,
+          "renormalize": true,
+          "routed_scaling_factor": 1.8,
+          "scoring_function": "sigmoid",
+          "top_k": 4,
+          "topk_group": 1
+        },
+        "shared_activation": "always_on",
+        "shared_expert_count": 1,
+        "shared_mode": "external_resident",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "checkpoint_index_sha256": "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791",
+      "config_sha256": "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb",
+      "gates": {
+        "decode_cache_churn": "not_run",
+        "h2d_lease_release": "not_run",
+        "latchmoe_eager_diagnostic": "not_run",
+        "layer_boundary_parity": "not_run",
+        "native_oracle": "not_run",
+        "piecewise_capture": "not_run",
+        "piecewise_replay": "not_run",
+        "prefill_overflow": "not_run",
+        "router_parity": "not_run",
+        "token_exactness": "not_run",
+        "zero_eager_fallback": "not_run"
+      },
+      "id": "glm-4.7-flash",
+      "status": "not_run"
+    },
+    {
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "shared_routed_tuple",
+        "overlap_mode": "none",
+        "parallel_mode": "single_npu",
+        "routed_expert_count": 512,
+        "router_adapter": "unresolved_until_native_preflight",
+        "router_owner": "unknown",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": false,
+          "grouped_top_k": false,
+          "num_expert_group": null,
+          "renormalize": true,
+          "routed_scaling_factor": 1.0,
+          "scoring_function": "softmax",
+          "top_k": 10,
+          "topk_group": null
+        },
+        "shared_activation": "gated",
+        "shared_expert_count": 1,
+        "shared_mode": "external_resident",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "checkpoint_index_sha256": "0e5274f538d750abdd7fd55a36bad64100f9e881d59c65f6a59f364d2f8b6dd7",
+      "config_sha256": "2d483c7cabad7c8704478ed4038fa7e7b2eff840bc00a118eccbe38e2b488303",
+      "gates": {
+        "decode_cache_churn": "not_run",
+        "h2d_lease_release": "not_run",
+        "latchmoe_eager_diagnostic": "not_run",
+        "layer_boundary_parity": "not_run",
+        "native_oracle": "not_run",
+        "piecewise_capture": "not_run",
+        "piecewise_replay": "not_run",
+        "prefill_overflow": "not_run",
+        "router_parity": "not_run",
+        "token_exactness": "not_run",
+        "zero_eager_fallback": "not_run"
+      },
+      "id": "qwen3-next-80b-a3b-instruct",
+      "status": "not_run"
+    }
+  ],
+  "schema_version": "latchmoe-qualification-matrix-v2"
+}

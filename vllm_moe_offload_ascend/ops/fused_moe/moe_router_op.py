@@ -227,7 +227,16 @@ def _moe_router_indirect_impl(
         num_shared_experts=num_shared_experts,
     )
 
-    return _moe_router_impl(
+    # AscendFusedMoE preserves the model value here because vLLM may rewrite
+    # ``layer.routed_scaling_factor`` to 1.0 when the scale is applied at the
+    # output.  The native apply path uses this preserved value, so the seam
+    # must use it as well to keep router weights bit-for-bit aligned.
+    routed_scaling_factor = getattr(
+        layer,
+        "_original_routed_scaling_factor",
+        getattr(layer, "routed_scaling_factor", 1.0),
+    )
+    topk_weights, topk_ids = _moe_router_impl(
         hidden_states=hidden_states,
         router_logits=router_logits,
         top_k=layer.top_k,
@@ -236,10 +245,23 @@ def _moe_router_indirect_impl(
         topk_group=layer.topk_group,
         num_expert_group=layer.num_expert_group,
         scoring_func=layer.scoring_func,
-        routed_scaling_factor=layer.routed_scaling_factor,
+        routed_scaling_factor=routed_scaling_factor,
         e_score_correction_bias=layer.e_score_correction_bias,
         num_experts=num_logical_experts,
     )
+    if os.getenv("VLLM_ASCEND_MOE_ROUTER_PARITY_PATH") and _capture_state() != "True":
+        from vllm_moe_offload_ascend.moe_offload.router_parity import (
+            record_router_snapshot,
+        )
+
+        record_router_snapshot(
+            role="seam",
+            layer_id=int(getattr(layer, "layer_id", -1)),
+            router_logits=router_logits,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+    return topk_weights, topk_ids
 
 
 def _moe_router_indirect_fake(
@@ -261,7 +283,11 @@ def _moe_router_indirect_fake(
         topk_group=layer.topk_group,
         num_expert_group=layer.num_expert_group,
         scoring_func=layer.scoring_func,
-        routed_scaling_factor=layer.routed_scaling_factor,
+        routed_scaling_factor=getattr(
+            layer,
+            "_original_routed_scaling_factor",
+            getattr(layer, "routed_scaling_factor", 1.0),
+        ),
         e_score_correction_bias=layer.e_score_correction_bias,
         num_experts=layer.moe_config.num_experts,
     )

@@ -36,11 +36,15 @@ from sew_bench import (  # noqa: E402
     validate_config,
     write_json,
 )
+from vllm_moe_offload_ascend.moe_offload.capabilities import (  # noqa: E402
+    describe_checkpoint_config,
+)
 
 
 DEFAULT_OUTPUT_ROOT = Path("benchmark/artifacts/runs")
 DEFAULT_MANAGER = Path("third_party/vllm-hust-dev-hub/manage.sh")
 HOST_MANAGER = Path("benchmark/scripts/manage_locked_host_runtime.py")
+DEFAULT_CAPABILITY_REGISTRY = Path("benchmark/registry/model_registry_v2.json")
 IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -157,6 +161,69 @@ def _provenance(
     }
 
 
+def _capability_identity(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Record the Phase-A descriptor and the exact registry row used by a run.
+
+    Config-only descriptors intentionally retain unresolved router ownership.
+    The materialized runner is still the fail-closed authority for seam enablement.
+    """
+
+    model_path = Path(str(config["model"]["path"])).resolve()
+    config_path = model_path / "config.json"
+    registry_path = Path(
+        str(getattr(args, "capability_registry", DEFAULT_CAPABILITY_REGISTRY))
+    )
+    result: dict[str, Any] = {
+        "descriptor_source": "checkpoint_config",
+        "model_path": str(model_path),
+        "config_path": str(config_path),
+        "config_sha256": _sha256_file(config_path),
+        "registry_path": str(registry_path),
+        "registry_sha256": _sha256_file(registry_path),
+        "registry_status": "unavailable",
+        "qualification_status": "not_run",
+    }
+    if config_path.is_file():
+        try:
+            descriptor = describe_checkpoint_config(
+                json.loads(config_path.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            result["descriptor_status"] = "invalid_config"
+            result["descriptor_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            result["descriptor_status"] = "recorded"
+            result["descriptor"] = descriptor.to_jsonable()
+            result["descriptor_sha256"] = descriptor.digest()
+    else:
+        result["descriptor_status"] = "missing_config"
+
+    if not registry_path.is_file():
+        return result
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        result["registry_status"] = "invalid"
+        result["registry_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    for record in registry.get("models", []):
+        if Path(str(record.get("checkpoint_path", ""))).resolve() != model_path:
+            continue
+        result["registry_model_id"] = record.get("id")
+        result["registry_checkpoint_index_sha256"] = record.get(
+            "checkpoint_index_sha256"
+        )
+        result["qualification_status"] = record.get("qualification_status", "not_run")
+        if record.get("config_sha256") != result["config_sha256"]:
+            result["registry_status"] = "config_digest_mismatch"
+            return result
+        result["registry_status"] = "matched"
+        result["registry_descriptor"] = record.get("capability_config")
+        return result
+    result["registry_status"] = "model_not_found"
+    return result
+
+
 def _locked_host_bundle_sha256(args: argparse.Namespace) -> str | None:
     if getattr(args, "managed_backend", "container") != "locked-host":
         return None
@@ -194,6 +261,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seam-root")
     parser.add_argument("--custody-unit-prefix", default="latchmoe-suite")
     parser.add_argument("--release-ack-dir")
+    parser.add_argument(
+        "--capability-registry",
+        default=str(DEFAULT_CAPABILITY_REGISTRY),
+        help="Phase-A model registry recorded in each unit manifest.",
+    )
+    parser.add_argument(
+        "--router-parity",
+        action="store_true",
+        help="Capture and fail closed on bounded eager router parity artifacts.",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--manifest")
     parser.add_argument("--model-path")
@@ -327,6 +404,8 @@ def _managed_env(
     case: dict[str, Any],
     unit_dir: Path,
     args: argparse.Namespace,
+    *,
+    router_parity: bool = False,
 ) -> dict[str, str]:
     managed_backend = getattr(args, "managed_backend", "container")
     if args.device not in {5, 6}:
@@ -345,7 +424,7 @@ def _managed_env(
     shape = config["serving_shape"]
     model = config["model"]
     image = str(args.runtime_image or "").split("@", 1)[0]
-    env = _unit_env(case, unit_dir)
+    env = _unit_env(case, unit_dir, router_parity=router_parity)
     env.update(
         {
             "VLLM_ENGINE_SYSTEMD_UNIT": unit_name,
@@ -428,7 +507,12 @@ def _manager_call(manager: Path, action: str, env: dict[str, str], log_path: Pat
     return completed
 
 
-def _unit_env(case: dict[str, Any], unit_dir: Path) -> dict[str, str]:
+def _unit_env(
+    case: dict[str, Any],
+    unit_dir: Path,
+    *,
+    router_parity: bool = False,
+) -> dict[str, str]:
     env = dict(os.environ)
     profile_path = unit_dir / "moe_profile.jsonl"
     trace_path = unit_dir / "moe_trace.jsonl"
@@ -438,6 +522,11 @@ def _unit_env(case: dict[str, Any], unit_dir: Path) -> dict[str, str]:
     env.setdefault("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "0")
     env.setdefault("VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE", "8")
     env.setdefault("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", "0")
+    if router_parity:
+        env["VLLM_ASCEND_MOE_ROUTER_PARITY_PATH"] = str(
+            unit_dir / "moe_router_parity.jsonl"
+        )
+        env["VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER"] = "1"
     for key, value in (case.get("env") or {}).items():
         if value is None or value == "":
             env.pop(str(key), None)
@@ -494,7 +583,10 @@ def run_unit(
 ) -> dict[str, Any]:
     unit_dir = suite_dir / str(case["name"]) / str(workload["name"])
     unit_dir.mkdir(parents=True, exist_ok=True)
-    env = _unit_env(case, unit_dir)
+    router_parity_enabled = bool(getattr(args, "router_parity", False))
+    router_parity_path = unit_dir / "moe_router_parity.jsonl"
+    router_parity_report = unit_dir / "router_parity_report.json"
+    env = _unit_env(case, unit_dir, router_parity=router_parity_enabled)
     server_cmd = build_server_command(config, case)
     benchmark_json = unit_dir / "benchmark.json"
     client_cmd = build_client_command(
@@ -505,7 +597,13 @@ def run_unit(
     )
     managed_env_for_manifest = None
     if not args.dry_run and not args.no_start_server:
-        managed_env_for_manifest = _managed_env(config, case, unit_dir, args)
+        managed_env_for_manifest = _managed_env(
+            config,
+            case,
+            unit_dir,
+            args,
+            router_parity=router_parity_enabled,
+        )
     manifest = {
         "case": case,
         "workload": workload,
@@ -514,6 +612,13 @@ def run_unit(
         "selected_env": _selected_env(env),
         "profile_jsonl": str(unit_dir / "moe_profile.jsonl"),
         "trace_jsonl": str(unit_dir / "moe_trace.jsonl"),
+        "router_parity": {
+            "enabled": router_parity_enabled,
+            "artifact_jsonl": str(router_parity_path),
+            "report_json": str(router_parity_report),
+            "max_tokens": env.get("VLLM_ASCEND_MOE_ROUTER_PARITY_MAX_TOKENS", "64"),
+        },
+        "capability_identity": _capability_identity(config, args),
         "provenance": _provenance(config, args, managed_env_for_manifest),
     }
     write_json(unit_dir / "unit_manifest.json", manifest)
@@ -549,7 +654,13 @@ def run_unit(
             )
             _assert_port_free(int(config["server"]["port"]))
             _assert_device_free(int(args.device))
-            managed_env = _managed_env(config, case, unit_dir, args)
+            managed_env = _managed_env(
+                config,
+                case,
+                unit_dir,
+                args,
+                router_parity=router_parity_enabled,
+            )
             status = _manager_call(manager, "status", managed_env, lifecycle_log_path, check=False)
             if status.returncode == 0:
                 payload = json.loads(status.stdout.strip().splitlines()[-1])
@@ -603,6 +714,31 @@ def run_unit(
             )
         if completed.returncode != 0:
             raise RuntimeError(f"client exited with code {completed.returncode}")
+        if router_parity_enabled:
+            verification = subprocess.run(
+                [
+                    args.python,
+                    str(SCRIPT_DIR / "verify_router_parity.py"),
+                    "--native",
+                    str(router_parity_path),
+                    "--seam",
+                    str(router_parity_path),
+                    "--output",
+                    str(router_parity_report),
+                ],
+                cwd=Path.cwd(),
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            (unit_dir / "router_parity_verify.log").write_text(
+                verification.stdout,
+                encoding="utf-8",
+            )
+            if verification.returncode != 0:
+                raise RuntimeError("router parity verification failed")
 
         result = {
             "case": case,
@@ -615,6 +751,8 @@ def run_unit(
             "benchmark_json": str(benchmark_json),
             "profile_jsonl": str(unit_dir / "moe_profile.jsonl"),
             "trace_jsonl": str(unit_dir / "moe_trace.jsonl"),
+            "router_parity_artifact": str(router_parity_path),
+            "router_parity_report": str(router_parity_report),
         }
     except BaseException as exc:
         result = {
@@ -630,6 +768,8 @@ def run_unit(
             "benchmark_json": str(benchmark_json),
             "profile_jsonl": str(unit_dir / "moe_profile.jsonl"),
             "trace_jsonl": str(unit_dir / "moe_trace.jsonl"),
+            "router_parity_artifact": str(router_parity_path),
+            "router_parity_report": str(router_parity_report),
         }
     finally:
         if manager is not None and managed_env is not None:

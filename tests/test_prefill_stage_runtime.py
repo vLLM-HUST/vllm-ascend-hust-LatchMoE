@@ -177,6 +177,60 @@ def test_memory_ledger_is_cached_and_invalidated_on_structural_changes():
     assert after_release.original_expert_weight_bytes == 0
 
 
+def test_memory_ledger_separates_resident_shared_weights_from_shared_gate():
+    class SharedExpert(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones((2, 3), dtype=torch.float32))
+            self.expert_gate = torch.nn.Linear(3, 1, bias=False)
+
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    shared = SharedExpert()
+    runtime.register_resident_shared_weights(
+        layer_id=3,
+        shared_experts=shared,
+        shared_gate=shared.expert_gate,
+    )
+
+    ledger = runtime.memory_ledger()
+    assert ledger.resident_shared_weight_bytes == shared.weight.numel() * shared.weight.element_size()
+    assert ledger.shared_gate_weight_bytes == (
+        shared.expert_gate.weight.numel() * shared.expert_gate.weight.element_size()
+    )
+    assert ledger.host_experts == 0
+    assert ledger.slot_bank_bytes == 0
+
+    runtime.register_resident_shared_weights(
+        layer_id=3,
+        shared_experts=shared,
+        shared_gate=shared.expert_gate,
+    )
+    assert runtime.memory_ledger().total_managed_bytes == ledger.total_managed_bytes
+
+
+def test_memory_ledger_unwraps_vllm_shared_experts_adapter():
+    class SharedExpert(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones((2, 3), dtype=torch.float32))
+
+    class SharedExpertsAdapter:
+        def __init__(self, layer) -> None:
+            self._layer = layer
+
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    shared = SharedExpert()
+    runtime.register_resident_shared_weights(
+        layer_id=4,
+        shared_experts=SharedExpertsAdapter(shared),
+        shared_gate=None,
+    )
+
+    assert runtime.memory_ledger().resident_shared_weight_bytes == (
+        shared.weight.numel() * shared.weight.element_size()
+    )
+
+
 def test_memory_ledger_counts_prefill_stage_banks_and_mapping_buffers():
     runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
     layer = TinyLayer()

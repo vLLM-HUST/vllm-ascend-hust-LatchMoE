@@ -74,6 +74,8 @@ class MoeOffloadMemoryLedger:
     full_layer_prefill_bank_count: int = 0
     full_layer_prefill_bank_bytes: int = 0
     full_layer_prefill_mapping_bytes: int = 0
+    resident_shared_weight_bytes: int = 0
+    shared_gate_weight_bytes: int = 0
 
     @property
     def original_expert_weights_retained(self) -> bool:
@@ -89,6 +91,8 @@ class MoeOffloadMemoryLedger:
             + self.prefill_stage_mapping_bytes
             + self.full_layer_prefill_bank_bytes
             + self.full_layer_prefill_mapping_bytes
+            + self.resident_shared_weight_bytes
+            + self.shared_gate_weight_bytes
         )
 
     @property
@@ -120,6 +124,8 @@ class MoeOffloadMemoryLedger:
             "full_layer_prefill_mapping_bytes": int(
                 self.full_layer_prefill_mapping_bytes
             ),
+            "resident_shared_weight_bytes": int(self.resident_shared_weight_bytes),
+            "shared_gate_weight_bytes": int(self.shared_gate_weight_bytes),
             "total_npu_slot_bytes": int(self.total_npu_slot_bytes),
             "original_expert_weights_retained": self.original_expert_weights_retained,
             "total_managed_bytes": int(self.total_managed_bytes),
@@ -255,6 +261,8 @@ class MoeOffloadRuntime:
         self._original_expert_weight_bytes_by_layer: dict[int, int] = {}
         self._expert_weight_bytes_by_layer: dict[int, int] = {}
         self._slot_expert_weight_bytes_by_layer: dict[int, int] = {}
+        self._resident_shared_weight_bytes_by_layer: dict[int, int] = {}
+        self._shared_gate_weight_bytes_by_layer: dict[int, int] = {}
         self._released_original_weight_layers: set[int] = set()
         # Option-2 (graph-compatible offload): persistent per-layer log2phy buffer.
         # Fixed address, allocated once at register time, updated in-place by the
@@ -606,6 +614,34 @@ class MoeOffloadRuntime:
                 "host_store": host_store_report.to_jsonable(),
             },
         )
+
+    def register_resident_shared_weights(
+        self,
+        *,
+        layer_id: int,
+        shared_experts: object | None,
+        shared_gate: object | None,
+    ) -> None:
+        """Account for resident shared weights without touching routed slots.
+
+        Shared modules remain owned by native vLLM.  This method only records
+        their physical HBM cost and explicitly keeps them out of the host store,
+        slot bank, victim selection, and multi-wave capacity calculations.
+        """
+
+        normalized_layer_id = int(layer_id)
+        if normalized_layer_id < 0 or shared_experts is None:
+            return
+        shared_params = _module_parameter_bytes(shared_experts)
+        gate_params = _module_parameter_bytes(shared_gate)
+        gate_ids = set(gate_params)
+        shared_bytes = sum(
+            size for identity, size in shared_params.items() if identity not in gate_ids
+        )
+        gate_bytes = sum(size for size in gate_params.values())
+        self._resident_shared_weight_bytes_by_layer[normalized_layer_id] = shared_bytes
+        self._shared_gate_weight_bytes_by_layer[normalized_layer_id] = gate_bytes
+        self._invalidate_memory_ledger_cache()
 
     def is_layer_registered(self, layer_id: int) -> bool:
         return int(layer_id) in self._slot_banks
@@ -962,10 +998,10 @@ class MoeOffloadRuntime:
             yield
         finally:
             if depth == 0:
-                try:
-                    del state.suspend_depth
-                except AttributeError:
-                    pass
+                # Keep the thread-local field materialized.  ``del`` on this
+                # object is not supported when the context manager is inlined
+                # by torch.compile during the native boundary comparison.
+                state.suspend_depth = 0
             else:
                 state.suspend_depth = depth
 
@@ -1093,6 +1129,12 @@ class MoeOffloadRuntime:
             full_layer_prefill_mapping_bytes=sum(
                 _tensor_nbytes(buffer)
                 for buffer in unique_full_layer_mappings.values()
+            ),
+            resident_shared_weight_bytes=sum(
+                self._resident_shared_weight_bytes_by_layer.values()
+            ),
+            shared_gate_weight_bytes=sum(
+                self._shared_gate_weight_bytes_by_layer.values()
             ),
         )
         self._memory_ledger_cache = ledger
@@ -2684,6 +2726,31 @@ class MoeOffloadRuntime:
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _module_parameter_bytes(module: object | None) -> dict[int, int]:
+    if module is None:
+        return {}
+    # vLLM 0.21 wraps external shared experts in ``runner.SharedExperts``;
+    # that adapter intentionally exposes no ``parameters()`` method and keeps
+    # the materialized module in ``_layer``.
+    wrapped_module = getattr(module, "_layer", None)
+    if wrapped_module is not None:
+        module = wrapped_module
+    parameters = getattr(module, "parameters", None)
+    if not callable(parameters):
+        return {}
+    try:
+        values = parameters()
+    except Exception:
+        return {}
+    result: dict[int, int] = {}
+    for parameter in values:
+        try:
+            result[id(parameter)] = _tensor_nbytes(parameter)
+        except (AttributeError, TypeError):
+            continue
+    return result
 
 
 def _to_bool_env(name: str, default: str = "0") -> bool:
