@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -207,3 +208,58 @@ def test_runner_preserves_preflight_failure_before_service_start() -> None:
     source = runner_path.read_text(encoding="utf-8")
 
     assert 'release_status not in {"released", "not-started"}' in source
+
+
+def test_capability_identity_binds_checkpoint_and_registry_row(tmp_path: Path) -> None:
+    module = _load_run_suite()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    config_path = checkpoint / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "hidden_size": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "id": "fixture-routed",
+                        "checkpoint_path": str(checkpoint),
+                        "config_sha256": config_sha,
+                        "checkpoint_index_sha256": "index-digest",
+                        "qualification_status": "not_run",
+                        "capability_config": {"shared_mode": "none"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    identity = module._capability_identity(
+        {"model": {"path": str(checkpoint)}},
+        _args(capability_registry=str(registry_path)),
+    )
+
+    assert identity["registry_status"] == "matched"
+    assert identity["registry_model_id"] == "fixture-routed"
+    assert identity["descriptor_status"] == "recorded"
+    assert len(identity["descriptor_sha256"]) == 64
+
+
+def test_router_parity_env_is_opt_in_and_has_an_artifact_path(tmp_path: Path) -> None:
+    env = _load_run_suite()._unit_env({}, tmp_path, router_parity=True)
+
+    assert env["VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER"] == "1"
+    assert env["VLLM_ASCEND_MOE_ROUTER_PARITY_PATH"] == str(
+        tmp_path / "moe_router_parity.jsonl"
+    )

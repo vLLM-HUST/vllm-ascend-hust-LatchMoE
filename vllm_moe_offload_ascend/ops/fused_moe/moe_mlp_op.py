@@ -34,9 +34,10 @@ the side-effect-only ``vllm::moe_offload_stage`` splitting op. Taking it as an
 explicit input keeps the ordering dependency real so torch.compile cannot
 dead-code-eliminate or reorder the staging op.
 
-First-version constraint: only the ``_shared_experts is None`` path (returns a
-single tensor). Shared-expert layers fall back to monolithic moe_forward (guarded
-in _select_forward).
+The routed-only and shared-expert paths deliberately use different custom-op
+schemas.  ``moe_mlp`` always returns a tensor, while ``moe_mlp_shared`` always
+returns ``(shared_out, routed_out)``.  A graph cannot safely specialize one op
+whose return type changes with the layer.
 
 Current integration: registered as the captured MLP piece of the SEW dataplane
 and wired through the B1 injection registry. Unsupported shared-expert forms
@@ -148,10 +149,99 @@ def _moe_mlp_fake(
     return torch.empty_like(hidden_states)
 
 
+def _moe_mlp_shared_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: str,
+    hidden_dim_unpadded: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run an external resident shared expert and routed MLP as a fixed tuple.
+
+    The native runner remains responsible for shared reduction, routed scaling,
+    output transforms, and final addition.  This op only moves the precomputed
+    routed top-k across the graph seam and preserves the upstream tuple ABI.
+    """
+
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+        get_layer_from_name,
+    )
+
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
+
+    layer = get_layer_from_name(layer_name)
+    layer_id = int(getattr(layer, "layer_id", -1))
+    if layer_id < 0:
+        raise RuntimeError(
+            "moe_mlp_shared requires a stable non-negative layer_id; "
+            f"layer={layer_name!r}"
+        )
+    moe_seam_inject.set_injected_topk(layer_id, topk_weights, topk_ids)
+    try:
+        result = layer.runner._forward_impl(
+            layer,
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+        )
+    finally:
+        moe_seam_inject.clear_injected_topk(layer_id)
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            "moe_mlp_shared expected the native shared-expert tuple ABI "
+            "(shared_out, routed_out)"
+        )
+    shared_out, routed_out = result
+    if not isinstance(shared_out, torch.Tensor) or not isinstance(routed_out, torch.Tensor):
+        raise RuntimeError("moe_mlp_shared native tuple contains a non-tensor output")
+    return shared_out, routed_out
+
+
+def _moe_mlp_shared_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: str,
+    hidden_dim_unpadded: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    routed_out = _moe_mlp_fake(
+        hidden_states,
+        router_logits,
+        topk_weights,
+        topk_ids,
+        shared_experts_input,
+        input_ids,
+        layer_name,
+        hidden_dim_unpadded,
+    )
+    shared_out = (
+        torch.empty_like(shared_experts_input)
+        if shared_experts_input is not None
+        else torch.empty_like(hidden_states)
+    )
+    return shared_out, routed_out
+
+
 direct_register_custom_op(
     op_name="moe_mlp",
     op_func=_moe_mlp_impl,
     fake_impl=_moe_mlp_fake,
+    mutates_args=["hidden_states"],
+    dispatch_key="PrivateUse1",
+)
+
+
+direct_register_custom_op(
+    op_name="moe_mlp_shared",
+    op_func=_moe_mlp_shared_impl,
+    fake_impl=_moe_mlp_shared_fake,
     mutates_args=["hidden_states"],
     dispatch_key="PrivateUse1",
 )

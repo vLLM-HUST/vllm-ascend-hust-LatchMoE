@@ -1122,9 +1122,11 @@ def test_seam_forward_prefill_resident_uses_native_fused_moe(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("compile_tracing", [False, True])
 def test_seam_forward_compares_native_layer_boundary_without_changing_result(
     monkeypatch,
     capsys,
+    compile_tracing,
 ):
     import torch
 
@@ -1161,6 +1163,11 @@ def test_seam_forward_compares_native_layer_boundary_without_changing_result(
         "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_LAYER_BOUNDARY",
         "1",
     )
+    monkeypatch.setattr(
+        patch_fused_moe,
+        "_is_torch_compile_tracing",
+        lambda: compile_tracing,
+    )
 
     runner = FakeRunner()
     runner._seam_active = True
@@ -1183,7 +1190,10 @@ def test_seam_forward_compares_native_layer_boundary_without_changing_result(
 
     hidden_states = torch.zeros((4, 16), dtype=torch.float32)
     router_logits = torch.zeros((4, 128), dtype=torch.float32)
-    native_out = torch.ones_like(hidden_states)
+    native_out = (
+        torch.zeros_like(hidden_states),
+        torch.ones_like(hidden_states),
+    )
     offload_out = torch.full_like(hidden_states, 3.0)
     calls = []
     native_inputs = []
@@ -1278,9 +1288,12 @@ def test_seam_forward_compares_native_layer_boundary_without_changing_result(
         ("mlp", True),
     ]
     output = capsys.readouterr().out
-    assert "SEW_LAYER_BOUNDARY_COMPARE layer=3 tokens=4" in output
-    assert "output_equal=False" in output
-    assert "output_max_abs=2.0" in output
+    if compile_tracing:
+        assert "SEW_LAYER_BOUNDARY_COMPARE" not in output
+    else:
+        assert "SEW_LAYER_BOUNDARY_COMPARE layer=3 tokens=4" in output
+        assert "output_equal=False" in output
+        assert "output_max_abs=2.0" in output
     assert runtime.should_use_fixed_slot_plan_for_layer(3) is True
 
 
@@ -1831,6 +1844,28 @@ def test_moe_mlp_fake_honors_unpadded_output_width():
     assert out.dtype == hidden.dtype
 
 
+def test_moe_mlp_shared_fake_has_fixed_tuple_abi_and_unpadded_routed_width():
+    import torch
+    from vllm_moe_offload_ascend.ops.fused_moe.moe_mlp_op import _moe_mlp_shared_fake
+
+    hidden = torch.empty((4, 16), dtype=torch.bfloat16)
+    shared_input = torch.empty((4, 12), dtype=torch.bfloat16)
+    shared_out, routed_out = _moe_mlp_shared_fake(
+        hidden,
+        torch.empty((4, 64)),
+        torch.empty((4, 2)),
+        torch.empty((4, 2), dtype=torch.int32),
+        shared_input,
+        None,
+        "model.layers.3.mlp.experts",
+        12,
+    )
+
+    assert shared_out.shape == shared_input.shape
+    assert routed_out.shape == (4, 12)
+    assert shared_out.dtype == routed_out.dtype == hidden.dtype
+
+
 def test_moe_router_fake_returns_hidden_states_dtype_not_logits_dtype():
     """M4: the router fake op must proxy topk_weights as hidden_states.dtype
     (matching the real _native_select_experts cast), not router_logits.dtype.
@@ -1861,6 +1896,60 @@ def test_moe_router_fake_returns_hidden_states_dtype_not_logits_dtype():
     assert topk_ids.dtype == torch.int32
     assert topk_weights.shape == (4, 2)
     assert topk_ids.shape == (4, 2)
+
+
+def test_moe_router_indirect_uses_ascend_original_routed_scaling_factor(monkeypatch):
+    """The seam must match AscendFusedMoE.apply after vLLM rewrites the layer field."""
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_router_op
+
+    layer = SimpleNamespace(
+        layer_id=7,
+        runner=None,
+        top_k=2,
+        use_grouped_topk=True,
+        renormalize=True,
+        topk_group=2,
+        num_expert_group=8,
+        scoring_func="sigmoid",
+        routed_scaling_factor=1.0,
+        _original_routed_scaling_factor=1.8,
+        e_score_correction_bias=torch.zeros(64),
+        custom_routing_function=None,
+        n_shared_experts=0,
+        global_redundant_expert_num=0,
+        moe_config=SimpleNamespace(num_experts=64),
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.runner.moe_runner.get_layer_from_name",
+        lambda _name: layer,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.quantization.methods.base.get_moe_num_logical_experts",
+        lambda *_args, **_kwargs: 64,
+    )
+
+    def fake_select_experts(**kwargs):
+        calls.append(kwargs)
+        return torch.ones((4, 2), dtype=torch.bfloat16), torch.zeros(
+            (4, 2), dtype=torch.int32
+        )
+
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.experts_selector.select_experts",
+        fake_select_experts,
+    )
+
+    moe_router_op._moe_router_indirect_impl(
+        torch.zeros((4, 16), dtype=torch.bfloat16),
+        torch.zeros((4, 64), dtype=torch.float32),
+        "fixture.layer.experts",
+    )
+
+    assert calls[0]["routed_scaling_factor"] == 1.8
 
 
 # ---------------------------------------------------------------------------
@@ -1938,6 +2027,138 @@ def test_seam_guard_returns_false_when_layer_has_no_layer_id(monkeypatch):
         "seam guard must return False for layers without layer_id to avoid "
         "cross-layer collision on key=-1"
     )
+
+
+def test_seam_guard_resolves_external_gated_internal_corrected_router(monkeypatch):
+    """The per-layer guard must select the tuple seam from capabilities alone."""
+    import torch
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
+
+    class FakeRunner:
+        _ascend_moe_offload_seam_patch = False
+
+        def _select_forward(self):
+            raise AssertionError("should not be called")
+
+    class SharedExperts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones((2, 2)))
+            self.expert_gate = torch.nn.Linear(2, 1, bias=False)
+
+    registrations = []
+    runtime = SimpleNamespace(
+        register_resident_shared_weights=lambda **kwargs: registrations.append(kwargs)
+    )
+    monkeypatch.setattr(runtime_mod, "get_moe_offload_runtime", lambda: runtime)
+    patch_fused_moe._patch_ascend_moe_runner(
+        SimpleNamespace(AscendMoERunner=FakeRunner)
+    )
+    layer = SimpleNamespace(
+        layer_id=11,
+        moe_config=SimpleNamespace(
+            num_experts=64, dp_size=1, ep_size=1, tp_size=1, pcp_size=1
+        ),
+        n_shared_experts=1,
+        mix_placement=False,
+        top_k=4,
+        use_grouped_topk=True,
+        topk_group=2,
+        num_expert_group=8,
+        renormalize=True,
+        scoring_func="sigmoid",
+        e_score_correction_bias=torch.zeros(64),
+        routed_scaling_factor=1.8,
+        custom_routing_function=None,
+        is_internal_router=True,
+        enable_npugraph_ex_static_kernel=False,
+        zero_expert_num=0,
+        zero_expert_type=None,
+    )
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
+    monkeypatch.setattr(mr, "get_layer_from_name", lambda _name: layer)
+    runner = FakeRunner()
+    runner.layer_name = "fixture.layer.experts"
+    runner._shared_experts = SharedExperts()
+    runner.shared_expert_gate = runner._shared_experts.expert_gate
+    runner.gate = object()
+
+    assert runner._resolve_seam_per_layer_guards() is True
+    assert runner._seam_capability.output_contract == "shared_routed_tuple"
+    assert runner._seam_capability.router_owner == "internal_gate"
+    assert runner._seam_capability.selection.correction_bias is True
+    assert runner._seam_num_logical_experts == 64
+    assert registrations == [
+        {
+            "layer_id": 11,
+            "shared_experts": runner._shared_experts,
+            "shared_gate": runner.shared_expert_gate,
+        }
+    ]
+
+
+def test_compile_tracing_probe_is_module_scoped_for_dynamo_capture():
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    assert callable(patch_fused_moe._is_torch_compile_tracing)
+    assert "_is_torch_compile_tracing" not in {
+        name for name in patch_fused_moe._patch_ascend_moe_runner.__code__.co_varnames
+    }
+
+
+def test_router_compare_skips_data_dependent_ops_during_tracing(monkeypatch):
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    hidden_states = torch.zeros((2, 4), dtype=torch.float32)
+    router_logits = torch.zeros((2, 8), dtype=torch.float32)
+    native_weights = torch.ones((2, 2), dtype=torch.float32)
+    native_ids = torch.zeros((2, 2), dtype=torch.int32)
+
+    class FakeMethod:
+        def process_weights_after_loading(self, layer):
+            return None
+
+        def apply(self, layer):
+            return fake_fused.select_experts(
+                hidden_states,
+                router_logits,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                num_experts=8,
+            )
+
+    def native_select(*args, **kwargs):
+        return native_weights, native_ids
+
+    fake_fused = SimpleNamespace(
+        AscendUnquantizedFusedMoEMethod=FakeMethod,
+        select_experts=native_select,
+    )
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER", "1")
+    monkeypatch.setenv(
+        "VLLM_ASCEND_MOE_ROUTER_PARITY_PATH",
+        "/tmp/should-not-be-created-router-parity.jsonl",
+    )
+    monkeypatch.setattr(
+        moe_seam_inject,
+        "peek_injected_topk",
+        lambda _layer_id: (native_weights, native_ids),
+    )
+    monkeypatch.setattr(patch_fused_moe, "_is_torch_compile_tracing", lambda: True)
+    monkeypatch.setattr(
+        torch,
+        "count_nonzero",
+        lambda *args, **kwargs: pytest.fail("router compare ran during tracing"),
+    )
+
+    patch_fused_moe._patch_unquantized_moe_method(fake_fused)
+    FakeMethod().apply(SimpleNamespace(layer_id=3))
+
 
 def test_graph_tools_default_to_graph_mode_and_reject_forced_eager(monkeypatch):
     from benchmark.scripts import run_fixed_slot_smoke as benchmark_smoke

@@ -101,6 +101,48 @@ without the repeated raw bundle required for a main claim.
 
 ---
 
+## Capability Status
+
+LatchMoE selects its graph seam from a serialized, model-name-independent
+capability descriptor. The descriptor fixes the output ABI, shared-expert
+representation, router ownership and selection semantics, weight lifecycle,
+parallel mode, and overlap mode. Unknown combinations fail closed before a
+native/eager fallback can be presented as an enabled LatchMoE run.
+
+| Capability tuple | Status | Evidence boundary |
+|---|---|---|
+| Routed-only, BF16, builtin router, single NPU | NPU-qualified | Qwen3-30B-A3B Issue #7 graph bundle |
+| External resident shared expert, fixed tuple ABI, builtin external/internal router, BF16, single NPU | Implemented | Host ABI/lifecycle/router tests; no NPU qualification claim yet |
+| Gated external shared expert with grouped/sigmoid/correction/routed-scale semantics | Implemented | Host guard and router-parity artifact tests; no NPU qualification claim yet |
+| Fused or mix-placement shared experts | Unsupported | Reserved for Issue #25 after a backend-qualified fixed shared lane |
+| Shared compute/H2D/MLP overlap | Unsupported | Reserved for Issue #26; current shared path is correctness-first no-overlap |
+| Quantized weights or multi-NPU execution | Unsupported | Rejected by the capability guard |
+
+`implemented` means the model-generic seam and host tests exist. It does not
+mean a checkpoint has completed native oracle, PIECEWISE capture/replay,
+overflow/decode, or token-exactness gates. The checked-in
+[`benchmark/registry/model_registry_v2.json`](benchmark/registry/model_registry_v2.json)
+and
+[`benchmark/registry/qualification_matrix_v2.json`](benchmark/registry/qualification_matrix_v2.json)
+preserve this distinction. Each benchmark unit records the checkpoint-derived
+descriptor digest and matching registry row; the materialized runner remains
+the authoritative capability check because config files alone cannot always
+identify router ownership.
+
+Regenerate the Phase-A inventory with the locked environment:
+
+```bash
+/root/.cache/latchmoe-npu5-v021/venv/bin/python benchmark/scripts/model_registry_v2.py \
+  --native-model-class-preflight \
+  --model qwen3-30b-a3b=/root/data/shared_models/strict-models/Qwen3-30B-A3B \
+  --model glm-4.7-flash=/root/data/shared_models/strict-models/GLM-4.7-Flash \
+  --model qwen3-next-80b-a3b-instruct=/root/data/shared_models/strict-models/Qwen3-Next-80B-A3B-Instruct \
+  --output benchmark/registry/model_registry_v2.json \
+  --matrix-output benchmark/registry/qualification_matrix_v2.json
+```
+
+---
+
 ## Architecture
 
 LatchMoE is organized into four layers:

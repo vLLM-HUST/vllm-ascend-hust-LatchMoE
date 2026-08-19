@@ -44,7 +44,9 @@ def test_registered_values_are_typed(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_GB", "14.5")
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS", "32")
     monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_ENABLED", "true")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_ROUTER_PARITY_MAX_TOKENS", "32")
 
     assert ENVIRONMENT_VARIABLES["VLLM_ASCEND_MOE_OFFLOAD_GB"]() == 14.5
     assert ENVIRONMENT_VARIABLES["VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS"]() == 32
     assert ENVIRONMENT_VARIABLES["VLLM_ASCEND_MOE_OFFLOAD_ENABLED"]() is True
+    assert ENVIRONMENT_VARIABLES["VLLM_ASCEND_MOE_ROUTER_PARITY_MAX_TOKENS"]() == 32
