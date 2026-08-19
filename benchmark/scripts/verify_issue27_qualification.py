@@ -249,11 +249,100 @@ def _overflow_gate(unit_dir: Path) -> tuple[bool, dict[str, Any]]:
     return bool(events) and not failures, {"events": len(events), "failures": failures}
 
 
+def _fused_shared_lane_gate(
+    unit_dir: Path,
+    *,
+    expected_routed_experts: int,
+    expected_shared_experts: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Verify that every fixed-slot MoE layer registered one pinned suffix."""
+
+    try:
+        records = _profile(unit_dir)
+    except ValueError as exc:
+        return False, {"reason": str(exc)}
+    expected_ids = list(
+        range(
+            int(expected_routed_experts),
+            int(expected_routed_experts) + int(expected_shared_experts),
+        )
+    )
+    registrations = [
+        record for record in records
+        if record.get("name") == "register_layer_for_fixed_slots"
+    ]
+    failures: list[dict[str, Any]] = []
+    for record in registrations:
+        payload = record.get("payload") or {}
+        actual = {
+            "routed_expert_count": int(payload.get("routed_expert_count") or 0),
+            "pinned_shared_expert_count": int(
+                payload.get("pinned_shared_expert_count") or 0
+            ),
+            "pinned_shared_logical_ids": list(
+                payload.get("pinned_shared_logical_ids") or []
+            ),
+        }
+        expected = {
+            "routed_expert_count": int(expected_routed_experts),
+            "pinned_shared_expert_count": int(expected_shared_experts),
+            "pinned_shared_logical_ids": expected_ids,
+        }
+        if actual != expected:
+            failures.append(
+                {
+                    "layer_id": record.get("layer_id"),
+                    "expected": expected,
+                    "actual": actual,
+                }
+            )
+    return bool(registrations) and not failures, {
+        "registrations": len(registrations),
+        "expected": {
+            "routed_expert_count": int(expected_routed_experts),
+            "pinned_shared_expert_count": int(expected_shared_experts),
+            "pinned_shared_logical_ids": expected_ids,
+        },
+        "failures": failures[:8],
+    }
+
+
+def _fused_shared_once_gate(unit_dir: Path) -> tuple[bool, dict[str, Any]]:
+    """Verify that B2 overflow executes each fused shared suffix once."""
+
+    try:
+        records = _profile(unit_dir)
+    except ValueError as exc:
+        return False, {"reason": str(exc)}
+    events = [
+        record for record in records
+        if record.get("name") == "fused_shared_b2_once"
+    ]
+    failures: list[dict[str, Any]] = []
+    for record in events:
+        payload = record.get("payload") or {}
+        if (
+            int(payload.get("shared_pair_execution_count") or 0) != 1
+            or int(payload.get("shared_pairs") or 0) <= 0
+            or int(payload.get("routed_pairs") or 0) <= 0
+        ):
+            failures.append(
+                {"layer_id": record.get("layer_id"), "payload": payload}
+            )
+    return bool(events) and not failures, {
+        "events": len(events),
+        "failures": failures[:8],
+    }
+
+
 def verify_bundle(
     bundle_dir: Path,
     *,
     model_id: str,
     shared_output_required: bool,
+    fused_shared_required: bool = False,
+    expected_routed_experts: int = 0,
+    expected_shared_experts: int = 0,
 ) -> dict[str, Any]:
     units = {
         "native-eager": bundle_dir / "native-eager",
@@ -379,6 +468,49 @@ def verify_bundle(
     details["prefill_overflow"] = overflow_detail
     gates["prefill_overflow"] = "passed" if overflow_ok and overflow_passed else "failed"
 
+    fused_failures: list[str] = []
+    if fused_shared_required:
+        required_config_units = {
+            "native-eager": native_flags,
+            "latch-eager": eager_flags,
+            "latch-graph": graph_flags,
+            "overflow-graph": overflow_flags,
+        }
+        config_failures = {
+            name: flags.get("ascend_additional_config")
+            for name, flags in required_config_units.items()
+            if (flags.get("ascend_additional_config") or {}).get("mix_placement")
+            is not True
+        }
+        details["fused_mix_placement_config"] = {
+            "passed": not config_failures,
+            "failures": config_failures,
+        }
+        if config_failures:
+            fused_failures.append("fused_mix_placement_config")
+
+        lane_units = {
+            "latch-eager": units["latch-eager"],
+            "latch-graph": units["latch-graph"],
+            "overflow-graph": units["overflow-graph"],
+        }
+        lane_details: dict[str, dict[str, Any]] = {}
+        for name, unit_dir in lane_units.items():
+            passed, detail = _fused_shared_lane_gate(
+                unit_dir,
+                expected_routed_experts=expected_routed_experts,
+                expected_shared_experts=expected_shared_experts,
+            )
+            lane_details[name] = {"passed": passed, **detail}
+        details["fused_shared_lane"] = lane_details
+        if not all(detail["passed"] for detail in lane_details.values()):
+            fused_failures.append("fused_shared_lane")
+
+        once_passed, once_detail = _fused_shared_once_gate(units["overflow-graph"])
+        details["fused_shared_once"] = once_detail
+        if not once_passed:
+            fused_failures.append("fused_shared_once")
+
     artifact_paths = [
         path
         for unit_dir in units.values()
@@ -391,6 +523,7 @@ def verify_bundle(
         if path.is_file()
     ]
     failures = [gate for gate, status in gates.items() if status != "passed"]
+    failures.extend(fused_failures)
     return {
         "schema_version": "latchmoe-issue27-qualification-v1",
         "model_id": model_id,
@@ -427,13 +560,26 @@ def main() -> int:
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--shared-output-required", action="store_true")
+    parser.add_argument("--fused-shared-required", action="store_true")
+    parser.add_argument("--expected-routed-experts", type=int, default=0)
+    parser.add_argument("--expected-shared-experts", type=int, default=0)
     parser.add_argument("--matrix", type=Path)
     args = parser.parse_args()
+    if args.fused_shared_required and (
+        args.expected_routed_experts <= 0 or args.expected_shared_experts <= 0
+    ):
+        parser.error(
+            "--fused-shared-required requires positive --expected-routed-experts "
+            "and --expected-shared-experts"
+        )
 
     report = verify_bundle(
         args.bundle_dir.resolve(),
         model_id=args.model_id,
         shared_output_required=bool(args.shared_output_required),
+        fused_shared_required=bool(args.fused_shared_required),
+        expected_routed_experts=int(args.expected_routed_experts),
+        expected_shared_experts=int(args.expected_shared_experts),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

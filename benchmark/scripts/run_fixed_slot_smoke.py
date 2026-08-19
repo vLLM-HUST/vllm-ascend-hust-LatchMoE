@@ -569,6 +569,9 @@ def run_smoke(
                     getattr(args, "layer_boundary_parity", False)
                 ),
                 "wave_prefill": bool(getattr(args, "wave_prefill", False)),
+                "ascend_additional_config": llm_kwargs.get(
+                    "additional_config", {}
+                ),
             },
         }
     )

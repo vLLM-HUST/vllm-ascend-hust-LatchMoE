@@ -101,6 +101,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-cache-memory-mb", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.96)
     parser.add_argument(
+        "--ascend-additional-config-json",
+        default="{}",
+        help=(
+            "JSON object passed to every smoke unit as vLLM-Ascend "
+            "additional_config, for example '{\"mix_placement\": true}'."
+        ),
+    )
+    parser.add_argument(
         "--prompt",
         default="Hi",
     )
@@ -113,7 +121,19 @@ def _parse_args() -> argparse.Namespace:
             + "The routed expert workload must remain deterministic. " * 24
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.ascend_additional_config = json.loads(
+            args.ascend_additional_config_json
+        )
+    except json.JSONDecodeError as exc:
+        parser.error(
+            "--ascend-additional-config-json is not valid JSON: "
+            f"{exc.msg}"
+        )
+    if not isinstance(args.ascend_additional_config, dict):
+        parser.error("--ascend-additional-config-json must decode to a JSON object")
+    return args
 
 
 def _base_command(args: argparse.Namespace, unit_dir: Path, *, mode: str, prompt: str, output_tokens: int, slots: int) -> list[str]:
@@ -142,6 +162,8 @@ def _base_command(args: argparse.Namespace, unit_dir: Path, *, mode: str, prompt
         str(int(slots)),
         "--ignore-eos",
         "--disable-ascend-norm-quant-fusion",
+        "--ascend-additional-config-json",
+        json.dumps(args.ascend_additional_config, sort_keys=True),
     ]
     return command
 
@@ -211,6 +233,7 @@ def _run_unit(
                     "router_parity": router_parity,
                     "layer_boundary_parity": layer_boundary_parity,
                     "wave_prefill": wave_prefill,
+                    "ascend_additional_config": args.ascend_additional_config,
                 },
                 "environment": {
                     key: env.get(key)
