@@ -341,6 +341,15 @@ class MoeOffloadRuntime:
         layer_id: int,
         topk_ids: torch.Tensor,
     ) -> tuple[object, ...]:
+        # Inference tensors intentionally do not expose a version counter. The
+        # route-stats entry is consumed at most once and still includes the
+        # tensor's address and full layout, so version=0 is sufficient for this
+        # same-forward handoff while preserving mutation detection for ordinary
+        # tensors.
+        try:
+            tensor_version = int(topk_ids._version)
+        except RuntimeError:
+            tensor_version = 0
         return (
             int(layer_id),
             str(topk_ids.device),
@@ -350,7 +359,7 @@ class MoeOffloadRuntime:
             int(topk_ids.storage_offset()),
             int(topk_ids.numel()),
             int(topk_ids.data_ptr()),
-            int(getattr(topk_ids, "_version", 0)),
+            tensor_version,
         )
 
     def cache_prefill_route_stats(

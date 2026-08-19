@@ -1820,6 +1820,26 @@ def test_prefill_route_stats_cache_consumes_matching_topk_once():
     ) is None
 
 
+def test_prefill_route_stats_cache_accepts_inference_tensor_without_version():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+
+    with torch.inference_mode():
+        topk_ids = torch.tensor([[1, 2], [2, 3]], dtype=torch.int32)
+        with pytest.raises(RuntimeError, match="do not track version counter"):
+            _ = topk_ids._version
+
+        runtime.cache_prefill_route_stats(
+            layer_id=7,
+            topk_ids=topk_ids,
+            token_counts_by_expert={1: 1, 2: 2, 3: 1},
+        )
+
+        assert runtime.consume_prefill_route_stats(
+            layer_id=7,
+            topk_ids=topk_ids,
+        ) == {1: 1, 2: 2, 3: 1}
+
+
 def test_prefill_route_stats_cache_rejects_different_storage_same_layout():
     runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
     topk_ids = torch.tensor([[1, 2], [2, 3]], dtype=torch.int32)
