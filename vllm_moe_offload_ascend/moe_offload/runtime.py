@@ -74,6 +74,10 @@ class MoeOffloadMemoryLedger:
     full_layer_prefill_bank_count: int = 0
     full_layer_prefill_bank_bytes: int = 0
     full_layer_prefill_mapping_bytes: int = 0
+    # Fused/mix-placement shared rows live in a stable suffix of the physical
+    # slot tensors. They are resident HBM, but are deliberately not part of the
+    # dynamic routed-slot capacity or cache accounting.
+    pinned_shared_lane_bytes: int = 0
     resident_shared_weight_bytes: int = 0
     shared_gate_weight_bytes: int = 0
 
@@ -91,6 +95,7 @@ class MoeOffloadMemoryLedger:
             + self.prefill_stage_mapping_bytes
             + self.full_layer_prefill_bank_bytes
             + self.full_layer_prefill_mapping_bytes
+            + self.pinned_shared_lane_bytes
             + self.resident_shared_weight_bytes
             + self.shared_gate_weight_bytes
         )
@@ -99,6 +104,7 @@ class MoeOffloadMemoryLedger:
     def total_npu_slot_bytes(self) -> int:
         return (
             self.slot_bank_bytes
+            + self.pinned_shared_lane_bytes
             + self.prefill_stage_bank_bytes
             + self.prefill_stage_mapping_bytes
             + self.full_layer_prefill_bank_bytes
@@ -124,6 +130,7 @@ class MoeOffloadMemoryLedger:
             "full_layer_prefill_mapping_bytes": int(
                 self.full_layer_prefill_mapping_bytes
             ),
+            "pinned_shared_lane_bytes": int(self.pinned_shared_lane_bytes),
             "resident_shared_weight_bytes": int(self.resident_shared_weight_bytes),
             "shared_gate_weight_bytes": int(self.shared_gate_weight_bytes),
             "total_npu_slot_bytes": int(self.total_npu_slot_bytes),
@@ -219,6 +226,24 @@ class SlotAddressFingerprint:
     dtype: str
 
 
+@dataclass(frozen=True)
+class FusedSharedLaneLayout:
+    """Logical/physical contract for a fused mix-placement MoE layer.
+
+    The backend emits routed IDs in ``[0, routed_expert_count)`` and appends
+    always-active shared IDs as a suffix. Dynamic slots own only the former;
+    the latter are fixed rows after the dynamic bank.
+    """
+
+    routed_expert_count: int
+    shared_expert_count: int
+    pinned_logical_ids: tuple[int, ...]
+
+    @property
+    def total_logical_expert_count(self) -> int:
+        return int(self.routed_expert_count + self.shared_expert_count)
+
+
 def _slot_address_fingerprint_payload(
     fingerprint: SlotAddressFingerprint,
 ) -> dict[str, object]:
@@ -242,6 +267,7 @@ class MoeOffloadRuntime:
         self._pending_trace_step_by_layer: dict[int, int] = {}
         self._host_store = HostExpertStore()
         self._slot_banks: dict[int, ExpertSlotBank] = {}
+        self._fused_shared_lane_layouts: dict[int, FusedSharedLaneLayout] = {}
         # Physical B2 stage buffers are layout-scoped, not layer-scoped. Layers
         # execute serially through the MoE splitting seam, so equal-layout
         # layers can safely lease the same double buffer when H2D waits for the
@@ -579,13 +605,32 @@ class MoeOffloadRuntime:
 
         start = perf_counter()
         cpu_first_layer = is_cpu_first_layer(layer)
+        w13_weight = getattr(layer, "w13_weight")
+        w2_weight = getattr(layer, "w2_weight")
+        if int(w13_weight.shape[0]) != int(w2_weight.shape[0]):
+            raise ValueError("w13_weight and w2_weight must have the same number of experts")
+        total_logical_experts = int(w13_weight.shape[0])
+        shared_expert_count = _fused_shared_expert_count(layer)
+        if shared_expert_count > total_logical_experts:
+            raise ValueError(
+                "fused shared expert count exceeds materialized expert rows: "
+                f"shared={shared_expert_count}, total={total_logical_experts}"
+            )
+        routed_expert_count = total_logical_experts - shared_expert_count
+        if routed_expert_count <= 0:
+            raise ValueError(
+                "fused mix-placement requires at least one routed expert; "
+                f"total={total_logical_experts}, shared={shared_expert_count}"
+            )
+        pinned_logical_ids = tuple(
+            range(routed_expert_count, total_logical_experts)
+        )
         host_store_report = self._host_store.register_layer(
             layer,
             pin_memory=self.config.should_pin_host_memory,
             clone_tensors=not cpu_first_layer,
+            routed_expert_count=routed_expert_count,
         )
-        w13_weight = getattr(layer, "w13_weight")
-        w2_weight = getattr(layer, "w2_weight")
         self._original_expert_weight_bytes_by_layer[layer_id] = _tensor_nbytes(w13_weight) + _tensor_nbytes(w2_weight)
         self._expert_weight_bytes_by_layer[layer_id] = (
             _tensor_nbytes(w13_weight[0]) + _tensor_nbytes(w2_weight[0])
@@ -597,7 +642,20 @@ class MoeOffloadRuntime:
             tuple(int(dim) for dim in w2_weight.shape[1:]),
             dtype=w13_weight.dtype,
             device=device,
+            pinned_logical_ids=pinned_logical_ids,
         )
+        if pinned_logical_ids:
+            self._slot_banks[layer_id].install_pinned_weights(
+                w13_weight[routed_expert_count:],
+                w2_weight[routed_expert_count:],
+            )
+            self._fused_shared_lane_layouts[layer_id] = FusedSharedLaneLayout(
+                routed_expert_count=routed_expert_count,
+                shared_expert_count=shared_expert_count,
+                pinned_logical_ids=pinned_logical_ids,
+            )
+        else:
+            self._fused_shared_lane_layouts.pop(layer_id, None)
         self._slot_expert_weight_bytes_by_layer[layer_id] = (
             _tensor_nbytes(self._slot_banks[layer_id].w13_slots[0])
             + _tensor_nbytes(self._slot_banks[layer_id].w2_slots[0])
@@ -605,13 +663,18 @@ class MoeOffloadRuntime:
         self._prefill_stage_banks.pop(layer_id, None)
         self._prefill_stage_log2phy_buffers.pop(layer_id, None)
         # Option-2: allocate the persistent log2phy buffer once, fixed address.
-        # Size = num_logical_experts (from the original weight's expert dim).
-        num_logical_experts = int(w13_weight.shape[0])
+        # The backend sees routed IDs plus the fused shared suffix. The stage
+        # planner only receives routed IDs, but the captured gather must be able
+        # to map both ranges through this one stable table.
+        num_logical_experts = total_logical_experts
         self._log2phy_buffers[layer_id] = torch.full(
             (num_logical_experts,),
             fill_value=-1,
             dtype=torch.int32,
             device=device,
+        )
+        self._slot_banks[layer_id].install_pinned_log2phy(
+            self._log2phy_buffers[layer_id]
         )
         self._log2phy_slot_by_expert[layer_id] = {}
         self._invalidate_memory_ledger_cache()
@@ -621,7 +684,57 @@ class MoeOffloadRuntime:
             start=start,
             payload={
                 "host_store": host_store_report.to_jsonable(),
+                "routed_expert_count": int(routed_expert_count),
+                "pinned_shared_expert_count": int(shared_expert_count),
+                "pinned_shared_logical_ids": [
+                    int(expert_id) for expert_id in pinned_logical_ids
+                ],
             },
+        )
+
+    def fused_shared_lane_layout(
+        self,
+        layer_id: int,
+    ) -> FusedSharedLaneLayout | None:
+        return self._fused_shared_lane_layouts.get(int(layer_id))
+
+    def routed_expert_count_for_layer(
+        self,
+        *,
+        layer_id: int,
+        fallback: int,
+    ) -> int:
+        layout = self.fused_shared_lane_layout(layer_id)
+        return (
+            int(layout.routed_expert_count)
+            if layout is not None
+            else int(fallback)
+        )
+
+    def total_logical_expert_count_for_layer(
+        self,
+        *,
+        layer_id: int,
+        fallback: int,
+    ) -> int:
+        layout = self.fused_shared_lane_layout(layer_id)
+        return (
+            int(layout.total_logical_expert_count)
+            if layout is not None
+            else int(fallback)
+        )
+
+    def is_static_residency_regime_for_layer(
+        self,
+        *,
+        layer_id: int,
+        fallback_routed_expert_count: int,
+    ) -> bool:
+        return self.is_static_residency_regime(
+            self.routed_expert_count_for_layer(
+                layer_id=layer_id,
+                fallback=fallback_routed_expert_count,
+            )
         )
 
     def register_resident_shared_weights(
@@ -1042,6 +1155,35 @@ class MoeOffloadRuntime:
         """
         return int(self.config.num_slots) >= int(num_logical_experts)
 
+    def _resolve_fused_shared_counts(
+        self,
+        *,
+        layer_id: int,
+        requested_logical_expert_count: int,
+    ) -> tuple[int, int]:
+        """Return ``(routed_count, total_backend_count)`` for one layer.
+
+        Existing callers describe the set that can be staged, i.e. routed IDs.
+        A fused shared layer additionally needs a mapping entry for its appended
+        shared suffix, so the physical backend count is larger. Accepting the
+        total count as well keeps internal reference paths explicit while still
+        rejecting a mismatched caller rather than silently staging the suffix.
+        """
+
+        requested = int(requested_logical_expert_count)
+        layout = self.fused_shared_lane_layout(layer_id)
+        if layout is None:
+            return requested, requested
+        routed = int(layout.routed_expert_count)
+        total = int(layout.total_logical_expert_count)
+        if requested not in {routed, total}:
+            raise RuntimeError(
+                "fused shared lane logical count mismatch: "
+                f"layer={int(layer_id)} requested={requested} "
+                f"routed={routed} total={total}"
+            )
+        return routed, total
+
     def should_use_b2_wave_prefill(
         self,
         *,
@@ -1122,7 +1264,9 @@ class MoeOffloadRuntime:
             host_experts=len(self._host_store),
             original_expert_weight_bytes=original_bytes,
             host_store_bytes=self._host_store.total_bytes,
-            slot_bank_bytes=sum(slot_bank.total_bytes for slot_bank in self._slot_banks.values()),
+            slot_bank_bytes=sum(
+                slot_bank.dynamic_bytes for slot_bank in self._slot_banks.values()
+            ),
             prefill_stage_bank_count=len(unique_stage_banks),
             prefill_stage_bank_bytes=sum(
                 bank.total_bytes for bank in unique_stage_banks.values()
@@ -1138,6 +1282,9 @@ class MoeOffloadRuntime:
             full_layer_prefill_mapping_bytes=sum(
                 _tensor_nbytes(buffer)
                 for buffer in unique_full_layer_mappings.values()
+            ),
+            pinned_shared_lane_bytes=sum(
+                slot_bank.pinned_bytes for slot_bank in self._slot_banks.values()
             ),
             resident_shared_weight_bytes=sum(
                 self._resident_shared_weight_bytes_by_layer.values()
@@ -1325,11 +1472,15 @@ class MoeOffloadRuntime:
             raise RuntimeError(
                 f"fixed-slot plan must not run on resident layer {layer_id}; use original NPU expert weights"
             )
+        routed_expert_count, total_logical_experts = self._resolve_fused_shared_counts(
+            layer_id=layer_id,
+            requested_logical_expert_count=num_logical_experts,
+        )
         unique_active_experts = _dedupe_preserve_order(active_experts)
         _validate_active_expert_ids(
             layer_id=layer_id,
             active_experts=unique_active_experts,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=routed_expert_count,
         )
         if len(unique_active_experts) > self.config.num_slots:
             raise RuntimeError(
@@ -1438,7 +1589,7 @@ class MoeOffloadRuntime:
         mapping = ExpertSlotMapping.from_slot_bank(
             layer_id=layer_id,
             active_experts=unique_active_experts,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=total_logical_experts,
             slot_bank=slot_bank,
             device=device,
         )
@@ -1506,21 +1657,25 @@ class MoeOffloadRuntime:
             raise RuntimeError(
                 f"fixed-slot plan must not run on resident layer {layer_id}; use original NPU expert weights"
             )
+        routed_expert_count, total_logical_experts = self._resolve_fused_shared_counts(
+            layer_id=layer_id,
+            requested_logical_expert_count=num_logical_experts,
+        )
         unique_active_experts = _dedupe_preserve_order(active_experts)
         _validate_active_expert_ids(
             layer_id=layer_id,
             active_experts=unique_active_experts,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=routed_expert_count,
         )
         if len(unique_active_experts) > self.config.num_slots:
             raise RuntimeError(
                 f"active expert working set size {len(unique_active_experts)} exceeds num_slots={self.config.num_slots}"
             )
 
-        if int(log2phy.numel()) != int(num_logical_experts):
+        if int(log2phy.numel()) != int(total_logical_experts):
             raise RuntimeError(
                 f"log2phy buffer for layer {layer_id} has size {int(log2phy.numel())}, "
-                f"expected {int(num_logical_experts)}"
+                f"expected {int(total_logical_experts)}"
             )
 
         slot_bank = self._slot_banks.get(layer_id)
@@ -1573,7 +1728,11 @@ class MoeOffloadRuntime:
         )
 
         active_slot_ids: list[int] = []
-        slot_to_expert: list[int | None] = [None] * len(slot_bank.slots)
+        slot_to_expert: list[int | None] = [None] * slot_bank.physical_expert_count
+        for logical_id in slot_bank.pinned_logical_ids:
+            pinned_slot = slot_bank.pinned_slot_for_logical_id(logical_id)
+            assert pinned_slot is not None
+            slot_to_expert[int(pinned_slot)] = int(logical_id)
         for expert_id in unique_active_experts:
             key = ExpertKey(layer_id, int(expert_id))
             slot = slot_bank.lookup(key)
@@ -1803,11 +1962,15 @@ class MoeOffloadRuntime:
             raise RuntimeError(
                 f"ready-slot plan must not run on resident layer {layer_id}; use original NPU expert weights"
             )
+        routed_expert_count, total_logical_experts = self._resolve_fused_shared_counts(
+            layer_id=layer_id,
+            requested_logical_expert_count=num_logical_experts,
+        )
         unique_active_experts = _dedupe_preserve_order(active_experts)
         _validate_active_expert_ids(
             layer_id=layer_id,
             active_experts=unique_active_experts,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=routed_expert_count,
         )
         if len(unique_active_experts) > self.config.num_slots:
             raise RuntimeError(
@@ -1824,7 +1987,11 @@ class MoeOffloadRuntime:
             else int(next(self._step_counter))
         )
         missing_experts: list[int] = []
-        slot_to_expert: list[int | None] = [None] * len(slot_bank.slots)
+        slot_to_expert: list[int | None] = [None] * slot_bank.physical_expert_count
+        for logical_id in slot_bank.pinned_logical_ids:
+            pinned_slot = slot_bank.pinned_slot_for_logical_id(logical_id)
+            assert pinned_slot is not None
+            slot_to_expert[int(pinned_slot)] = int(logical_id)
         active_slot_ids: list[int] = []
         for expert_id in unique_active_experts:
             key = ExpertKey(layer_id, int(expert_id))
@@ -1843,7 +2010,7 @@ class MoeOffloadRuntime:
             mapping = ExpertSlotMapping.from_slot_bank(
                 layer_id=layer_id,
                 active_experts=unique_active_experts,
-                num_logical_experts=num_logical_experts,
+                num_logical_experts=total_logical_experts,
                 slot_bank=slot_bank,
                 device=device,
             )
@@ -1894,11 +2061,15 @@ class MoeOffloadRuntime:
             raise RuntimeError(
                 f"prefill stage plan must not run on resident layer {layer_id}"
             )
+        routed_expert_count, total_logical_experts = self._resolve_fused_shared_counts(
+            layer_id=layer_id,
+            requested_logical_expert_count=num_logical_experts,
+        )
         unique_active_experts = _dedupe_preserve_order(active_experts)
         _validate_active_expert_ids(
             layer_id=layer_id,
             active_experts=unique_active_experts,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=routed_expert_count,
         )
         if len(unique_active_experts) > self.config.num_slots:
             raise RuntimeError(
@@ -1921,7 +2092,7 @@ class MoeOffloadRuntime:
         log2phy = self._get_prefill_stage_log2phy_buffer(
             layer_id=layer_id,
             buffer_index=int(buffer_index),
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=total_logical_experts,
             device=device,
         )
         step_id = (
@@ -1954,6 +2125,7 @@ class MoeOffloadRuntime:
         if build_log2phy:
             timer = perf_counter() if collect_profile else 0.0
             log2phy.fill_(-1)
+            stage_bank.install_pinned_log2phy(log2phy)
             _mark("log2phy_fill", timer)
         for slot_id, expert_id in enumerate(unique_active_experts):
             key = ExpertKey(layer_id, int(expert_id))
@@ -2029,7 +2201,11 @@ class MoeOffloadRuntime:
         _mark("ready_event", timer)
 
         timer = perf_counter() if collect_profile else 0.0
-        slot_to_expert: list[int | None] = [None] * len(stage_bank.slots)
+        slot_to_expert: list[int | None] = [None] * stage_bank.physical_expert_count
+        for logical_id in stage_bank.pinned_logical_ids:
+            pinned_slot = stage_bank.pinned_slot_for_logical_id(logical_id)
+            assert pinned_slot is not None
+            slot_to_expert[int(pinned_slot)] = int(logical_id)
         for slot_id, expert_id in enumerate(unique_active_experts):
             slot_to_expert[int(slot_id)] = int(expert_id)
         mapping = ExpertSlotMapping(
@@ -2101,12 +2277,15 @@ class MoeOffloadRuntime:
             )
 
         layer_id = int(layer_id)
-        num_logical_experts = int(num_logical_experts)
+        routed_expert_count, total_logical_experts = self._resolve_fused_shared_counts(
+            layer_id=layer_id,
+            requested_logical_expert_count=num_logical_experts,
+        )
         if self.is_resident_layer(layer_id):
             raise RuntimeError(
                 f"full-layer prefill plan must not run on resident layer {layer_id}"
             )
-        if num_logical_experts <= 0:
+        if routed_expert_count <= 0:
             raise ValueError("num_logical_experts must be greater than 0")
 
         template_bank = self._slot_banks.get(layer_id)
@@ -2115,26 +2294,26 @@ class MoeOffloadRuntime:
                 f"layer {layer_id} is not registered for fixed-slot execution"
             )
         layer_buffer = self._host_store.get_layer_buffer(layer_id)
-        if int(layer_buffer.num_experts) != num_logical_experts:
+        if int(layer_buffer.num_experts) != routed_expert_count:
             raise RuntimeError(
                 f"host expert count for layer {layer_id} is "
-                f"{layer_buffer.num_experts}, expected {num_logical_experts}"
+                f"{layer_buffer.num_experts}, expected {routed_expert_count}"
             )
 
         pool_key = self._full_layer_prefill_pool_key(
             template_bank,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=routed_expert_count,
         )
         pool_reused = pool_key in self._full_layer_prefill_pool
         bank = self._get_full_layer_prefill_bank(
             layer_id=layer_id,
             template_bank=template_bank,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=routed_expert_count,
             pool_key=pool_key,
         )
         log2phy = self._get_full_layer_prefill_log2phy_buffer(
             pool_key=pool_key,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=total_logical_experts,
             device=device,
         )
         step_id = (
@@ -2143,7 +2322,7 @@ class MoeOffloadRuntime:
             else int(next(self._step_counter))
         )
 
-        for expert_id in range(num_logical_experts):
+        for expert_id in range(routed_expert_count):
             bank.assign_transient_slot(
                 expert_id,
                 ExpertKey(layer_id, expert_id),
@@ -2152,22 +2331,26 @@ class MoeOffloadRuntime:
 
         stage_start = perf_counter()
         try:
-            bank.w13_slots.copy_(layer_buffer.w13, non_blocking=False)
-            bank.w2_slots.copy_(layer_buffer.w2, non_blocking=False)
+            bank.w13_slots[:routed_expert_count].copy_(layer_buffer.w13, non_blocking=False)
+            bank.w2_slots[:routed_expert_count].copy_(layer_buffer.w2, non_blocking=False)
+            bank.copy_pinned_weights_from(template_bank)
         except Exception:
-            for slot_id in range(num_logical_experts):
+            for slot_id in range(routed_expert_count):
                 bank.clear_slot(slot_id, force=True)
             raise
-        for slot_id in range(num_logical_experts):
+        for slot_id in range(routed_expert_count):
             bank.mark_ready(slot_id)
         stage_ms = (perf_counter() - stage_start) * 1000.0
 
-        all_experts = tuple(range(num_logical_experts))
+        all_experts = tuple(range(routed_expert_count))
+        slot_to_expert: list[int | None] = list(all_experts)
+        for logical_id in bank.pinned_logical_ids:
+            slot_to_expert.append(int(logical_id))
         mapping = ExpertSlotMapping(
             layer_id=layer_id,
             active_experts=all_experts,
             logical_to_physical=log2phy,
-            slot_to_expert=all_experts,
+            slot_to_expert=tuple(slot_to_expert),
             active_slot_ids=all_experts,
         )
         prepared = PreparedSlotWeights.from_slot_bank(
@@ -2176,7 +2359,9 @@ class MoeOffloadRuntime:
         )
         payload = {
             "execution_mode": "reference_full_layer",
-            "num_logical_experts": num_logical_experts,
+            "num_logical_experts": total_logical_experts,
+            "routed_expert_count": routed_expert_count,
+            "pinned_shared_expert_count": len(bank.pinned_logical_ids),
             "physical_expert_count": int(prepared.physical_expert_count),
             "h2d_bytes": int(layer_buffer.total_bytes),
             "stage_ms": round(stage_ms, 3),
@@ -2233,8 +2418,10 @@ class MoeOffloadRuntime:
                     tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
                     dtype=template_bank.w13_slots.dtype,
                     device=template_bank.w13_slots.device,
+                    pinned_logical_ids=template_bank.pinned_logical_ids,
                 )
             )
+            banks[-1].copy_pinned_weights_from(template_bank)
             self._invalidate_memory_ledger_cache()
             hbm_after = self._npu_hbm_snapshot(template_bank.w13_slots.device)
             self._record_profile_event(
@@ -2268,6 +2455,7 @@ class MoeOffloadRuntime:
             str(template_bank.w13_slots.device),
             str(template_bank.w13_slots.dtype),
             int(num_logical_experts),
+            tuple(int(expert_id) for expert_id in template_bank.pinned_logical_ids),
             tuple(int(dim) for dim in template_bank.w13_slots.shape[1:]),
             tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
             tuple(int(stride) for stride in template_bank.w13_slots[0].stride()),
@@ -2294,6 +2482,7 @@ class MoeOffloadRuntime:
             tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
             dtype=template_bank.w13_slots.dtype,
             device=template_bank.w13_slots.device,
+            pinned_logical_ids=template_bank.pinned_logical_ids,
         )
         self._full_layer_prefill_pool[pool_key] = bank
         self._invalidate_memory_ledger_cache()
@@ -2304,7 +2493,7 @@ class MoeOffloadRuntime:
             start=allocation_start,
             payload={
                 "bank_bytes": int(bank.total_bytes),
-                "physical_expert_count": int(num_logical_experts),
+                "physical_expert_count": int(bank.physical_expert_count),
                 "hbm_before": hbm_before,
                 "hbm_after": hbm_after,
             },
@@ -2346,6 +2535,8 @@ class MoeOffloadRuntime:
             str(template_bank.w13_slots.device),
             str(template_bank.w13_slots.dtype),
             len(template_bank.slots),
+            tuple(int(expert_id) for expert_id in template_bank.pinned_logical_ids),
+            tuple(int(expert_id) for expert_id in template_bank.pinned_logical_ids),
             tuple(int(dim) for dim in template_bank.w13_slots.shape[1:]),
             tuple(int(dim) for dim in template_bank.w2_slots.shape[1:]),
             tuple(int(stride) for stride in template_bank.w13_slots.stride()),
@@ -2521,14 +2712,22 @@ class MoeOffloadRuntime:
         self._lock_graph_slot_addresses(layer_id)
         from vllm_moe_offload_ascend.moe_offload.slot_mapping import ExpertSlotMapping
 
+        slot_to_expert: list[int | None] = [
+            int(slot.expert_key.expert_id)
+            if slot.expert_key is not None
+            else None
+            for slot in slot_bank.slots
+        ]
+        for logical_id in slot_bank.pinned_logical_ids:
+            pinned_slot = slot_bank.pinned_slot_for_logical_id(logical_id)
+            assert pinned_slot is not None
+            slot_to_expert.append(int(logical_id))
+
         mapping = ExpertSlotMapping(
             layer_id=layer_id,
             active_experts=(),
             logical_to_physical=buf,
-            slot_to_expert=tuple(
-                int(slot.expert_key.expert_id) if slot.expert_key is not None else None
-                for slot in slot_bank.slots
-            ),
+            slot_to_expert=tuple(slot_to_expert),
             active_slot_ids=(),
         )
         return PreparedSlotWeights.from_slot_bank(slot_bank=slot_bank, mapping=mapping)
@@ -2638,8 +2837,11 @@ class MoeOffloadRuntime:
         buf = self._log2phy_buffers.get(layer_id)
         if buf is None:
             return False
-        num_logical_experts = int(buf.numel())
-        if not self.is_static_residency_regime(num_logical_experts):
+        routed_expert_count, total_logical_experts = self._resolve_fused_shared_counts(
+            layer_id=layer_id,
+            requested_logical_expert_count=int(buf.numel()),
+        )
+        if not self.is_static_residency_regime(routed_expert_count):
             self._record_profile_event(
                 "skip_full_residency_slot_plan",
                 layer_id=layer_id,
@@ -2647,14 +2849,15 @@ class MoeOffloadRuntime:
                 payload={
                     "reason": "regime_b_num_slots_lt_logical_experts",
                     "num_slots": int(self.config.num_slots),
-                    "num_logical_experts": int(num_logical_experts),
+                    "num_logical_experts": int(total_logical_experts),
+                    "routed_expert_count": int(routed_expert_count),
                 },
             )
             return False
         self.stage_fixed_slot_plan(
             layer_id=layer_id,
-            active_experts=tuple(range(num_logical_experts)),
-            num_logical_experts=num_logical_experts,
+            active_experts=tuple(range(routed_expert_count)),
+            num_logical_experts=total_logical_experts,
         )
         return True
 
@@ -2735,6 +2938,23 @@ class MoeOffloadRuntime:
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _fused_shared_expert_count(layer: torch.nn.Module) -> int:
+    """Return the appended shared suffix size for a mix-placement layer."""
+
+    if not bool(getattr(layer, "mix_placement", False)):
+        return 0
+    try:
+        count = int(getattr(layer, "n_shared_experts", 0) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        raise ValueError(
+            "mix_placement is enabled but layer.n_shared_experts is not a "
+            "positive integer"
+        )
+    return count
 
 
 def _module_parameter_bytes(module: object | None) -> dict[int, int]:

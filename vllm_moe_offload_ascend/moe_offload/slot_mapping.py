@@ -76,8 +76,17 @@ class ExpertSlotMapping:
             dtype=dtype,
             device=device,
         )
-        slot_to_expert: list[int | None] = [None] * len(slot_bank.slots)
+        slot_to_expert: list[int | None] = [None] * slot_bank.physical_expert_count
         active_slot_ids: list[int] = []
+
+        # Fused/mix-placement shared experts occupy immutable physical suffix
+        # rows. They are not part of the dynamic active set, but their logical
+        # IDs are present in every backend top-k and must map on every call.
+        slot_bank.install_pinned_log2phy(logical_to_physical)
+        for logical_id in slot_bank.pinned_logical_ids:
+            pinned_slot = slot_bank.pinned_slot_for_logical_id(logical_id)
+            assert pinned_slot is not None
+            slot_to_expert[int(pinned_slot)] = int(logical_id)
 
         for expert_id in unique_active_experts:
             if expert_id < 0 or expert_id >= num_logical_experts:
@@ -173,6 +182,6 @@ class PreparedSlotWeights:
             w1=slot_bank.w13_slots,
             w2=slot_bank.w2_slots,
             log2phy=mapping.logical_to_physical,
-            physical_expert_count=len(slot_bank.slots),
+            physical_expert_count=slot_bank.physical_expert_count,
             mapping=mapping,
         )

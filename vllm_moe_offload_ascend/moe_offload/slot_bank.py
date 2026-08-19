@@ -85,11 +85,34 @@ class ExpertSlotBank:
         *,
         dtype: torch.dtype,
         device: torch.device,
+        pinned_logical_ids: tuple[int, ...] = (),
     ) -> None:
         if num_slots <= 0:
             raise ValueError("num_slots must be greater than 0")
-        self.w13_slots = torch.empty((num_slots, *w13_shape), dtype=dtype, device=device)
-        self.w2_slots = torch.empty((num_slots, *w2_shape), dtype=dtype, device=device)
+        normalized_pinned = tuple(int(expert_id) for expert_id in pinned_logical_ids)
+        if len(set(normalized_pinned)) != len(normalized_pinned):
+            raise ValueError("pinned logical expert ids must be unique")
+        if any(expert_id < 0 for expert_id in normalized_pinned):
+            raise ValueError("pinned logical expert ids must be non-negative")
+
+        # A fused/mix-placement layer exposes shared experts in the same backend
+        # weight tensor as routed experts. Keep those rows in a stable suffix of
+        # the physical tensor, while ``slots`` continues to describe *only* the
+        # dynamic routed cache. This makes it impossible for LRU/victim logic to
+        # evict a pinned shared expert by accident.
+        self.num_dynamic_slots = int(num_slots)
+        self.pinned_logical_ids = normalized_pinned
+        self._pinned_slot_by_logical_id = {
+            logical_id: int(num_slots) + offset
+            for offset, logical_id in enumerate(normalized_pinned)
+        }
+        physical_expert_count = int(num_slots) + len(normalized_pinned)
+        self.w13_slots = torch.empty(
+            (physical_expert_count, *w13_shape), dtype=dtype, device=device
+        )
+        self.w2_slots = torch.empty(
+            (physical_expert_count, *w2_shape), dtype=dtype, device=device
+        )
         self.slots = [
             ExpertSlot(
                 slot_id=slot_id,
@@ -100,6 +123,90 @@ class ExpertSlotBank:
         ]
         self._resident: dict[ExpertKey, int] = {}
         self._resident_by_expert_id: dict[int, int] = {}
+
+    @property
+    def physical_expert_count(self) -> int:
+        return int(self.w13_slots.shape[0])
+
+    @property
+    def pinned_slot_ids(self) -> tuple[int, ...]:
+        return tuple(
+            int(self._pinned_slot_by_logical_id[logical_id])
+            for logical_id in self.pinned_logical_ids
+        )
+
+    @property
+    def dynamic_bytes(self) -> int:
+        return _tensor_nbytes(self.w13_slots[: self.num_dynamic_slots]) + _tensor_nbytes(
+            self.w2_slots[: self.num_dynamic_slots]
+        )
+
+    @property
+    def pinned_bytes(self) -> int:
+        return _tensor_nbytes(self.w13_slots[self.num_dynamic_slots :]) + _tensor_nbytes(
+            self.w2_slots[self.num_dynamic_slots :]
+        )
+
+    def pinned_slot_for_logical_id(self, logical_id: int) -> int | None:
+        return self._pinned_slot_by_logical_id.get(int(logical_id))
+
+    def install_pinned_weights(
+        self,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+    ) -> None:
+        """Copy always-resident shared rows into the immutable suffix."""
+
+        pinned_count = len(self.pinned_logical_ids)
+        if pinned_count == 0:
+            if w13.numel() or w2.numel():
+                raise ValueError("cannot install pinned weights into a routed-only bank")
+            return
+        expected_w13 = tuple(int(dim) for dim in self.w13_slots.shape[1:])
+        expected_w2 = tuple(int(dim) for dim in self.w2_slots.shape[1:])
+        if (
+            int(w13.shape[0]) != pinned_count
+            or tuple(int(dim) for dim in w13.shape[1:]) != expected_w13
+            or int(w2.shape[0]) != pinned_count
+            or tuple(int(dim) for dim in w2.shape[1:]) != expected_w2
+        ):
+            raise ValueError(
+                "pinned shared weight layout does not match slot bank: "
+                f"w13={tuple(w13.shape)} expected=({pinned_count}, {expected_w13}); "
+                f"w2={tuple(w2.shape)} expected=({pinned_count}, {expected_w2})"
+            )
+        # Weight registration must not attach the permanent slot storage to the
+        # checkpoint Parameter's autograd graph. Inference weights may still be
+        # Parameters even though the runtime never differentiates them.
+        with torch.no_grad():
+            self.w13_slots[self.num_dynamic_slots :].copy_(w13, non_blocking=False)
+            self.w2_slots[self.num_dynamic_slots :].copy_(w2, non_blocking=False)
+
+    def copy_pinned_weights_from(self, source: "ExpertSlotBank") -> None:
+        """Clone a compatible pinned lane into a temporary prefill bank."""
+
+        if self.pinned_logical_ids != source.pinned_logical_ids:
+            raise ValueError("cannot copy pinned weights across different logical layouts")
+        if not self.pinned_logical_ids:
+            return
+        with torch.no_grad():
+            self.w13_slots[self.num_dynamic_slots :].copy_(
+                source.w13_slots[source.num_dynamic_slots :], non_blocking=False
+            )
+            self.w2_slots[self.num_dynamic_slots :].copy_(
+                source.w2_slots[source.num_dynamic_slots :], non_blocking=False
+            )
+
+    def install_pinned_log2phy(self, log2phy: torch.Tensor) -> None:
+        """Write immutable shared logical->physical entries into a mapping."""
+
+        for logical_id, slot_id in self._pinned_slot_by_logical_id.items():
+            if logical_id >= int(log2phy.numel()):
+                raise ValueError(
+                    "log2phy does not cover pinned logical expert "
+                    f"{logical_id}; size={int(log2phy.numel())}"
+                )
+            log2phy[int(logical_id)] = int(slot_id)
 
     def allocate_for(self, expert_key: ExpertKey, *, step_id: int) -> ExpertSlot:
         if expert_key in self._resident:

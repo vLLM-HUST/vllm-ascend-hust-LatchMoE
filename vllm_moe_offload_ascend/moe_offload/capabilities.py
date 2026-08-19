@@ -228,7 +228,11 @@ def evaluate_support(descriptor: MoeCapabilityDescriptor) -> CapabilitySupport:
     blockers: list[str] = []
     if descriptor.output_contract not in {"routed_tensor", "shared_routed_tuple"}:
         blockers.append(f"unknown_output_contract:{descriptor.output_contract}")
-    if descriptor.shared_mode not in {"none", "external_resident"}:
+    if descriptor.shared_mode not in {
+        "none",
+        "external_resident",
+        "fused_mix_placement",
+    }:
         blockers.append(f"unsupported_shared_mode:{descriptor.shared_mode}")
     if descriptor.router_owner not in {"external_logits", "internal_gate"}:
         blockers.append(f"unsupported_router_owner:{descriptor.router_owner}")

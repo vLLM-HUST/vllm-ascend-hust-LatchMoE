@@ -38,8 +38,8 @@ First-version constraints (see design doc decisions):
   - ``custom_routing_function`` MUST be None (a Callable cannot cross an op
     boundary). Callers with a custom routing function fall back to the
     monolithic ``super().forward()`` path.
-  - mirrors the apply-path call exactly: ``mix_placement=False``,
-    ``num_shared_experts=0`` (the apply-path select_experts call passes neither).
+  - mirrors the apply-path call exactly, including fused/mix-placement shared
+    suffixes when the materialized layer enables them.
 
 Current integration: the explicit router core and the layer-name indirect
 router are registered for the SEW router -> stage -> MLP dataplane. The seam
@@ -81,6 +81,8 @@ def _moe_router_impl(
     routed_scaling_factor: float,
     e_score_correction_bias: torch.Tensor | None,
     num_experts: int,
+    mix_placement: bool = False,
+    num_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run expert selection exactly as the apply-path does, returning
     ``(topk_weights, topk_ids)``.
@@ -116,6 +118,9 @@ def _moe_router_impl(
         routed_scaling_factor=routed_scaling_factor,
         e_score_correction_bias=e_score_correction_bias,
         num_experts=num_experts,
+        mix_placement=bool(mix_placement),
+        num_logical_experts=int(num_experts),
+        num_shared_experts=int(num_shared_experts),
     )
     return topk_weights, topk_ids
 
@@ -132,9 +137,11 @@ def _moe_router_fake(
     routed_scaling_factor: float,
     e_score_correction_bias: torch.Tensor | None,
     num_experts: int,
+    mix_placement: bool = False,
+    num_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Trace-time shape/dtype proxy. The apply-path call passes mix_placement=False
-    # and num_shared_experts=0, so both outputs are (num_tokens, top_k).
+    # Trace-time shape/dtype proxy. Fused mix-placement appends one shared pair
+    # per shared expert to the routed top-k suffix.
     #   - topk_weights: real _native_select_experts casts to hidden_states.dtype
     #     (experts_selector.py line ~322: `topk_weights = topk_weights.to(x.dtype)`).
     #     Using router_logits.dtype was wrong for indirect-router models where the
@@ -143,10 +150,14 @@ def _moe_router_fake(
     #   - topk_ids: int32 selected logical-expert ids.
     num_tokens = hidden_states.shape[0]
     topk_weights = torch.empty(
-        (num_tokens, top_k), dtype=hidden_states.dtype, device=hidden_states.device
+        (num_tokens, top_k + (int(num_shared_experts) if mix_placement else 0)),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     topk_ids = torch.empty(
-        (num_tokens, top_k), dtype=torch.int32, device=hidden_states.device
+        (num_tokens, top_k + (int(num_shared_experts) if mix_placement else 0)),
+        dtype=torch.int32,
+        device=hidden_states.device,
     )
     return topk_weights, topk_ids
 
@@ -220,6 +231,7 @@ def _moe_router_indirect_impl(
         router_logits, _ = gate(hidden_states)
 
     num_shared_experts = getattr(layer, "n_shared_experts", 0) or 0
+    mix_placement = bool(getattr(layer, "mix_placement", False))
     num_logical_experts = get_moe_num_logical_experts(
         layer,
         layer.moe_config.num_experts,
@@ -248,6 +260,8 @@ def _moe_router_indirect_impl(
         routed_scaling_factor=routed_scaling_factor,
         e_score_correction_bias=layer.e_score_correction_bias,
         num_experts=num_logical_experts,
+        mix_placement=mix_placement,
+        num_shared_experts=num_shared_experts,
     )
     if os.getenv("VLLM_ASCEND_MOE_ROUTER_PARITY_PATH") and _capture_state() != "True":
         from vllm_moe_offload_ascend.moe_offload.router_parity import (
@@ -290,6 +304,8 @@ def _moe_router_indirect_fake(
         ),
         e_score_correction_bias=layer.e_score_correction_bias,
         num_experts=layer.moe_config.num_experts,
+        mix_placement=bool(getattr(layer, "mix_placement", False)),
+        num_shared_experts=int(getattr(layer, "n_shared_experts", 0) or 0),
     )
 
 

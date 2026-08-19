@@ -1538,6 +1538,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         if offload is None or not offload.enabled:
             return None
         runtime = get_moe_offload_runtime()
+        fused_layout_fn = getattr(runtime, "fused_shared_lane_layout", None)
+        fused_shared_layout = (
+            fused_layout_fn(int(offload.layer_id))
+            if callable(fused_layout_fn)
+            else None
+        )
         profile_adaptive_wave = _is_moe_offload_profile_run_active()
         graph_warmup_adaptive_wave = _is_moe_offload_graph_warmup_active()
         adaptive_wave_context = profile_adaptive_wave or graph_warmup_adaptive_wave
@@ -1613,6 +1619,16 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             token_count_ms = (perf_counter() - token_count_start) * 1000.0
         else:
             token_count_ms = 0.0
+        if fused_shared_layout is not None:
+            # The backend appends always-active shared IDs to every token's
+            # top-k. Capacity and B2 planning are routed-only: the shared suffix
+            # has fixed storage and is executed exactly once in a separate step.
+            routed_count = int(fused_shared_layout.routed_expert_count)
+            token_counts = {
+                int(expert_id): int(pair_count)
+                for expert_id, pair_count in token_counts.items()
+                if 0 <= int(expert_id) < routed_count
+            }
         active_experts = tuple(sorted(token_counts))
         active_expert_count = len(active_experts)
         b2_phase_match = runtime.should_use_b2_pair_waves(
@@ -1637,13 +1653,24 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             "forward_phase": str(forward_phase),
             "profile_adaptive_wave": profile_adaptive_wave,
             "graph_warmup_adaptive_wave": graph_warmup_adaptive_wave,
+            # Cached offsets refer to the full routed+shared matrix. The
+            # routed B2 executor receives a narrower routed-only view, so
+            # rebuilding offsets is required to preserve pair positions.
             "pair_offsets_by_expert": (
-                route_stats.pair_offsets_by_expert
-                if route_stats is not None
-                else None
+                None
+                if fused_shared_layout is not None or route_stats is None
+                else route_stats.pair_offsets_by_expert
             ),
         }
         try:
+            if fused_shared_layout is not None:
+                return self._run_b2_fused_shared_once(
+                    fused_experts_input=fused_experts_input,
+                    before_dispatch_evt=before_dispatch_evt,
+                    token_counts=token_counts,
+                    shared_layout=fused_shared_layout,
+                    control_profile=control_profile,
+                )
             return self._run_b2_wave_prefill(
                 fused_experts_input=fused_experts_input,
                 active_experts=active_experts,
@@ -1670,6 +1697,108 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 fallback_reason=fallback_reason,
             )
 
+    def _run_b2_fused_shared_once(
+        self,
+        *,
+        fused_experts_input,
+        before_dispatch_evt,
+        token_counts,
+        shared_layout,
+        control_profile,
+    ):
+        """Run B2 for routed pairs and the fused shared suffix exactly once.
+
+        ``mix_placement`` flattens routed and shared pairs into one backend
+        input. Splitting that tensor naively would either count pinned shared
+        IDs against dynamic slot capacity or repeat them in every routed wave.
+        This method creates a routed-only B2 view and invokes the native fused
+        kernel once for the immutable shared suffix, then adds the two outputs.
+        """
+
+        runtime = get_moe_offload_runtime()
+        offload = fused_experts_input.offload
+        shared_count = int(shared_layout.shared_expert_count)
+        routed_count = int(shared_layout.routed_expert_count)
+        total_count = int(shared_layout.total_logical_expert_count)
+        topk_ids = fused_experts_input.topk_ids
+        topk_weights = fused_experts_input.topk_weights
+        if topk_ids.ndim != 2 or topk_weights.ndim != 2:
+            raise RuntimeError(
+                "fused shared B2 requires rank-2 top-k tensors; "
+                f"ids={tuple(topk_ids.shape)}, weights={tuple(topk_weights.shape)}"
+            )
+        if int(topk_ids.shape[1]) <= shared_count:
+            raise RuntimeError(
+                "fused shared B2 top-k has no routed columns after removing "
+                f"shared suffix: topk={int(topk_ids.shape[1])}, shared={shared_count}"
+            )
+
+        shared_ids = topk_ids[:, -shared_count:]
+        shared_weights = topk_weights[:, -shared_count:]
+        expected_shared_ids = torch.arange(
+            routed_count,
+            total_count,
+            dtype=shared_ids.dtype,
+            device=shared_ids.device,
+        ).view(1, shared_count).expand_as(shared_ids)
+        if not bool(torch.equal(shared_ids, expected_shared_ids)):
+            raise RuntimeError(
+                "fused shared B2 expected appended pinned shared IDs "
+                f"[{routed_count}, {total_count}), but router suffix differs"
+            )
+
+        routed_input = replace(
+            fused_experts_input,
+            topk_ids=topk_ids[:, :-shared_count],
+            topk_weights=topk_weights[:, :-shared_count],
+        )
+        routed_profile = dict(control_profile)
+        routed_profile["pair_offsets_by_expert"] = None
+        routed_result = self._run_b2_wave_prefill(
+            fused_experts_input=routed_input,
+            active_experts=tuple(sorted(int(expert_id) for expert_id in token_counts)),
+            token_counts=token_counts,
+            before_dispatch_evt=before_dispatch_evt,
+            control_profile=routed_profile,
+        )
+        if routed_result is None:
+            raise RuntimeError("fused shared B2 routed executor produced no result")
+
+        pinned_weights = runtime.capture_safe_slot_weights(
+            layer_id=int(offload.layer_id)
+        )
+        if pinned_weights is None:
+            raise RuntimeError(
+                "fused shared B2 requires the registered pinned shared lane; "
+                f"layer={int(offload.layer_id)}"
+            )
+        pinned_weights.validate_backend_ready(
+            expected_device_type=offload.expected_device_type
+        )
+        shared_input = replace(
+            self._with_prepared_slot_weights(
+                fused_experts_input,
+                pinned_weights,
+            ),
+            topk_ids=shared_ids,
+            topk_weights=shared_weights,
+        )
+        shared_result = original_fused_experts(self, shared_input)
+        combined_out = routed_result.routed_out + shared_result.routed_out
+        runtime._record_profile_event(
+            "fused_shared_b2_once",
+            layer_id=int(offload.layer_id),
+            start=perf_counter(),
+            payload={
+                "routed_expert_count": routed_count,
+                "pinned_shared_expert_count": shared_count,
+                "shared_pairs": int(shared_ids.numel()),
+                "shared_pair_execution_count": 1,
+                "routed_pairs": int(routed_input.topk_ids.numel()),
+            },
+        )
+        return replace(routed_result, routed_out=combined_out)
+
     def _run_b2_wave_prefill(
         self,
         *,
@@ -1690,6 +1819,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
 
         runtime = get_moe_offload_runtime()
         offload = fused_experts_input.offload
+        routed_expert_count = runtime.routed_expert_count_for_layer(
+            layer_id=int(offload.layer_id),
+            fallback=int(offload.num_logical_experts),
+        )
         num_slots = int(runtime.config.num_slots)
         device = fused_experts_input.topk_ids.device
         b2_total_start = (
@@ -1871,7 +2004,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 wave_microbatch_plans = build_b2_device_wave_microbatch_plans(
                     fused_experts_input.topk_ids,
                     waves,
-                    num_logical_experts=int(offload.num_logical_experts),
+                    num_logical_experts=routed_expert_count,
                     active_experts=unique_active,
                     physical_slot_by_expert={},
                     wave_pair_counts=tuple(
@@ -3223,6 +3356,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
     cls._with_prepared_slot_weights = _with_prepared_slot_weights
     cls._maybe_apply_moe_offload_plan = _maybe_apply_moe_offload_plan
     cls._maybe_run_b2_wave_prefill = _maybe_run_b2_wave_prefill
+    cls._run_b2_fused_shared_once = _run_b2_fused_shared_once
     cls._run_b2_wave_prefill = _run_b2_wave_prefill
     cls._run_b2_full_layer_reference = _run_b2_full_layer_reference
     cls._run_b2_pair_wave = _run_b2_pair_wave
@@ -3545,10 +3679,14 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
             and registered
         ):
             buf = runtime.log2phy_buffer(layer_id)
-            num_logical_experts = (
+            total_logical_experts = (
                 int(buf.numel()) if buf is not None else int(getattr(layer, "w13_weight").shape[0])
             )
-            if runtime.is_static_residency_regime(num_logical_experts):
+            routed_expert_count = runtime.routed_expert_count_for_layer(
+                layer_id=layer_id,
+                fallback=total_logical_experts,
+            )
+            if runtime.is_static_residency_regime(routed_expert_count):
                 runtime.stage_full_residency_slot_plan(layer_id=layer_id)
         return result
 
@@ -3921,13 +4059,57 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             support = CapabilitySupport(state="unsupported", blockers=tuple(extra_blockers))
         self._seam_capability = descriptor
         self._seam_capability_support = support
-        if not support.enabled:
-            return False
-        self._seam_num_logical_experts = descriptor.routed_expert_count
         from vllm_moe_offload_ascend.moe_offload.runtime import (
             get_moe_offload_runtime,
         )
         runtime = get_moe_offload_runtime()
+        if descriptor.shared_mode == "fused_mix_placement":
+            # A fused router emits appended shared IDs in the same top-k tensor
+            # as routed IDs. The seam must not proceed until the runtime has
+            # registered the corresponding immutable physical suffix; otherwise
+            # a later stage call could treat shared IDs as evictable routed rows.
+            layout_fn = getattr(runtime, "fused_shared_lane_layout", None)
+            layout = (
+                layout_fn(self._seam_layer_id)
+                if callable(layout_fn)
+                else None
+            )
+            expected_pinned_ids = tuple(
+                range(
+                    int(descriptor.routed_expert_count),
+                    int(descriptor.routed_expert_count)
+                    + int(descriptor.shared_expert_count),
+                )
+            )
+            try:
+                layout_matches = (
+                    layout is not None
+                    and int(layout.routed_expert_count)
+                    == int(descriptor.routed_expert_count)
+                    and int(layout.shared_expert_count)
+                    == int(descriptor.shared_expert_count)
+                    and int(layout.total_logical_expert_count)
+                    == int(descriptor.routed_expert_count)
+                    + int(descriptor.shared_expert_count)
+                    and tuple(int(expert_id) for expert_id in layout.pinned_logical_ids)
+                    == expected_pinned_ids
+                )
+            except (AttributeError, TypeError, ValueError):
+                layout_matches = False
+            if not layout_matches:
+                blocker = (
+                    "fused_shared_lane_unregistered"
+                    if layout is None
+                    else "fused_shared_lane_layout_mismatch"
+                )
+                support = CapabilitySupport(
+                    state="unsupported",
+                    blockers=tuple((*support.blockers, blocker)),
+                )
+                self._seam_capability_support = support
+        if not support.enabled:
+            return False
+        self._seam_num_logical_experts = descriptor.routed_expert_count
         if descriptor.shared_mode == "external_resident":
             shared_experts = getattr(self, "_shared_experts", None)
             shared_gate = getattr(self, "shared_expert_gate", None)

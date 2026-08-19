@@ -195,6 +195,28 @@ def _moe_offload_stage_impl(
 
     runtime = get_moe_offload_runtime()
     layer_id = int(layer_id)
+    routed_count_fn = getattr(runtime, "routed_expert_count_for_layer", None)
+    total_count_fn = getattr(runtime, "total_logical_expert_count_for_layer", None)
+    routed_expert_count = (
+        int(
+            routed_count_fn(
+                layer_id=layer_id,
+                fallback=int(num_logical_experts),
+            )
+        )
+        if callable(routed_count_fn)
+        else int(num_logical_experts)
+    )
+    total_logical_experts = (
+        int(
+            total_count_fn(
+                layer_id=layer_id,
+                fallback=int(num_logical_experts),
+            )
+        )
+        if callable(total_count_fn)
+        else int(num_logical_experts)
+    )
 
     # During capture we must not perform host sync / conditional H2D. In the
     # canonical flow the captured graph only reads the fixed slot tensors + the
@@ -225,7 +247,18 @@ def _moe_offload_stage_impl(
     # later step's expert that maps to -1 makes the captured gather read slot[-1]
     # (MTE DDR out-of-range). The seam must therefore be a transparent no-op in
     # Regime A; it owns staging only in Regime B (num_slots < n).
-    if runtime.is_static_residency_regime(int(num_logical_experts)):
+    static_for_layer = getattr(runtime, "is_static_residency_regime_for_layer", None)
+    is_static = (
+        bool(
+            static_for_layer(
+                layer_id=layer_id,
+                fallback_routed_expert_count=routed_expert_count,
+            )
+        )
+        if callable(static_for_layer)
+        else bool(runtime.is_static_residency_regime(routed_expert_count))
+    )
+    if is_static:
         if os.environ.get("SEW_SEAM_PROBE"):
             _PROBE_CALLS["eager_passthrough"] += 1
             print(
@@ -264,7 +297,7 @@ def _moe_offload_stage_impl(
     flat_topk_ids = topk_ids.detach().reshape(-1).to("cpu", non_blocking=False)
     token_counts_by_expert, flat_topk_id_list = _count_active_experts_from_cpu_topk(
         flat_topk_ids,
-        num_logical_experts=int(num_logical_experts),
+        num_logical_experts=routed_expert_count,
     )
     active_experts = tuple(sorted(token_counts_by_expert))
 
@@ -421,7 +454,7 @@ def _moe_offload_stage_impl(
     runtime.stage_fixed_slot_plan(
         layer_id=layer_id,
         active_experts=active_experts,
-        num_logical_experts=int(num_logical_experts),
+        num_logical_experts=total_logical_experts,
     )
     if _probe:
         torch.npu.synchronize()

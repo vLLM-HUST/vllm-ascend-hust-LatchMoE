@@ -115,6 +115,7 @@ class HostExpertStore:
         *,
         pin_memory: bool = False,
         clone_tensors: bool = True,
+        routed_expert_count: int | None = None,
     ) -> HostStoreRegisterReport:
         layer_id = int(getattr(layer, "layer_id", -1))
         w13_weight = getattr(layer, "w13_weight")
@@ -122,19 +123,29 @@ class HostExpertStore:
         if w13_weight.shape[0] != w2_weight.shape[0]:
             raise ValueError("w13_weight and w2_weight must have the same number of experts")
 
-        num_experts = int(w13_weight.shape[0])
+        total_experts = int(w13_weight.shape[0])
+        num_experts = (
+            total_experts
+            if routed_expert_count is None
+            else int(routed_expert_count)
+        )
         if num_experts <= 0:
             raise ValueError("host expert store requires at least one expert")
+        if num_experts > total_experts:
+            raise ValueError(
+                "routed expert count exceeds materialized expert rows: "
+                f"routed={num_experts}, total={total_experts}"
+            )
         self._weights = {key: bundle for key, bundle in self._weights.items() if key.layer_id != layer_id}
         self._weights_by_layer.pop(layer_id, None)
         self._layer_buffers.pop(layer_id, None)
         w13_host, w13_pinned, w13_error = _to_host_layer_tensor(
-            w13_weight,
+            w13_weight[:num_experts],
             clone=clone_tensors,
             pin_memory=pin_memory,
         )
         w2_host, w2_pinned, w2_error = _to_host_layer_tensor(
-            w2_weight,
+            w2_weight[:num_experts],
             clone=clone_tensors,
             pin_memory=pin_memory,
         )
@@ -179,7 +190,13 @@ class HostExpertStore:
         normalized_expert_id = int(expert_id)
         layer_bundles = self._weights_by_layer.get(normalized_layer_id)
         if layer_bundles is not None:
-            return layer_bundles[normalized_expert_id]
+            try:
+                return layer_bundles[normalized_expert_id]
+            except IndexError as exc:
+                raise KeyError(
+                    f"expert {normalized_expert_id} is not host-managed for "
+                    f"layer {normalized_layer_id}"
+                ) from exc
         return self._weights[ExpertKey(normalized_layer_id, normalized_expert_id)]
 
     def get_layer_buffer(self, layer_id: int) -> HostExpertLayerBuffer:
