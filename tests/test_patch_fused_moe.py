@@ -2809,7 +2809,8 @@ def test_seam_guard_requires_matching_fused_shared_lane(
     layer = SimpleNamespace(
         layer_id=11,
         moe_config=SimpleNamespace(
-            num_experts=4, dp_size=1, ep_size=1, tp_size=1, pcp_size=1
+            # Ascend FusedMoE mutates this count to include the two shared rows.
+            num_experts=6, dp_size=1, ep_size=1, tp_size=1, pcp_size=1
         ),
         n_shared_experts=2,
         mix_placement=True,

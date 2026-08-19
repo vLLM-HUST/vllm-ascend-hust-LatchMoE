@@ -98,13 +98,29 @@ def describe_layer_capability(layer: Any, runner: Any) -> MoeCapabilityDescripto
     """Describe a materialized FusedMoE layer without model-name checks."""
 
     moe_config = getattr(layer, "moe_config", None) or getattr(runner, "moe_config", None)
-    routed_expert_count = _positive_int(
+    materialized_expert_count = _positive_int(
         getattr(moe_config, "num_experts", None),
         _positive_int(getattr(layer, "num_experts", None), 0),
     )
     external_shared = getattr(runner, "_shared_experts", None)
     mix_placement = bool(getattr(layer, "mix_placement", False))
     shared_expert_count = _positive_int(getattr(layer, "n_shared_experts", None), 0)
+    # Ascend FusedMoE mutates ``moe_config.num_experts`` after construction to
+    # include the appended shared suffix. Prefer the backend's preserved
+    # logical routed count when it exists; otherwise derive the routed range
+    # from the materialized total. This deliberately mirrors
+    # ``get_moe_num_logical_experts`` in vLLM-Ascend.
+    routed_expert_count = materialized_expert_count
+    if mix_placement:
+        preserved_routed_count = _positive_int(
+            getattr(moe_config, "num_logical_experts", None),
+            0,
+        )
+        routed_expert_count = (
+            preserved_routed_count
+            if preserved_routed_count > 0
+            else materialized_expert_count - shared_expert_count
+        )
     if external_shared is not None:
         shared_mode: SharedMode = "external_resident"
         output_contract: OutputContract = "shared_routed_tuple"
