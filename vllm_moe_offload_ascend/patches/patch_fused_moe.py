@@ -25,8 +25,23 @@ import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from typing import Any
+
+
+_MIX_PLACEMENT_AITER_INIT_LOCK = RLock()
+
+
+def _summarize_fused_shared_ids(shared_ids: Any) -> list[int]:
+    """Return a bounded eager-only summary for a fused router suffix."""
+
+    import torch
+
+    if not isinstance(shared_ids, torch.Tensor):
+        return []
+    values = shared_ids.detach().to(device="cpu", dtype=torch.int64).flatten().tolist()
+    return sorted({int(value) for value in values})
 
 
 def _ascend_device_op_is_initializing() -> bool:
@@ -1742,9 +1757,31 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             device=shared_ids.device,
         ).view(1, shared_count).expand_as(shared_ids)
         if not bool(torch.equal(shared_ids, expected_shared_ids)):
+            capturing = _is_torch_compile_tracing() or _is_current_graph_capturing()
+            actual_suffix_ids: list[int] | str = "unavailable_during_capture"
+            if not capturing:
+                try:
+                    actual_suffix_ids = _summarize_fused_shared_ids(shared_ids)
+                except Exception as exc:
+                    actual_suffix_ids = f"unavailable:{type(exc).__name__}"
+            runtime._record_profile_event(
+                "fused_shared_router_suffix_mismatch",
+                layer_id=int(offload.layer_id),
+                start=perf_counter(),
+                payload={
+                    "topk_width": int(topk_ids.shape[1]),
+                    "shared_width": shared_count,
+                    "routed_expert_count": routed_count,
+                    "total_logical_expert_count": total_count,
+                    "expected_shared_ids": list(range(routed_count, total_count)),
+                    "actual_suffix_ids": actual_suffix_ids,
+                    "capturing": bool(capturing),
+                },
+            )
             raise RuntimeError(
                 "fused shared B2 expected appended pinned shared IDs "
-                f"[{routed_count}, {total_count}), but router suffix differs"
+                f"[{routed_count}, {total_count}), but router suffix differs; "
+                f"topk_width={int(topk_ids.shape[1])} actual_suffix_ids={actual_suffix_ids}"
             )
 
         routed_input = replace(
@@ -1754,13 +1791,23 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         )
         routed_profile = dict(control_profile)
         routed_profile["pair_offsets_by_expert"] = None
-        routed_result = self._run_b2_wave_prefill(
-            fused_experts_input=routed_input,
-            active_experts=tuple(sorted(int(expert_id) for expert_id in token_counts)),
-            token_counts=token_counts,
-            before_dispatch_evt=before_dispatch_evt,
-            control_profile=routed_profile,
-        )
+        dispatcher = getattr(self, "token_dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "top_k"):
+            raise RuntimeError(
+                "fused shared B2 requires a token dispatcher with a mutable top_k"
+            )
+        original_dispatch_top_k = int(dispatcher.top_k)
+        dispatcher.top_k = int(routed_input.topk_ids.shape[1])
+        try:
+            routed_result = self._run_b2_wave_prefill(
+                fused_experts_input=routed_input,
+                active_experts=tuple(sorted(int(expert_id) for expert_id in token_counts)),
+                token_counts=token_counts,
+                before_dispatch_evt=before_dispatch_evt,
+                control_profile=routed_profile,
+            )
+        finally:
+            dispatcher.top_k = original_dispatch_top_k
         if routed_result is None:
             raise RuntimeError("fused shared B2 routed executor produced no result")
 
@@ -1788,12 +1835,6 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         # path keeps that value at the model's routed top-k, while this native
         # call deliberately contains only the pinned shared suffix. Set it for
         # this call only, then restore it before the next routed wave.
-        dispatcher = getattr(self, "token_dispatcher", None)
-        if dispatcher is None or not hasattr(dispatcher, "top_k"):
-            raise RuntimeError(
-                "fused shared B2 requires a token dispatcher with a mutable top_k"
-            )
-        original_dispatch_top_k = int(dispatcher.top_k)
         dispatcher.top_k = shared_count
         try:
             shared_result = original_fused_experts(self, shared_input)
@@ -3428,8 +3469,119 @@ def _wrap_setup_moe_comm_method(_comm: Any, original_setup_moe_comm_method: Call
 
 
 def _patch_fused_moe_runtime_hooks(_fused_moe: Any) -> None:
+    _patch_ascend_mix_placement_aiter_compat(_fused_moe)
     _patch_unquantized_moe_method(_fused_moe)
     _patch_ascend_moe_runner(_fused_moe)
+
+
+def _ascend_mix_placement_enabled() -> bool:
+    """Return whether the active Ascend backend fuses shared expert rows."""
+
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return bool(getattr(get_ascend_config(), "mix_placement", False))
+    except Exception:
+        return False
+
+
+def _patch_ascend_mix_placement_aiter_compat(_fused_moe: Any) -> None:
+    """Keep Ascend's mix-placement shim from allocating ROCm CUDA buffers.
+
+    The pinned vLLM-Ascend runner temporarily reports the ROCm AIter shared
+    expert feature as enabled while constructing a mix-placement model. That
+    preserves upstream model layout selection, but the parent ``FusedMoE``
+    constructor then attempts to allocate its AIter metadata on ``cuda``.
+    Ascend has a separate router and dispatch path, so suppress AIter only for
+    the parent constructor, while retaining the backend's model-level layout
+    choice and restoring its shim immediately afterward.
+    """
+
+    cls = getattr(_fused_moe, "AscendFusedMoE", None)
+    if cls is None or getattr(cls, "_latchmoe_mix_placement_aiter_patch", False):
+        return
+
+    original_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        shared_count = kwargs.get("n_shared_experts", 0)
+        try:
+            shared_count = int(shared_count or 0)
+        except (TypeError, ValueError):
+            shared_count = 0
+        if shared_count <= 0 or not _ascend_mix_placement_enabled():
+            return original_init(self, *args, **kwargs)
+
+        try:
+            from vllm._aiter_ops import rocm_aiter_ops
+        except Exception:
+            return original_init(self, *args, **kwargs)
+
+        original_shared_enabled = getattr(
+            rocm_aiter_ops,
+            "is_fusion_moe_shared_experts_enabled",
+            None,
+        )
+        original_fused_enabled = getattr(
+            rocm_aiter_ops,
+            "is_fused_moe_enabled",
+            None,
+        )
+        if not callable(original_shared_enabled) or not callable(original_fused_enabled):
+            return original_init(self, *args, **kwargs)
+
+        def _disabled() -> bool:
+            return False
+
+        # The Ascend runner changes these process-global probes to make
+        # upstream models pass shared rows to FusedMoE. Model construction is
+        # serialized per EngineCore; the lock also keeps restoration atomic in
+        # tests and alternative launchers.
+        with _MIX_PLACEMENT_AITER_INIT_LOCK:
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = _disabled
+            rocm_aiter_ops.is_fused_moe_enabled = _disabled
+            try:
+                result = original_init(self, *args, **kwargs)
+            finally:
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = (
+                    original_shared_enabled
+                )
+                rocm_aiter_ops.is_fused_moe_enabled = original_fused_enabled
+
+        self._latchmoe_mix_placement_aiter_suppressed = True
+        moe_config = getattr(self, "moe_config", None)
+        routed_top_k = getattr(moe_config, "experts_per_token", None)
+        if moe_config is not None and routed_top_k is not None:
+            try:
+                routed_top_k = int(routed_top_k)
+            except (TypeError, ValueError):
+                routed_top_k = 0
+            if routed_top_k > 0:
+                total_top_k = routed_top_k + shared_count
+                # AllGather derives active_num from its persistent dispatcher
+                # rather than the input width. The upstream backend leaves this
+                # at routed top-k even though select_experts appends shared
+                # pairs, so install the full native width before the comm
+                # method is used. B2 temporarily narrows it per split below.
+                moe_config.experts_per_token = total_top_k
+                setup_moe_comm_method = getattr(_fused_moe, "setup_moe_comm_method", None)
+                if callable(setup_moe_comm_method):
+                    setup_moe_comm_method(moe_config)
+                self._latchmoe_mix_placement_dispatch_top_k = total_top_k
+        if not getattr(cls, "_latchmoe_mix_placement_aiter_announced", False):
+            print(
+                "LATCHMOE_BACKEND_COMPAT "
+                "mix_placement_aiter=disabled_for_ascend "
+                f"dispatch_top_k={getattr(self, '_latchmoe_mix_placement_dispatch_top_k', 'unchanged')}",
+                flush=True,
+            )
+            cls._latchmoe_mix_placement_aiter_announced = True
+        return result
+
+    __init__._latchmoe_mix_placement_aiter_patch = True
+    __init__.__wrapped__ = original_init
+    cls.__init__ = __init__
+    cls._latchmoe_mix_placement_aiter_patch = True
 
 
 def _ondemand_stage_enabled() -> bool:
@@ -3589,6 +3741,7 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
 
     def select_experts(*args, **kwargs):
         layer_id = getattr(layer_context, "layer_id", None)
+        layer = getattr(layer_context, "layer", None)
         if layer_id is not None:
             injected = moe_seam_inject.peek_injected_topk(int(layer_id))
             if injected is not None:
@@ -3605,26 +3758,73 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                     and not _is_torch_compile_tracing()
                     and not _is_current_graph_capturing()
                 ):
+                    # The native Ascend apply path omits mix-placement
+                    # arguments even though the materialized expert bank has
+                    # an immutable shared suffix. Reconstruct those arguments
+                    # from the registered lane so the diagnostic compares like
+                    # with like: 6 routed + 2 shared columns, not 6 vs 8.
+                    native_kwargs = kwargs
+                    runtime = get_moe_offload_runtime()
+                    layout_fn = getattr(runtime, "fused_shared_lane_layout", None)
+                    fused_layout = (
+                        layout_fn(int(layer_id)) if callable(layout_fn) else None
+                    )
+                    if (
+                        fused_layout is not None
+                        and not bool(kwargs.get("mix_placement", False))
+                    ):
+                        native_kwargs = dict(kwargs)
+                        native_kwargs.update(
+                            mix_placement=True,
+                            num_logical_experts=int(
+                                fused_layout.routed_expert_count
+                            ),
+                            num_shared_experts=int(
+                                fused_layout.shared_expert_count
+                            ),
+                        )
                     native_weights, native_ids = original_select_experts(
                         *args,
-                        **kwargs,
+                        **native_kwargs,
                     )
                     injected_weights, injected_ids = injected
-                    id_mismatch_count = int(
-                        torch.count_nonzero(native_ids != injected_ids).item()
+                    ids_same_shape = tuple(native_ids.shape) == tuple(
+                        injected_ids.shape
                     )
-                    weight_diff = (
-                        native_weights.float() - injected_weights.float()
-                    ).abs()
+                    weights_same_shape = tuple(native_weights.shape) == tuple(
+                        injected_weights.shape
+                    )
+                    ids_equal = ids_same_shape and bool(
+                        torch.equal(native_ids, injected_ids)
+                    )
+                    weights_equal = weights_same_shape and bool(
+                        torch.equal(native_weights, injected_weights)
+                    )
+                    id_mismatch_count = (
+                        int(torch.count_nonzero(native_ids != injected_ids).item())
+                        if ids_same_shape
+                        else -1
+                    )
+                    if weights_same_shape:
+                        weight_diff = (
+                            native_weights.float() - injected_weights.float()
+                        ).abs()
+                        weight_max_abs: float | str = float(weight_diff.max().item())
+                        weight_mean_abs: float | str = float(weight_diff.mean().item())
+                    else:
+                        weight_max_abs = "shape_mismatch"
+                        weight_mean_abs = "shape_mismatch"
                     print(
                         "SEW_ROUTER_COMPARE "
                         f"layer={int(layer_id)} "
                         f"tokens={int(hidden_states.shape[0])} "
-                        f"ids_equal={bool(torch.equal(native_ids, injected_ids))} "
+                        f"native_id_shape={tuple(native_ids.shape)} "
+                        f"seam_id_shape={tuple(injected_ids.shape)} "
+                        f"ids_equal={ids_equal} "
                         f"id_mismatch_count={id_mismatch_count} "
-                        f"weights_equal={bool(torch.equal(native_weights, injected_weights))} "
-                        f"weight_max_abs={float(weight_diff.max().item())} "
-                        f"weight_mean_abs={float(weight_diff.mean().item())}",
+                        f"weights_equal={weights_equal} "
+                        f"weight_max_abs={weight_max_abs} "
+                        f"weight_mean_abs={weight_mean_abs}",
                         flush=True,
                     )
                     from vllm_moe_offload_ascend.moe_offload.router_parity import (
@@ -3643,6 +3843,44 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                             topk_weights=native_weights,
                         )
                 return injected
+        # The pinned Ascend implementation materializes the shared rows for
+        # mix-placement but does not pass its own ``mix_placement`` arguments
+        # to select_experts().  Without these arguments the router emits only
+        # routed columns, silently omitting the always-active shared suffix.
+        # Keep this compatibility shim local to actual fused layers and leave
+        # a backend that starts forwarding the arguments unchanged.
+        if (
+            layer is not None
+            and bool(getattr(layer, "mix_placement", False))
+            and not bool(kwargs.get("mix_placement", False))
+        ):
+            try:
+                shared_count = int(getattr(layer, "n_shared_experts", 0) or 0)
+                routed_count = int(kwargs.get("num_experts", -1))
+            except (TypeError, ValueError):
+                shared_count = 0
+                routed_count = -1
+            if shared_count > 0:
+                if routed_count <= 0:
+                    raise RuntimeError(
+                        "mix-placement router requires a positive routed expert count; "
+                        f"layer={int(layer_id) if layer_id is not None else -1} "
+                        f"count={routed_count}"
+                    )
+                kwargs = dict(kwargs)
+                kwargs.update(
+                    mix_placement=True,
+                    num_logical_experts=routed_count,
+                    num_shared_experts=shared_count,
+                )
+                if not getattr(cls, "_latchmoe_mix_placement_router_announced", False):
+                    print(
+                        "LATCHMOE_BACKEND_COMPAT "
+                        "mix_placement_router_suffix=enabled",
+                        flush=True,
+                    )
+                    cls._latchmoe_mix_placement_router_announced = True
+
         topk_weights, topk_ids = original_select_experts(*args, **kwargs)
         if layer_id is not None:
             runtime = get_moe_offload_runtime()
@@ -3710,12 +3948,58 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
         if layer is None and args:
             layer = args[0]
         old_layer_id = getattr(layer_context, "layer_id", None)
+        old_layer = getattr(layer_context, "layer", None)
         if layer is not None:
+            layer_context.layer = layer
             lid = int(getattr(layer, "layer_id", -1))
             if lid >= 0:
                 layer_context.layer_id = lid
             # lid == -1: layer has no id; skip context so the seam does not
             # collide with other unidentified layers sharing key -1.
+
+        # During EngineCore's profile/dummy run, the upstream quant method can
+        # deliberately replace every top-k ID with a random routed ID to spread
+        # synthetic load. That transformation happens *after* select_experts.
+        # For a mix-placement seam it would overwrite the injected immutable
+        # shared suffix (for example [64, 65]) as well as the routed columns.
+        # Keep profile balancing on native paths, but never mutate a fused
+        # router result that the seam has already materialized and tied to a
+        # registered pinned lane.
+        if layer is not None and bool(kwargs.get("enable_force_load_balance", False)):
+            layer_id = int(getattr(layer, "layer_id", -1))
+            injected = (
+                moe_seam_inject.peek_injected_topk(layer_id)
+                if layer_id >= 0
+                else None
+            )
+            runtime = get_moe_offload_runtime()
+            layout_fn = getattr(runtime, "fused_shared_lane_layout", None)
+            fused_layout = (
+                layout_fn(layer_id)
+                if injected is not None and callable(layout_fn)
+                else None
+            )
+            if fused_layout is not None:
+                kwargs = dict(kwargs)
+                kwargs["enable_force_load_balance"] = False
+                record_event = getattr(runtime, "_record_profile_event", None)
+                if callable(record_event):
+                    injected_ids = injected[1]
+                    shape = getattr(injected_ids, "shape", ())
+                    record_event(
+                        "fused_shared_profile_router_preserved",
+                        layer_id=layer_id,
+                        start=perf_counter(),
+                        payload={
+                            "routed_expert_count": int(
+                                fused_layout.routed_expert_count
+                            ),
+                            "shared_expert_count": int(
+                                fused_layout.shared_expert_count
+                            ),
+                            "topk_width": int(shape[1]) if len(shape) >= 2 else -1,
+                        },
+                    )
         # Naive on-demand staging (no fixed slots): if this layer's experts were
         # offloaded to CPU at load time, stage them to device for this forward
         # and evict right after, so the plain grouped matmul sees device weights.
@@ -3731,6 +4015,10 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                 delattr(layer_context, "layer_id")
             else:
                 layer_context.layer_id = old_layer_id
+            if old_layer is None and hasattr(layer_context, "layer"):
+                delattr(layer_context, "layer")
+            else:
+                layer_context.layer = old_layer
 
     cls.process_weights_after_loading = process_weights_after_loading
     cls.apply = apply

@@ -108,6 +108,355 @@ def test_runtime_patch_install_registers_custom_ops_before_moe_modules(monkeypat
     ]
 
 
+def test_mix_placement_aiter_compat_suppresses_only_parent_constructor(monkeypatch):
+    """Ascend's model-layout shim must not allocate ROCm CUDA AIter buffers."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    original_shared_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled
+    original_fused_enabled = rocm_aiter_ops.is_fused_moe_enabled
+    monkeypatch.setattr(rocm_aiter_ops, "is_fusion_moe_shared_experts_enabled", lambda: True)
+    monkeypatch.setattr(rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+    monkeypatch.setattr(patch_fused_moe, "_ascend_mix_placement_enabled", lambda: True)
+
+    class FakeAscendFusedMoE:
+        def __init__(self, **kwargs):
+            self.shared_probe_in_parent = (
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            )
+            self.fused_probe_in_parent = rocm_aiter_ops.is_fused_moe_enabled()
+            self.n_shared_experts = kwargs["n_shared_experts"]
+
+    fake_module = SimpleNamespace(AscendFusedMoE=FakeAscendFusedMoE)
+    patch_fused_moe._patch_ascend_mix_placement_aiter_compat(fake_module)
+    layer = FakeAscendFusedMoE(n_shared_experts=2)
+
+    assert layer.shared_probe_in_parent is False
+    assert layer.fused_probe_in_parent is False
+    assert layer._latchmoe_mix_placement_aiter_suppressed is True
+    assert rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() is True
+    assert rocm_aiter_ops.is_fused_moe_enabled() is True
+    assert fake_module.AscendFusedMoE._latchmoe_mix_placement_aiter_patch is True
+
+    # Keep the originals reachable for clarity if this test is run without
+    # pytest's monkeypatch teardown during an interactive investigation.
+    assert callable(original_shared_enabled)
+    assert callable(original_fused_enabled)
+
+
+def test_mix_placement_aiter_compat_leaves_external_shared_path_unchanged(monkeypatch):
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_fusion_moe_shared_experts_enabled", lambda: True)
+    monkeypatch.setattr(rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+    monkeypatch.setattr(patch_fused_moe, "_ascend_mix_placement_enabled", lambda: False)
+
+    class FakeAscendFusedMoE:
+        def __init__(self, **kwargs):
+            self.shared_probe_in_parent = (
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            )
+            self.fused_probe_in_parent = rocm_aiter_ops.is_fused_moe_enabled()
+            self.n_shared_experts = kwargs["n_shared_experts"]
+
+    fake_module = SimpleNamespace(AscendFusedMoE=FakeAscendFusedMoE)
+    patch_fused_moe._patch_ascend_mix_placement_aiter_compat(fake_module)
+    layer = FakeAscendFusedMoE(n_shared_experts=2)
+
+    assert layer.shared_probe_in_parent is True
+    assert layer.fused_probe_in_parent is True
+    assert not hasattr(layer, "_latchmoe_mix_placement_aiter_suppressed")
+
+
+def test_mix_placement_aiter_compat_expands_dispatcher_top_k(monkeypatch):
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_fusion_moe_shared_experts_enabled", lambda: True)
+    monkeypatch.setattr(rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+    monkeypatch.setattr(patch_fused_moe, "_ascend_mix_placement_enabled", lambda: True)
+    setup_calls = []
+
+    class FakeAscendFusedMoE:
+        def __init__(self, **kwargs):
+            self.n_shared_experts = kwargs["n_shared_experts"]
+            self.moe_config = SimpleNamespace(experts_per_token=6)
+
+    fake_module = SimpleNamespace(
+        AscendFusedMoE=FakeAscendFusedMoE,
+        setup_moe_comm_method=lambda config: setup_calls.append(config.experts_per_token),
+    )
+    patch_fused_moe._patch_ascend_mix_placement_aiter_compat(fake_module)
+    layer = FakeAscendFusedMoE(n_shared_experts=2)
+
+    assert layer.moe_config.experts_per_token == 8
+    assert layer._latchmoe_mix_placement_dispatch_top_k == 8
+    assert setup_calls == [8]
+
+
+def test_mix_placement_router_compat_appends_shared_suffix_arguments(monkeypatch):
+    """Pinned Ascend must tell its selector about materialized shared rows."""
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+
+    calls = []
+
+    class FakeBaseMethod:
+        def create_weights(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeAscendMethod(FakeBaseMethod):
+        def process_weights_after_loading(self, layer):
+            del layer
+
+        def apply(self, *, layer, **kwargs):
+            return fake_module.select_experts(
+                hidden_states=kwargs["hidden_states"],
+                router_logits=kwargs["router_logits"],
+                num_experts=kwargs["num_experts"],
+            )
+
+    def original_select_experts(**kwargs):
+        calls.append(kwargs)
+        return "weights", "ids"
+
+    fake_module = SimpleNamespace(
+        AscendUnquantizedFusedMoEMethod=FakeAscendMethod,
+        UnquantizedFusedMoEMethod=FakeBaseMethod,
+        select_experts=original_select_experts,
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(offload_stage_seam=False),
+        should_use_fixed_slot_plan_for_layer=lambda _layer_id: False,
+    )
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    patch_fused_moe._patch_unquantized_moe_method(fake_module)
+    layer = SimpleNamespace(layer_id=7, mix_placement=True, n_shared_experts=2)
+    hidden_states = object()
+    router_logits = object()
+    assert FakeAscendMethod().apply(
+        layer=layer,
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        num_experts=64,
+    ) == ("weights", "ids")
+
+    assert calls == [
+        {
+            "hidden_states": hidden_states,
+            "router_logits": router_logits,
+            "num_experts": 64,
+            "mix_placement": True,
+            "num_logical_experts": 64,
+            "num_shared_experts": 2,
+        }
+    ]
+
+
+def test_mix_placement_router_compat_leaves_regular_selector_arguments_unchanged(monkeypatch):
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+
+    calls = []
+
+    class FakeBaseMethod:
+        def create_weights(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeAscendMethod(FakeBaseMethod):
+        def process_weights_after_loading(self, layer):
+            del layer
+
+        def apply(self, *, layer, **kwargs):
+            return fake_module.select_experts(
+                hidden_states=kwargs["hidden_states"],
+                router_logits=kwargs["router_logits"],
+                num_experts=kwargs["num_experts"],
+            )
+
+    def original_select_experts(**kwargs):
+        calls.append(kwargs)
+        return "weights", "ids"
+
+    fake_module = SimpleNamespace(
+        AscendUnquantizedFusedMoEMethod=FakeAscendMethod,
+        UnquantizedFusedMoEMethod=FakeBaseMethod,
+        select_experts=original_select_experts,
+    )
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(offload_stage_seam=False),
+        should_use_fixed_slot_plan_for_layer=lambda _layer_id: False,
+    )
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    patch_fused_moe._patch_unquantized_moe_method(fake_module)
+    layer = SimpleNamespace(layer_id=7, mix_placement=False, n_shared_experts=2)
+    assert FakeAscendMethod().apply(
+        layer=layer,
+        hidden_states=object(),
+        router_logits=object(),
+        num_experts=64,
+    ) == ("weights", "ids")
+
+    assert list(calls[0]) == ["hidden_states", "router_logits", "num_experts"]
+
+
+def test_mix_placement_injected_topk_preserves_shared_suffix_during_profile(monkeypatch):
+    """Profile balancing must not rewrite a fused shared suffix as routed IDs."""
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+
+    class FakeBaseMethod:
+        def create_weights(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeAscendMethod(FakeBaseMethod):
+        def process_weights_after_loading(self, layer):
+            del layer
+
+        def apply(self, *, layer, **kwargs):
+            del layer
+            return kwargs["enable_force_load_balance"]
+
+    profile_events = []
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(offload_stage_seam=False),
+        should_use_fixed_slot_plan_for_layer=lambda _layer_id: False,
+        fused_shared_lane_layout=lambda layer_id: (
+            SimpleNamespace(
+                routed_expert_count=64,
+                shared_expert_count=2,
+            )
+            if layer_id == 7
+            else None
+        ),
+        _record_profile_event=lambda *args, **kwargs: profile_events.append(
+            (args, kwargs)
+        ),
+    )
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+    fake_module = SimpleNamespace(
+        AscendUnquantizedFusedMoEMethod=FakeAscendMethod,
+        UnquantizedFusedMoEMethod=FakeBaseMethod,
+        select_experts=lambda **_kwargs: ("weights", "ids"),
+    )
+    patch_fused_moe._patch_unquantized_moe_method(fake_module)
+
+    topk_ids = SimpleNamespace(shape=(3, 8))
+    moe_seam_inject.set_injected_topk(7, object(), topk_ids)
+    try:
+        assert FakeAscendMethod().apply(
+            layer=SimpleNamespace(layer_id=7),
+            enable_force_load_balance=True,
+        ) is False
+    finally:
+        moe_seam_inject.clear_injected_topk(7)
+
+    assert profile_events[0][0] == ("fused_shared_profile_router_preserved",)
+    assert profile_events[0][1]["layer_id"] == 7
+    assert profile_events[0][1]["payload"] == {
+        "routed_expert_count": 64,
+        "shared_expert_count": 2,
+        "topk_width": 8,
+    }
+
+
+def test_mix_placement_router_parity_compares_appended_shared_suffix(monkeypatch):
+    """The eager router oracle must use the same 6+routed shared ABI as seam."""
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
+    from vllm_moe_offload_ascend.moe_offload import router_parity
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+
+    class FakeBaseMethod:
+        def create_weights(self, *args, **kwargs):
+            del args, kwargs
+
+    class FakeAscendMethod(FakeBaseMethod):
+        def process_weights_after_loading(self, layer):
+            del layer
+
+        def apply(self, *, layer, **kwargs):
+            return fake_module.select_experts(
+                hidden_states=kwargs["hidden_states"],
+                router_logits=kwargs["router_logits"],
+                num_experts=kwargs["num_experts"],
+            )
+
+    calls = []
+    snapshots = []
+    injected_weights = torch.tensor([[0.4, 0.3, 1.0, 1.0]])
+    injected_ids = torch.tensor([[10, 11, 64, 65]], dtype=torch.int32)
+
+    def native_selector(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["mix_placement"] is True
+        assert kwargs["num_logical_experts"] == 64
+        assert kwargs["num_shared_experts"] == 2
+        return injected_weights, injected_ids
+
+    runtime = SimpleNamespace(
+        config=SimpleNamespace(offload_stage_seam=False),
+        should_use_fixed_slot_plan_for_layer=lambda _layer_id: False,
+        fused_shared_lane_layout=lambda layer_id: (
+            SimpleNamespace(routed_expert_count=64, shared_expert_count=2)
+            if layer_id == 7
+            else None
+        ),
+    )
+    fake_module = SimpleNamespace(
+        AscendUnquantizedFusedMoEMethod=FakeAscendMethod,
+        UnquantizedFusedMoEMethod=FakeBaseMethod,
+        select_experts=native_selector,
+    )
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        router_parity,
+        "record_router_snapshot",
+        lambda **kwargs: snapshots.append(kwargs),
+    )
+    monkeypatch.setenv("VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER", "1")
+    patch_fused_moe._patch_unquantized_moe_method(fake_module)
+
+    moe_seam_inject.set_injected_topk(7, injected_weights, injected_ids)
+    try:
+        actual = FakeAscendMethod().apply(
+            layer=SimpleNamespace(layer_id=7),
+            hidden_states=torch.zeros((1, 4)),
+            router_logits=torch.zeros((1, 64)),
+            num_experts=64,
+        )
+    finally:
+        moe_seam_inject.clear_injected_topk(7)
+
+    assert actual == (injected_weights, injected_ids)
+    assert len(calls) == 1
+    assert snapshots == [
+        {
+            "role": "native",
+            "layer_id": 7,
+            "router_logits": calls[0]["router_logits"],
+            "topk_ids": injected_ids,
+            "topk_weights": injected_weights,
+        }
+    ]
+
+
+def test_summarize_fused_shared_ids_is_bounded_and_unique():
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    assert patch_fused_moe._summarize_fused_shared_ids(
+        torch.tensor([[65, 64], [64, 65]], dtype=torch.int32)
+    ) == [64, 65]
+
+
 def test_cann_compat_install_does_not_install_moe_runtime(monkeypatch):
     import importlib
 
