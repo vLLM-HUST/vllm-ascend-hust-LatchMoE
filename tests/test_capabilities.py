@@ -87,16 +87,49 @@ def test_internal_router_and_gated_shared_do_not_depend_on_model_name():
     assert evaluate_support(descriptor).state == "implemented"
 
 
-def test_fused_mix_placement_is_described_but_fail_closed():
+def test_fused_mix_placement_is_described_and_supported_by_its_own_lane():
     descriptor = describe_layer_capability(
-        _layer(n_shared_experts=2, mix_placement=True),
+        _layer(
+            n_shared_experts=2,
+            mix_placement=True,
+            moe_config=SimpleNamespace(
+                # FusedMoE materializes routed + shared rows, while retaining
+                # num_logical_experts as the routed-domain contract.
+                num_experts=66,
+                num_logical_experts=64,
+                dp_size=1,
+                ep_size=1,
+                tp_size=1,
+                pcp_size=1,
+            ),
+        ),
         _runner(),
     )
     support = evaluate_support(descriptor)
 
     assert descriptor.shared_mode == "fused_mix_placement"
-    assert support.state == "unsupported"
-    assert "unsupported_shared_mode:fused_mix_placement" in support.blockers
+    assert descriptor.routed_expert_count == 64
+    assert support.state == "implemented"
+    assert support.blockers == ()
+
+
+def test_fused_mix_placement_derives_routed_count_from_materialized_suffix():
+    descriptor = describe_layer_capability(
+        _layer(
+            n_shared_experts=2,
+            mix_placement=True,
+            moe_config=SimpleNamespace(
+                num_experts=66,
+                dp_size=1,
+                ep_size=1,
+                tp_size=1,
+                pcp_size=1,
+            ),
+        ),
+        _runner(),
+    )
+
+    assert descriptor.routed_expert_count == 64
 
 
 def test_python_router_callable_and_multicard_are_fail_closed():

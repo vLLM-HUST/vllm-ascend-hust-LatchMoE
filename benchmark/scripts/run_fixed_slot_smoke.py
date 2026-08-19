@@ -90,6 +90,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-cache-memory-mb", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument(
+        "--ascend-additional-config-json",
+        default="{}",
+        help=(
+            "JSON object forwarded as vLLM-Ascend additional_config and recorded "
+            "in the smoke summary, for example '{\"mix_placement\": true}'."
+        ),
+    )
+    parser.add_argument(
         "--disable-ascend-norm-quant-fusion",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -163,6 +171,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--layer-boundary-parity requires an eager fixed-slot seam diagnostic")
     if args.wave_prefill and not args.stage_seam:
         parser.error("--wave-prefill requires --stage-seam")
+    try:
+        args.ascend_additional_config = json.loads(
+            args.ascend_additional_config_json
+        )
+    except json.JSONDecodeError as exc:
+        parser.error(f"--ascend-additional-config-json is not valid JSON: {exc.msg}")
+    if not isinstance(args.ascend_additional_config, dict):
+        parser.error("--ascend-additional-config-json must decode to a JSON object")
     return args
 
 
@@ -422,13 +438,16 @@ def _build_llm_kwargs(args: argparse.Namespace, config: dict[str, Any], mode: st
                 "offload_params": _csv_set(args.offload_params),
             }
         )
-    disable_norm_quant = bool(
-        getattr(args, "disable_ascend_norm_quant_fusion", False)
-    )
+    additional_config = dict(getattr(args, "ascend_additional_config", {}) or {})
+    disable_norm_quant = bool(getattr(args, "disable_ascend_norm_quant_fusion", False))
     if disable_norm_quant:
-        kwargs["additional_config"] = {
-            "ascend_compilation_config": {"fuse_norm_quant": False}
-        }
+        compile_config = dict(
+            additional_config.get("ascend_compilation_config") or {}
+        )
+        compile_config["fuse_norm_quant"] = False
+        additional_config["ascend_compilation_config"] = compile_config
+    if additional_config:
+        kwargs["additional_config"] = additional_config
     compilation_config = _smoke_compilation_config(
         mode=mode,
         enforce_eager=bool(args.enforce_eager),
@@ -525,6 +544,7 @@ def run_smoke(
             "disable_ascend_norm_quant_fusion": bool(
                 getattr(args, "disable_ascend_norm_quant_fusion", False)
             ),
+            "ascend_additional_config": llm_kwargs.get("additional_config", {}),
             "load_seconds": load_s,
             "manifest": str(args.manifest),
             "buckets": args.buckets,
@@ -549,6 +569,9 @@ def run_smoke(
                     getattr(args, "layer_boundary_parity", False)
                 ),
                 "wave_prefill": bool(getattr(args, "wave_prefill", False)),
+                "ascend_additional_config": llm_kwargs.get(
+                    "additional_config", {}
+                ),
             },
         }
     )

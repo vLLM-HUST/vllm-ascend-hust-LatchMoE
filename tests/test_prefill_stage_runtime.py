@@ -21,6 +21,22 @@ class TinyLayer(torch.nn.Module):
         )
 
 
+class TinyFusedSharedLayer(torch.nn.Module):
+    """Four routed rows followed by two mix-placement shared rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer_id = 9
+        self.mix_placement = True
+        self.n_shared_experts = 2
+        self.w13_weight = torch.nn.Parameter(
+            torch.arange(6 * 2 * 3, dtype=torch.float32).reshape(6, 2, 3)
+        )
+        self.w2_weight = torch.nn.Parameter(
+            torch.arange(6 * 3 * 2, dtype=torch.float32).reshape(6, 3, 2)
+        )
+
+
 def test_slot_bank_lookup_expert_id_tracks_resident_index():
     bank = ExpertSlotBank(
         2,
@@ -206,6 +222,121 @@ def test_memory_ledger_separates_resident_shared_weights_from_shared_gate():
         shared_gate=shared.expert_gate,
     )
     assert runtime.memory_ledger().total_managed_bytes == ledger.total_managed_bytes
+
+
+def test_fused_shared_lane_pins_suffix_and_offloads_only_routed_rows():
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            release_original_expert_weights=True,
+        )
+    )
+    layer = TinyFusedSharedLayer()
+    original_w13 = layer.w13_weight.detach().clone()
+    original_w2 = layer.w2_weight.detach().clone()
+
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    layout = runtime.fused_shared_lane_layout(layer.layer_id)
+    assert layout is not None
+    assert layout.routed_expert_count == 4
+    assert layout.shared_expert_count == 2
+    assert layout.pinned_logical_ids == (4, 5)
+
+    bank = runtime._slot_banks[layer.layer_id]
+    assert len(bank.slots) == 2
+    assert bank.physical_expert_count == 4
+    assert bank.pinned_slot_ids == (2, 3)
+    assert torch.equal(bank.w13_slots[2:], original_w13[4:])
+    assert torch.equal(bank.w2_slots[2:], original_w2[4:])
+    assert len(runtime._host_store) == 4
+    with pytest.raises(KeyError):
+        runtime._host_store.get(layer.layer_id, 4)
+
+    prepared = runtime.prepare_fixed_slot_plan(
+        layer_id=layer.layer_id,
+        active_experts=(3, 0),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+    assert prepared.physical_expert_count == 4
+    assert prepared.log2phy.tolist() == [1, -1, -1, 0, 2, 3]
+    assert prepared.mapping.slot_to_expert == (3, 0, 4, 5)
+    assert torch.equal(prepared.w1[2:], original_w13[4:])
+
+    with pytest.raises(ValueError, match="out of range"):
+        runtime.prepare_fixed_slot_plan(
+            layer_id=layer.layer_id,
+            active_experts=(4,),
+            num_logical_experts=4,
+            device=torch.device("cpu"),
+        )
+
+    ledger = runtime.memory_ledger()
+    dynamic_row_bytes = (
+        original_w13[0].numel() * original_w13.element_size()
+        + original_w2[0].numel() * original_w2.element_size()
+    )
+    assert ledger.slot_bank_bytes == 2 * dynamic_row_bytes
+    assert ledger.pinned_shared_lane_bytes == 2 * dynamic_row_bytes
+    assert ledger.host_experts == 4
+
+    persisted = runtime.stage_fixed_slot_plan(
+        layer_id=layer.layer_id,
+        active_experts=(3, 0),
+        num_logical_experts=4,
+    )
+    assert persisted.log2phy.tolist() == [1, -1, -1, 0, 2, 3]
+
+    release_plan = runtime.release_original_expert_weights_if_ready(layer)
+    assert release_plan.ready
+    assert layer.w13_weight.numel() == 0
+    captured = runtime.capture_safe_slot_weights(layer_id=layer.layer_id)
+    assert captured is not None
+    assert captured.log2phy.tolist() == [1, -1, -1, 0, 2, 3]
+    assert torch.equal(captured.w2[2:], original_w2[4:])
+
+
+def test_fused_shared_lane_prefill_and_full_layer_keep_pinned_suffix_once():
+    runtime = MoeOffloadRuntime(MoeOffloadConfig(enabled=True, num_slots=2))
+    layer = TinyFusedSharedLayer()
+    original_w13 = layer.w13_weight.detach().clone()
+    original_w2 = layer.w2_weight.detach().clone()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+
+    staged, _, payload = runtime.prepare_prefill_stage_plan(
+        layer_id=layer.layer_id,
+        active_experts=(1, 3),
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+        buffer_index=0,
+        async_load=False,
+    )
+    assert staged.physical_expert_count == 4
+    assert staged.log2phy.tolist() == [-1, 0, -1, 1, 2, 3]
+    assert staged.mapping.slot_to_expert == (1, 3, 4, 5)
+    assert torch.equal(staged.w1[2:], original_w13[4:])
+    assert torch.equal(staged.w2[2:], original_w2[4:])
+    assert payload["miss_experts"] == [1, 3]
+    assert payload["h2d_bytes"] == 2 * (
+        original_w13[0].numel() * original_w13.element_size()
+        + original_w2[0].numel() * original_w2.element_size()
+    )
+
+    full, full_payload = runtime.prepare_full_layer_prefill_plan(
+        layer_id=layer.layer_id,
+        num_logical_experts=4,
+        device=torch.device("cpu"),
+    )
+    assert full.physical_expert_count == 6
+    assert full.log2phy.tolist() == [0, 1, 2, 3, 4, 5]
+    assert full.mapping.active_experts == (0, 1, 2, 3)
+    assert full.mapping.slot_to_expert == (0, 1, 2, 3, 4, 5)
+    assert torch.equal(full.w1, original_w13)
+    assert torch.equal(full.w2, original_w2)
+    assert full_payload["routed_expert_count"] == 4
+    assert full_payload["pinned_shared_expert_count"] == 2
 
 
 def test_memory_ledger_unwraps_vllm_shared_experts_adapter():

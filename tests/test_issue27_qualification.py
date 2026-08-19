@@ -161,6 +161,63 @@ def test_wave_prefill_configures_profile_shape_hint(monkeypatch):
     assert os.environ["VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT"] == "1"
 
 
+def test_fused_shared_verifier_requires_pinned_layout_and_once_event(
+    tmp_path: Path,
+):
+    verifier = _load(VERIFY_PATH, "issue25_verify_fused_test")
+    unit = tmp_path / "overflow-graph"
+    unit.mkdir()
+    records = [
+        {
+            "name": "register_layer_for_fixed_slots",
+            "layer_id": 3,
+            "payload": {
+                "routed_expert_count": 64,
+                "pinned_shared_expert_count": 2,
+                "pinned_shared_logical_ids": [64, 65],
+            },
+        },
+        {
+            "name": "fused_shared_b2_once",
+            "layer_id": 3,
+            "payload": {
+                "shared_pair_execution_count": 1,
+                "shared_pairs": 8,
+                "routed_pairs": 24,
+            },
+        },
+    ]
+    (unit / "moe_offload_profile.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    lane_passed, lane_detail = verifier._fused_shared_lane_gate(
+        unit,
+        expected_routed_experts=64,
+        expected_shared_experts=2,
+    )
+    once_passed, once_detail = verifier._fused_shared_once_gate(unit)
+
+    assert lane_passed is True
+    assert lane_detail["registrations"] == 1
+    assert once_passed is True
+    assert once_detail["events"] == 1
+
+    records[0]["payload"]["pinned_shared_logical_ids"] = [63, 64]
+    (unit / "moe_offload_profile.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    lane_passed, lane_detail = verifier._fused_shared_lane_gate(
+        unit,
+        expected_routed_experts=64,
+        expected_shared_experts=2,
+    )
+    assert lane_passed is False
+    assert lane_detail["failures"][0]["actual"]["pinned_shared_logical_ids"] == [63, 64]
+
+
 def test_qualification_runner_uses_capacity_bounded_default_slots(
     monkeypatch,
 ):
@@ -182,6 +239,40 @@ def test_qualification_runner_uses_capacity_bounded_default_slots(
     )
 
     assert runner._parse_args().num_slots == 32
+
+
+def test_qualification_runner_propagates_ascend_additional_config(monkeypatch):
+    runner = _load(RUNNER_PATH, "issue25_runner_config_test")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_issue27_qualification.py",
+            "--model-id",
+            "deepseek-v2-lite",
+            "--model-path",
+            "/tmp/model",
+            "--output-root",
+            "/tmp/output",
+            "--device",
+            "5",
+            "--ascend-additional-config-json",
+            '{"mix_placement": true}',
+        ],
+    )
+
+    args = runner._parse_args()
+    command = runner._base_command(
+        args,
+        Path("/tmp/unit"),
+        mode="fixed_slot_sync",
+        prompt="Hi",
+        output_tokens=1,
+        slots=4,
+    )
+
+    index = command.index("--ascend-additional-config-json")
+    assert json.loads(command[index + 1]) == {"mix_placement": True}
 
 
 def test_capacity_limited_native_oracle_is_explicitly_classified(tmp_path: Path):
