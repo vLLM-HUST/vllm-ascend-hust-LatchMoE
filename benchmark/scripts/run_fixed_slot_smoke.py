@@ -48,8 +48,18 @@ SEW_OFFLOAD_ENV_VARS = (
     "VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS",
     "VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS",
     "VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME",
+    "VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE",
     "VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD",
     "VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH",
+    "VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM",
+    "VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD",
+    "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER",
+    "VLLM_ASCEND_MOE_OFFLOAD_COMPARE_LAYER_BOUNDARY",
+    "VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL",
+    "VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE",
+    "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT",
+    "VLLM_ASCEND_MOE_ROUTER_PARITY_PATH",
+    "VLLM_ASCEND_MOE_ROUTER_PARITY_MAX_TOKENS",
 )
 
 
@@ -86,12 +96,43 @@ def parse_args() -> argparse.Namespace:
         help="Disable vLLM and Ascend norm-quant compiler passes for CANN compatibility probes.",
     )
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--diagnostic-eager",
+        action="store_true",
+        help="Allow eager execution only for an explicitly labelled qualification diagnostic.",
+    )
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-slots", type=int, default=16)
     parser.add_argument("--resident-layer-ids", default="")
     parser.add_argument("--release-original-expert-weights", action="store_true")
     parser.add_argument("--layered-runtime", action="store_true")
     parser.add_argument("--fanout-threshold", type=int, default=0)
+    parser.add_argument(
+        "--stage-seam",
+        action="store_true",
+        help="Enable the graph splitting seam for a fixed-slot qualification run.",
+    )
+    parser.add_argument(
+        "--cpu-first-load",
+        action="store_true",
+        help="Load routed expert weights CPU-first before fixed-slot registration.",
+    )
+    parser.add_argument(
+        "--router-parity",
+        action="store_true",
+        help="Capture bounded native and seam router snapshots in eager diagnostics.",
+    )
+    parser.add_argument("--router-parity-max-tokens", type=int, default=64)
+    parser.add_argument(
+        "--layer-boundary-parity",
+        action="store_true",
+        help="Compare native and seam MoE tuple outputs in eager diagnostics.",
+    )
+    parser.add_argument(
+        "--wave-prefill",
+        action="store_true",
+        help="Enable the multi-wave prefill qualification path.",
+    )
     parser.add_argument("--offload-backend", default="prefetch")
     parser.add_argument("--offload-group-size", type=int, default=4)
     parser.add_argument("--offload-num-in-group", type=int, default=1)
@@ -108,8 +149,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
-    if args.enforce_eager:
-        parser.error("--enforce-eager is forbidden for graph-only LatchMoE runs")
+    if args.enforce_eager and not args.diagnostic_eager:
+        parser.error("--enforce-eager requires --diagnostic-eager")
+    if args.diagnostic_eager and not args.enforce_eager:
+        parser.error("--diagnostic-eager requires --enforce-eager")
+    if args.stage_seam and args.mode != "fixed_slot_sync":
+        parser.error("--stage-seam requires --mode fixed_slot_sync")
+    if args.cpu_first_load and not args.stage_seam:
+        parser.error("--cpu-first-load requires --stage-seam")
+    if args.router_parity and (not args.stage_seam or not args.diagnostic_eager):
+        parser.error("--router-parity requires an eager fixed-slot seam diagnostic")
+    if args.layer_boundary_parity and (not args.stage_seam or not args.diagnostic_eager):
+        parser.error("--layer-boundary-parity requires an eager fixed-slot seam diagnostic")
+    if args.wave_prefill and not args.stage_seam:
+        parser.error("--wave-prefill requires --stage-seam")
     return args
 
 
@@ -176,6 +229,7 @@ def configure_sew_offload_env(
     mode: str,
     *,
     num_slots: int,
+    max_num_seqs_hint: int | None = None,
     resident_layer_ids: str = "",
     release_original_expert_weights: bool = False,
     layered_runtime: bool = False,
@@ -204,7 +258,16 @@ def configure_sew_offload_env(
         "1" if release_original_expert_weights else "0"
     )
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_LAYERED_RUNTIME"] = "1" if layered_runtime else "0"
+    os.environ["VLLM_ASCEND_MOE_OFFLOAD_GRAPH_COMPATIBLE"] = (
+        "1" if mode == "fixed_slot_sync" else "0"
+    )
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_FANOUT_THRESHOLD"] = str(int(fanout_threshold))
+    if max_num_seqs_hint is not None:
+        if int(max_num_seqs_hint) <= 0:
+            raise ValueError("max_num_seqs_hint must be greater than zero")
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT"] = str(
+            int(max_num_seqs_hint)
+        )
     os.environ.setdefault("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH", "moe_offload_profile.jsonl")
 
 
@@ -393,12 +456,35 @@ def run_smoke(
     configure_sew_offload_env(
         mode,
         num_slots=args.num_slots,
+        max_num_seqs_hint=(
+            int(args.max_num_seqs)
+            if bool(getattr(args, "wave_prefill", False))
+            else None
+        ),
         resident_layer_ids=getattr(args, "resident_layer_ids", ""),
         release_original_expert_weights=getattr(args, "release_original_expert_weights", False),
         layered_runtime=getattr(args, "layered_runtime", False),
         fanout_threshold=getattr(args, "fanout_threshold", 0),
         trace_path=str(trace_jsonl_path),
     )
+    router_parity_path = output_dir / "moe_router_parity.jsonl"
+    if bool(getattr(args, "stage_seam", False)):
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_STAGE_SEAM"] = "1"
+    if bool(getattr(args, "cpu_first_load", False)):
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD"] = "1"
+    if bool(getattr(args, "router_parity", False)):
+        if router_parity_path.exists():
+            router_parity_path.unlink()
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_COMPARE_ROUTER"] = "1"
+        os.environ["VLLM_ASCEND_MOE_ROUTER_PARITY_PATH"] = str(router_parity_path)
+        os.environ["VLLM_ASCEND_MOE_ROUTER_PARITY_MAX_TOKENS"] = str(
+            max(1, int(getattr(args, "router_parity_max_tokens", 64)))
+        )
+    if bool(getattr(args, "layer_boundary_parity", False)):
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_COMPARE_LAYER_BOUNDARY"] = "1"
+    if bool(getattr(args, "wave_prefill", False)):
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL"] = "1"
+        os.environ["VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE"] = "multi_wave"
     if mode != "no_offload":
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH"] = str(profile_jsonl_path)
         # vLLM selects a single platform plugin; explicitly install LatchMoE hooks.
@@ -432,6 +518,9 @@ def run_smoke(
             "model": llm_kwargs["model"],
             "num_slots": int(args.num_slots) if mode == "fixed_slot_sync" else 0,
             "layered_runtime": bool(getattr(args, "layered_runtime", False)) if mode == "fixed_slot_sync" else False,
+            "graph_compatible_offload": bool(
+                mode == "fixed_slot_sync"
+            ),
             "fanout_threshold": int(getattr(args, "fanout_threshold", 0)) if mode == "fixed_slot_sync" else 0,
             "disable_ascend_norm_quant_fusion": bool(
                 getattr(args, "disable_ascend_norm_quant_fusion", False)
@@ -442,6 +531,25 @@ def run_smoke(
             "moe_offload_profile": get_moe_offload_runtime().profiling_summary(),
             "moe_offload_profile_jsonl": str(profile_jsonl_path),
             "moe_offload_profile_jsonl_events": _read_profile_jsonl(profile_jsonl_path),
+            "qualification_diagnostics": {
+                "diagnostic_eager": bool(getattr(args, "diagnostic_eager", False)),
+                "stage_seam": bool(getattr(args, "stage_seam", False)),
+                "cpu_first_load": bool(getattr(args, "cpu_first_load", False)),
+                "release_original_expert_weights": bool(
+                    getattr(args, "release_original_expert_weights", False)
+                ),
+                "graph_compatible_offload": bool(mode == "fixed_slot_sync"),
+                "router_parity": bool(getattr(args, "router_parity", False)),
+                "router_parity_artifact": (
+                    str(router_parity_path)
+                    if bool(getattr(args, "router_parity", False))
+                    else None
+                ),
+                "layer_boundary_parity": bool(
+                    getattr(args, "layer_boundary_parity", False)
+                ),
+                "wave_prefill": bool(getattr(args, "wave_prefill", False)),
+            },
         }
     )
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

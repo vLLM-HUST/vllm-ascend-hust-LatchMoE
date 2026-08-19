@@ -18,10 +18,13 @@
 from __future__ import annotations
 
 import ctypes
+import importlib
+import inspect
 import os
 import sys
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -194,6 +197,32 @@ def _is_current_graph_capturing() -> bool:
         )
 
         return bool(runtime_is_current_graph_capturing())
+    except Exception:
+        return False
+
+
+def _is_moe_offload_profile_run_active() -> bool:
+    """Return the explicit vLLM profile/dummy-run marker, if installed."""
+
+    try:
+        from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+            is_moe_offload_profile_run_active,
+        )
+
+        return bool(is_moe_offload_profile_run_active())
+    except Exception:
+        return False
+
+
+def _is_moe_offload_graph_warmup_active() -> bool:
+    """Return the scoped graph warm-up marker, if the runner patch is installed."""
+
+    try:
+        from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+            is_moe_offload_graph_warmup_active,
+        )
+
+        return bool(is_moe_offload_graph_warmup_active())
     except Exception:
         return False
 
@@ -438,29 +467,42 @@ def _patch_rms_norm_bias_cann_compat() -> None:
     except Exception:
         layernorm = None
 
-    cls = getattr(layernorm, "AscendRMSNorm", None)
-    original = getattr(cls, "forward_oot", None)
-    if (
-        cls is not None
-        and callable(original)
-        and not getattr(original, "_latchmoe_cann_rmsnorm_compat", False)
+    for class_name, is_gemma in (
+        ("AscendRMSNorm", False),
+        ("AscendGemmaRMSNorm", True),
     ):
+        cls = getattr(layernorm, class_name, None)
+        original = getattr(cls, "forward_oot", None)
+        if (
+            cls is None
+            or not callable(original)
+            or getattr(original, "_latchmoe_cann_rmsnorm_compat", False)
+        ):
+            continue
 
-        def _forward_oot(self, x, residual=None):
+        def _forward_oot(
+            self,
+            x,
+            residual=None,
+            *,
+            _original=original,
+            _is_gemma=is_gemma,
+        ):
             if residual is None:
-                return original(self, x, residual)
+                return _original(self, x, residual)
 
             import torch
             import torch_npu
 
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
+            weight = 1.0 + self.weight if _is_gemma else self.weight
             x, _, residual = torch_npu.npu_add_rms_norm(
                 x,
                 residual,
-                self.weight,
+                weight,
                 self.variance_epsilon,
             )
-            if self.bias is not None:
+            if not _is_gemma and self.bias is not None:
                 x.add_(self.bias)
             return x, residual
 
@@ -547,6 +589,7 @@ def apply_cann_compat_patches() -> None:
 def apply_patches() -> None:
     # 0. Eagerly write env defaults so spawned worker processes see them.
     _apply_env_defaults_from_gb()
+    _bootstrap_gdn_custom_op_vendor_env()
 
     _patch_adapt_patch_reinstall()
     _install_runtime_patches_when_ready()
@@ -573,6 +616,10 @@ def _install_runtime_patches_when_ready() -> bool:
 
     if _ascend_device_op_is_initializing():
         return False
+
+    # Retry after the Ascend package has completed lazy extension discovery.
+    # This is harmless when the platform bootstrap already configured it.
+    _bootstrap_gdn_custom_op_vendor_env()
 
     # The parent ops package may already be cached from the guarded partial
     # import, so import the registration module explicitly before loading MoE
@@ -618,9 +665,307 @@ def _patch_adapt_patch_reinstall() -> None:
     _utils.adapt_patch = adapt_patch
 
 
+def _patch_model_runner_profile_context() -> None:
+    """Mark only vLLM's ``_dummy_run(is_profile=True)`` as profile execution.
+
+    Profile forwards often omit serving attention metadata, so phase inference
+    alone cannot distinguish them from a short decode. vLLM and vLLM-Ascend
+    runners carry the explicit ``is_profile`` argument; wrap that narrow
+    boundary and scope the marker to the dummy forward.
+    """
+
+    runner_modules = (
+        ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner"),
+        ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner"),
+        # NPUModelRunner overrides _dummy_run, so wrapping only vLLM's base
+        # class misses the actual Ascend profile forward.
+        ("vllm_ascend.worker.model_runner_v1", "NPUModelRunner"),
+        ("vllm_ascend.worker.v2.model_runner", "NPUModelRunner"),
+        ("vllm_ascend._310p.model_runner_310p", "NPUModelRunner310"),
+    )
+    for module_name, class_name in runner_modules:
+        try:
+            module = importlib.import_module(module_name)
+            cls = getattr(module, class_name)
+            current = getattr(cls, "_dummy_run")
+        except Exception:
+            continue
+        if not callable(current) or getattr(
+            current,
+            "_latchmoe_profile_context_patch",
+            False,
+        ):
+            continue
+        try:
+            signature = inspect.signature(current)
+        except (TypeError, ValueError):
+            signature = None
+
+        def _dummy_run_with_profile_context(
+            self,
+            *args,
+            _original=current,
+            _signature=signature,
+            **kwargs,
+        ):
+            is_profile = bool(kwargs.get("is_profile", False))
+            if not is_profile and _signature is not None:
+                try:
+                    bound = _signature.bind_partial(self, *args, **kwargs)
+                    is_profile = bool(bound.arguments.get("is_profile", False))
+                except TypeError:
+                    pass
+            if not is_profile:
+                return _original(self, *args, **kwargs)
+
+            from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+                reset_moe_offload_profile_run_active,
+                set_moe_offload_profile_run_active,
+            )
+
+            token = set_moe_offload_profile_run_active(True)
+            try:
+                return _original(self, *args, **kwargs)
+            finally:
+                reset_moe_offload_profile_run_active(token)
+
+        _dummy_run_with_profile_context._latchmoe_profile_context_patch = True
+        _dummy_run_with_profile_context.__wrapped__ = current
+        cls._dummy_run = _dummy_run_with_profile_context
+
+
+def _patch_model_runner_graph_warmup_context() -> None:
+    """Mark graph warm-up without changing serving or profile-run semantics.
+
+    vLLM invokes ``_dummy_run(is_profile=False)`` while ``capture_model`` builds
+    PIECEWISE graphs. The stage seam has no serving phase metadata there, so an
+    overflowing active union previously took the decode-safe fixed-slot path and
+    failed before capture. The context is scoped to ``capture_model`` only; the
+    stage op still sees actual stream capture and remains a no-op at that point.
+    """
+
+    runner_modules = (
+        ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner"),
+        ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner"),
+        ("vllm_ascend.worker.model_runner_v1", "NPUModelRunner"),
+        ("vllm_ascend.worker.v2.model_runner", "NPUModelRunner"),
+        ("vllm_ascend._310p.model_runner_310p", "NPUModelRunner310"),
+    )
+    for module_name, class_name in runner_modules:
+        try:
+            module = importlib.import_module(module_name)
+            cls = getattr(module, class_name)
+            current = getattr(cls, "capture_model")
+        except Exception:
+            continue
+        if not callable(current) or getattr(
+            current,
+            "_latchmoe_graph_warmup_context_patch",
+            False,
+        ):
+            continue
+
+        def _capture_model_with_graph_warmup_context(
+            self,
+            *args,
+            _original=current,
+            **kwargs,
+        ):
+            from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
+                reset_moe_offload_graph_warmup_active,
+                set_moe_offload_graph_warmup_active,
+            )
+
+            token = set_moe_offload_graph_warmup_active(True)
+            try:
+                return _original(self, *args, **kwargs)
+            finally:
+                reset_moe_offload_graph_warmup_active(token)
+
+        _capture_model_with_graph_warmup_context._latchmoe_graph_warmup_context_patch = True
+        _capture_model_with_graph_warmup_context.__wrapped__ = current
+        cls.capture_model = _capture_model_with_graph_warmup_context
+
+
+_GDN_CAUSAL_CONV1D_OP_NAME = "npu_causal_conv1d_custom"
+_GDN_CAUSAL_CONV1D_TENSOR_ARGS = (
+    "query_start_loc_opt",
+    "cache_indices_opt",
+    "initial_state_mode_opt",
+    "num_accepted_tokens_opt",
+)
+_GDN_CUSTOM_OP_VENDOR_ENV = "ASCEND_CUSTOM_OPP_PATH"
+_GDN_CUSTOM_OP_VENDOR_RELATIVE_PATH = Path(
+    "_cann_ops_custom/vendors/custom_transformer"
+)
+_GDN_CUSTOM_OP_VENDOR_LIBRARY = Path("op_api/lib/libcust_opapi.so")
+
+
+def _gdn_extension_custom_op_vendor() -> Path | None:
+    """Find custom-op assets adjacent to the registered Ascend extension.
+
+    Some deployment overlays keep Python sources in one editable checkout and
+    the compiled ``vllm_ascend_C`` extension in another. vLLM-Ascend's normal
+    bootstrap derives the vendor directory only from the source module, which
+    leaves its custom CausalConv1d symbols undiscoverable in that layout.
+    The extension is the authoritative owner of the matching op binary.
+    """
+
+    try:
+        spec = importlib.util.find_spec("vllm_ascend.vllm_ascend_C")
+    except (ImportError, AttributeError, ValueError):
+        return None
+    origin = getattr(spec, "origin", None)
+    if not origin or origin in {"built-in", "frozen"}:
+        return None
+    vendor = Path(origin).resolve().parent / _GDN_CUSTOM_OP_VENDOR_RELATIVE_PATH
+    if (vendor / _GDN_CUSTOM_OP_VENDOR_LIBRARY).is_file():
+        return vendor
+    return None
+
+
+def _bootstrap_gdn_custom_op_vendor_env() -> bool:
+    """Expose extension-owned CausalConv1d assets to the Ascend op resolver.
+
+    Only ``ASCEND_CUSTOM_OPP_PATH`` is required: the custom-op resolver opens
+    its vendor library from that directory. Avoiding an ``LD_LIBRARY_PATH``
+    mutation keeps the process-wide loader precedence unchanged.
+    """
+
+    vendor = _gdn_extension_custom_op_vendor()
+    if vendor is None:
+        return False
+    value = str(vendor)
+    entries = [entry for entry in os.environ.get(_GDN_CUSTOM_OP_VENDOR_ENV, "").split(":") if entry]
+    if value in entries:
+        return False
+    os.environ[_GDN_CUSTOM_OP_VENDOR_ENV] = ":".join((value, *entries))
+    print("LATCHMOE_BACKEND_COMPAT gdn_custom_opp=extension_vendor", flush=True)
+    return True
+
+
+def _gdn_causal_conv1d_schema_uses_tensor_args(operator: object) -> bool:
+    """Return whether a registered GDN conv1d op uses the newer Tensor ABI.
+
+    The pinned Python frontend represents the four dynamic GDN arguments as
+    host tuples, while newer custom-op binaries accept optional device Tensors.
+    The schema is the only safe source of truth because both binary versions
+    can be present in supported environments.
+    """
+
+    schema = getattr(operator, "_schema", None)
+    if schema is None:
+        default = getattr(operator, "default", None)
+        schema = getattr(default, "_schema", None)
+    if schema is None:
+        return False
+    normalized = "".join(str(schema).split())
+    return all(
+        f"Tensor?{argument}" in normalized
+        for argument in _GDN_CAUSAL_CONV1D_TENSOR_ARGS
+    )
+
+
+def _gdn_causal_conv1d_tensor_arg(value: object, reference: object, torch_module: object) -> object:
+    """Convert legacy host arguments to the Tensor ABI without touching tuples.
+
+    The original tuples remain available to vLLM-Ascend's graph-update code.
+    Conversion occurs immediately before dispatching the custom op, where the
+    newer ABI requires device tensors. Empty legacy lists mean "not supplied"
+    and map to ``None``, matching the newer frontend.
+    """
+
+    if value is None:
+        return None
+    tensor_type = getattr(torch_module, "Tensor")
+    if isinstance(value, tensor_type):
+        if int(value.numel()) == 0:
+            return None
+        return value.to(device=reference.device, dtype=torch_module.int64)
+    if isinstance(value, (tuple, list)) and len(value) == 0:
+        return None
+    return torch_module.tensor(value, device=reference.device, dtype=torch_module.int64)
+
+
+def _patch_gdn_causal_conv1d_tensor_abi(torch_module: object | None = None) -> bool:
+    """Adapt only a detected Tensor-ABI GDN op to the pinned tuple frontend.
+
+    This is intentionally an operator boundary adapter rather than a rewrite of
+    ``vllm_ascend.ops.gdn``: graph bookkeeping keeps its tuple arithmetic and
+    only the final call receives the representation required by the loaded
+    binary. The patch is a no-op for the older ``int[]`` schema.
+    """
+
+    if torch_module is None:
+        import torch as torch_module
+
+    try:
+        namespace = torch_module.ops._C_ascend
+        original = getattr(namespace, _GDN_CAUSAL_CONV1D_OP_NAME)
+    except (AttributeError, RuntimeError):
+        return False
+    if getattr(original, "_latchmoe_gdn_tensor_abi_patch", False):
+        return True
+    if not _gdn_causal_conv1d_schema_uses_tensor_args(original):
+        return False
+
+    def _tensor_abi_adapter(output, x, weight, *args, **kwargs):
+        positional = list(args)
+        # The three explicit positional arguments are followed by conv_state,
+        # bias_opt, then the four ABI-sensitive arguments.
+        for index, argument in enumerate(_GDN_CAUSAL_CONV1D_TENSOR_ARGS, start=2):
+            if index < len(positional):
+                positional[index] = _gdn_causal_conv1d_tensor_arg(
+                    positional[index], x, torch_module
+                )
+        converted_kwargs = dict(kwargs)
+        for argument in _GDN_CAUSAL_CONV1D_TENSOR_ARGS:
+            if argument in converted_kwargs:
+                converted_kwargs[argument] = _gdn_causal_conv1d_tensor_arg(
+                    converted_kwargs[argument], x, torch_module
+                )
+        return original(output, x, weight, *positional, **converted_kwargs)
+
+    _tensor_abi_adapter._latchmoe_gdn_tensor_abi_patch = True
+    _tensor_abi_adapter.__wrapped__ = original
+    setattr(namespace, _GDN_CAUSAL_CONV1D_OP_NAME, _tensor_abi_adapter)
+    print("LATCHMOE_BACKEND_COMPAT gdn_causal_conv1d=tensor_abi", flush=True)
+    return True
+
+
+def _patch_gdn_causal_conv1d_tensor_abi_when_loaded() -> None:
+    """Retry the ABI patch at the first GDN core call after lazy op loading."""
+
+    try:
+        gdn_module = importlib.import_module("vllm_ascend.ops.gdn")
+        attention_class = getattr(gdn_module, "AscendGatedDeltaNetAttention")
+        current = getattr(attention_class, "_forward_core")
+    except Exception:
+        return
+    if getattr(current, "_latchmoe_gdn_tensor_abi_retry_patch", False):
+        return
+    original = current
+
+    def _forward_core_with_tensor_abi(self, *args, **kwargs):
+        _patch_gdn_causal_conv1d_tensor_abi()
+        # Custom-op registration is complete by the first forward. Avoid a
+        # per-layer compatibility probe after that point.
+        attention_class._forward_core = original
+        return original(self, *args, **kwargs)
+
+    _forward_core_with_tensor_abi._latchmoe_gdn_tensor_abi_retry_patch = True
+    _forward_core_with_tensor_abi.__wrapped__ = original
+    attention_class._forward_core = _forward_core_with_tensor_abi
+
+
 def _install_runtime_module_patches() -> None:
     from vllm_moe_offload_ascend.moe_offload.runtime import get_moe_offload_runtime, MoeOffloadDecisionPath
     from vllm_moe_offload_ascend.moe_offload.pipeline import get_moe_pipeline_profiler
+
+    _patch_model_runner_profile_context()
+    _patch_model_runner_graph_warmup_context()
+    _patch_gdn_causal_conv1d_tensor_abi()
+    _patch_gdn_causal_conv1d_tensor_abi_when_loaded()
 
     try:
         import vllm_ascend.ops.fused_moe.moe_comm_method as _comm
@@ -1193,7 +1538,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         if offload is None or not offload.enabled:
             return None
         runtime = get_moe_offload_runtime()
-        if not runtime.config.b2_wave_prefill:
+        profile_adaptive_wave = _is_moe_offload_profile_run_active()
+        graph_warmup_adaptive_wave = _is_moe_offload_graph_warmup_active()
+        adaptive_wave_context = profile_adaptive_wave or graph_warmup_adaptive_wave
+        if not runtime.config.b2_wave_prefill and not adaptive_wave_context:
             return None
         if _is_current_graph_capturing():
             return None
@@ -1226,12 +1574,18 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             return None
         if not runtime.should_use_fixed_slot_plan_for_layer(int(offload.layer_id)):
             return None
-        route_stats = runtime.consume_prefill_route_stats_record(
-            layer_id=int(offload.layer_id),
-            topk_ids=fused_experts_input.topk_ids,
-        ) if _to_bool_env(
-            "VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0"
-        ) else None
+        route_stats_cache_enabled = (
+            adaptive_wave_context
+            or _to_bool_env("VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0")
+        )
+        route_stats = (
+            runtime.consume_prefill_route_stats_record(
+                layer_id=int(offload.layer_id),
+                topk_ids=fused_experts_input.topk_ids,
+            )
+            if route_stats_cache_enabled
+            else None
+        )
         route_stats_cache_hit = route_stats is not None
         max_num_seqs_hint = int(
             getattr(runtime.config, "max_num_seqs_hint", 0) or 0
@@ -1241,7 +1595,12 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             and max_num_seqs_hint > 0
             and int(fused_experts_input.topk_ids.shape[0]) > max_num_seqs_hint
         )
-        if phase_is_prefill is None and route_stats is None and not unknown_prefill_candidate:
+        if (
+            phase_is_prefill is None
+            and route_stats is None
+            and not unknown_prefill_candidate
+            and not adaptive_wave_context
+        ):
             return None
         token_counts = (
             dict(route_stats.token_counts_by_expert)
@@ -1261,7 +1620,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             active_expert_count=active_expert_count,
         )
         b2_overflow_handoff = (
-            (route_stats is not None or unknown_prefill_candidate)
+            (
+                adaptive_wave_context
+                or route_stats is not None
+                or unknown_prefill_candidate
+            )
             and active_expert_count > int(runtime.config.num_slots)
         )
         if not (b2_phase_match or b2_overflow_handoff):
@@ -1272,6 +1635,8 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             "token_count_ms": token_count_ms,
             "route_stats_cache_hit": route_stats_cache_hit,
             "forward_phase": str(forward_phase),
+            "profile_adaptive_wave": profile_adaptive_wave,
+            "graph_warmup_adaptive_wave": graph_warmup_adaptive_wave,
             "pair_offsets_by_expert": (
                 route_stats.pair_offsets_by_expert
                 if route_stats is not None
@@ -3403,27 +3768,55 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             )
         )
         native_routed_out = None
+        real_name = self.layer_name
+        original_weights_unavailable = bool(
+            getattr(runtime.config, "cpu_first_load", False)
+            or getattr(runtime.config, "release_original_expert_weights", False)
+        )
         if compare_layer_boundary:
-            with runtime.suspend_fixed_slot_execution():
+            if original_weights_unavailable:
+                # CPU-first/release qualification deliberately removes the full
+                # routed expert tensor. Compare the native runner and seam using
+                # the same staged fixed-slot values instead of reading CPU or
+                # zero-element placeholders through grouped matmul.
+                topk_weights, topk_ids = torch.ops.vllm.moe_router_indirect(
+                    hidden_states,
+                    router_logits,
+                    real_name,
+                )
+                torch.ops.vllm.moe_offload_stage(
+                    topk_ids,
+                    self._seam_layer_id,
+                    self._seam_num_logical_experts,
+                    phase_int,
+                )
                 native_result = _native_moe_forward(
                     native_hidden_states=hidden_states.clone(),
                     native_router_logits=router_logits.clone(),
                     native_layer_name=self.layer_name,
                 )
-                if isinstance(native_result, tuple):
-                    native_routed_out = (
-                        native_result[0].clone(),
-                        native_result[1].clone(),
+            else:
+                with runtime.suspend_fixed_slot_execution():
+                    native_result = _native_moe_forward(
+                        native_hidden_states=hidden_states.clone(),
+                        native_router_logits=router_logits.clone(),
+                        native_layer_name=self.layer_name,
                     )
-                else:
-                    native_routed_out = native_result.clone()
+            if isinstance(native_result, tuple):
+                native_routed_out = (
+                    native_result[0].clone(),
+                    native_result[1].clone(),
+                )
+            else:
+                native_routed_out = native_result.clone()
 
-        real_name = self.layer_name
-        topk_weights, topk_ids = torch.ops.vllm.moe_router_indirect(
-            hidden_states,
-            router_logits,
-            real_name,
-        )
+        if not compare_layer_boundary or not original_weights_unavailable:
+            topk_weights, topk_ids = torch.ops.vllm.moe_router_indirect(
+                hidden_states,
+                router_logits,
+                real_name,
+            )
+
         torch.ops.vllm.moe_offload_stage(
             topk_ids,
             self._seam_layer_id,
@@ -3462,20 +3855,35 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             and not _is_torch_compile_tracing()
             and not _is_current_graph_capturing()
         ):
+            native_has_shared = isinstance(native_routed_out, tuple)
+            seam_has_shared = isinstance(routed_out, tuple)
             native_compare = (
                 native_routed_out[1]
-                if isinstance(native_routed_out, tuple)
+                if native_has_shared
                 else native_routed_out
             )
-            routed_compare = routed_out[1] if isinstance(routed_out, tuple) else routed_out
+            routed_compare = routed_out[1] if seam_has_shared else routed_out
             output_diff = (native_compare.float() - routed_compare.float()).abs()
+            shared_diagnostic = "shared_contract_equal=True"
+            if native_has_shared and seam_has_shared:
+                native_shared = native_routed_out[0]
+                seam_shared = routed_out[0]
+                shared_diff = (native_shared.float() - seam_shared.float()).abs()
+                shared_diagnostic = (
+                    f"shared_equal={bool(torch.equal(native_shared, seam_shared))} "
+                    f"shared_max_abs={float(shared_diff.max().item())} "
+                    f"shared_mean_abs={float(shared_diff.mean().item())}"
+                )
+            elif native_has_shared or seam_has_shared:
+                shared_diagnostic = "shared_contract_equal=False"
             print(
                 "SEW_LAYER_BOUNDARY_COMPARE "
                 f"layer={int(self._seam_layer_id)} "
                 f"tokens={int(hidden_states.shape[0])} "
                 f"output_equal={bool(torch.equal(native_compare, routed_compare))} "
                 f"output_max_abs={float(output_diff.max().item())} "
-                f"output_mean_abs={float(output_diff.mean().item())}",
+                f"output_mean_abs={float(output_diff.mean().item())} "
+                f"{shared_diagnostic}",
                 flush=True,
             )
         return routed_out

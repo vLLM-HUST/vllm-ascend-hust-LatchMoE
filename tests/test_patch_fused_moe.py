@@ -195,8 +195,16 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
         def forward_oot(self, x, residual=None):
             return ("original", x, residual)
 
+    class FakeGemmaRMSNorm:
+        weight = 3.0
+        variance_epsilon = 1e-6
+
+        def forward_oot(self, x, residual=None):
+            return ("gemma-original", x, residual)
+
     fake_layernorm = ModuleType("vllm_ascend.ops.layernorm")
     fake_layernorm.AscendRMSNorm = FakeRMSNorm
+    fake_layernorm.AscendGemmaRMSNorm = FakeGemmaRMSNorm
     original_import_module = importlib.import_module
 
     def import_module(name, package=None):
@@ -227,6 +235,15 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
         "next_residual",
     )
     assert FakeRMSNorm().forward_oot("x") == ("original", "x", None)
+    assert FakeGemmaRMSNorm().forward_oot("x", "residual") == (
+        ("normalized", "x", "residual", 4.0, 1e-6),
+        "next_residual",
+    )
+    assert FakeGemmaRMSNorm().forward_oot("x") == (
+        "gemma-original",
+        "x",
+        None,
+    )
 
 
 def test_cann_rmsnorm_fallback_disables_unsupported_fusion_patterns(monkeypatch):
@@ -1471,6 +1488,105 @@ def test_b2_runs_exact_pair_waves_for_multi_request_decode_overflow(monkeypatch)
     assert calls[0]["control_profile"]["forward_phase"] == "decode"
 
 
+def test_profile_b2_runs_without_explicit_feature_flag(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeCommMethod:
+        _ascend_moe_offload_runtime_patch = False
+
+        def fused_experts(self, fused_experts_input):
+            return "native"
+
+        def _maybe_apply_moe_offload_plan(self, fused_experts_input):
+            return fused_experts_input
+
+    cached_stats = SimpleNamespace(
+        token_counts_by_expert={0: 1, 1: 1, 2: 1, 3: 1},
+        pair_offsets_by_expert=None,
+    )
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            graph_compatible_offload=False,
+            b2_wave_prefill=False,
+            gmm_profile_path="",
+            max_num_seqs_hint=0,
+            num_slots=2,
+        )
+
+        def is_resident_layer(self, layer_id):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def consume_prefill_route_stats_record(self, **kwargs):
+            return cached_stats
+
+        def should_use_b2_pair_waves(self, *, layer_id, active_expert_count):
+            return False
+
+    monkeypatch.setattr(patch_fused_moe, "_current_forward_is_prefill", lambda: None)
+    monkeypatch.setattr(
+        runtime_impl,
+        "get_moe_offload_runtime",
+        lambda: FakeRuntime(),
+    )
+
+    fake_comm = SimpleNamespace(
+        MoECommMethod=FakeCommMethod,
+        build_token_dispatch_input=lambda **kwargs: kwargs,
+        build_mlp_compute_input=lambda **kwargs: kwargs,
+        FusedExpertsResult=SimpleNamespace,
+        MoEFusedExpertsInput=SimpleNamespace,
+        MoEWeights=SimpleNamespace,
+        MoEOffloadParams=SimpleNamespace,
+        MoERoutingParams=SimpleNamespace,
+        setup_moe_comm_method=None,
+    )
+    patch_fused_moe._patch_moe_comm_method_runtime_hooks(fake_comm)
+
+    comm = FakeCommMethod()
+    TokenDispatcherWithAllGather = type("TokenDispatcherWithAllGather", (), {})
+    comm.token_dispatcher = TokenDispatcherWithAllGather()
+    calls = []
+    comm._run_b2_wave_prefill = lambda **kwargs: calls.append(kwargs) or "b2"
+    fused_experts_input = SimpleNamespace(
+        hidden_states=torch.empty((1, 16)),
+        topk_ids=torch.tensor([[0, 1, 2, 3]], dtype=torch.int64),
+        offload=SimpleNamespace(enabled=True, layer_id=7),
+    )
+
+    token = moe_offload_stage_op.set_moe_offload_profile_run_active(True)
+    try:
+        assert comm._maybe_run_b2_wave_prefill(
+            fused_experts_input,
+            before_dispatch_evt=None,
+        ) == "b2"
+    finally:
+        moe_offload_stage_op.reset_moe_offload_profile_run_active(token)
+
+    assert calls[0]["control_profile"]["route_stats_cache_hit"] is True
+    assert calls[0]["control_profile"]["profile_adaptive_wave"] is True
+
+    token = moe_offload_stage_op.set_moe_offload_graph_warmup_active(True)
+    try:
+        assert comm._maybe_run_b2_wave_prefill(
+            fused_experts_input,
+            before_dispatch_evt=None,
+        ) == "b2"
+    finally:
+        moe_offload_stage_op.reset_moe_offload_graph_warmup_active(token)
+
+    assert calls[1]["control_profile"]["route_stats_cache_hit"] is True
+    assert calls[1]["control_profile"]["profile_adaptive_wave"] is False
+    assert calls[1]["control_profile"]["graph_warmup_adaptive_wave"] is True
+
+
 def test_b2_recoverable_wave_failure_runs_full_layer_fallback(monkeypatch):
     import torch
 
@@ -1609,6 +1725,254 @@ def test_stage_op_defers_capacity_overflow_to_b2_without_phase_hint(monkeypatch)
 
     assert runtime.stage_calls == 0
     assert runtime.cached is None
+
+
+def test_profile_dummy_run_scopes_adaptive_wave_context(monkeypatch):
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    calls = []
+
+    class FakeRunner:
+        def _dummy_run(self, num_tokens, is_profile=False):
+            calls.append(moe_offload_stage_op.is_moe_offload_profile_run_active())
+            return num_tokens
+
+    fake_module = ModuleType("fake_vllm_model_runner")
+    fake_module.GPUModelRunner = FakeRunner
+    fake_module.NPUModelRunner = FakeRunner
+
+    def fake_import(name):
+        if name == "vllm_ascend.worker.model_runner_v1":
+            return fake_module
+        raise ImportError(name)
+
+    monkeypatch.setattr(patch_fused_moe.importlib, "import_module", fake_import)
+
+    patch_fused_moe._patch_model_runner_profile_context()
+    runner = FakeRunner()
+    assert moe_offload_stage_op.is_moe_offload_profile_run_active() is False
+    assert runner._dummy_run(1, True) == 1
+    assert moe_offload_stage_op.is_moe_offload_profile_run_active() is False
+    assert runner._dummy_run(1, False) == 1
+    assert calls == [True, False]
+
+
+def test_graph_warmup_scopes_adaptive_wave_context(monkeypatch):
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    calls = []
+
+    class FakeRunner:
+        def capture_model(self):
+            calls.append(
+                (
+                    moe_offload_stage_op.is_moe_offload_graph_warmup_active(),
+                    moe_offload_stage_op.is_moe_offload_profile_run_active(),
+                )
+            )
+            return 1
+
+    fake_module = ModuleType("fake_vllm_model_runner")
+    fake_module.GPUModelRunner = FakeRunner
+    fake_module.NPUModelRunner = FakeRunner
+
+    def fake_import(name):
+        if name == "vllm_ascend.worker.model_runner_v1":
+            return fake_module
+        raise ImportError(name)
+
+    monkeypatch.setattr(patch_fused_moe.importlib, "import_module", fake_import)
+
+    patch_fused_moe._patch_model_runner_graph_warmup_context()
+    runner = FakeRunner()
+    assert moe_offload_stage_op.is_moe_offload_graph_warmup_active() is False
+    assert runner.capture_model() == 1
+    assert moe_offload_stage_op.is_moe_offload_graph_warmup_active() is False
+    assert calls == [(True, False)]
+
+
+def test_stage_op_profile_overflow_adapts_to_b2_without_feature_flag(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=False,
+            num_slots=2,
+            max_num_seqs_hint=0,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = 0
+            self.events = []
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def cache_prefill_route_stats(self, **kwargs):
+            self.cached = kwargs
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls += 1
+            raise AssertionError("profile overflow must be handed to B2")
+
+        def _record_profile_event(self, name, *, layer_id, start, payload):
+            self.events.append((name, layer_id, payload))
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    token = moe_offload_stage_op.set_moe_offload_profile_run_active(True)
+    try:
+        moe_offload_stage_op._moe_offload_stage_impl(
+            torch.tensor([[0, 1, 2, 3]], dtype=torch.int64),
+            layer_id=7,
+            num_logical_experts=64,
+            phase=moe_offload_stage_op.PHASE_UNKNOWN,
+        )
+    finally:
+        moe_offload_stage_op.reset_moe_offload_profile_run_active(token)
+
+    assert runtime.stage_calls == 0
+    assert runtime.cached is not None
+    assert runtime.cached["token_counts_by_expert"] == {0: 1, 1: 1, 2: 1, 3: 1}
+    assert runtime.events == [
+        (
+            "profile_adaptive_wave_decision",
+            7,
+            {
+                "active_expert_count": 4,
+                "num_slots": 2,
+                "decision": "multi_wave",
+                "forward_phase": moe_offload_stage_op.PHASE_UNKNOWN,
+                "decision_source": "profile",
+            },
+        )
+    ]
+
+
+def test_stage_op_graph_warmup_overflow_adapts_to_b2(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=True,
+            num_slots=2,
+            max_num_seqs_hint=1,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = 0
+            self.events = []
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def cache_prefill_route_stats(self, **kwargs):
+            self.cached = kwargs
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls += 1
+            raise AssertionError("graph warm-up overflow must be handed to B2")
+
+        def _record_profile_event(self, name, *, layer_id, start, payload):
+            self.events.append((name, layer_id, payload))
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    token = moe_offload_stage_op.set_moe_offload_graph_warmup_active(True)
+    try:
+        moe_offload_stage_op._moe_offload_stage_impl(
+            torch.tensor([[0, 1, 2, 3]], dtype=torch.int64),
+            layer_id=7,
+            num_logical_experts=64,
+            phase=moe_offload_stage_op.PHASE_UNKNOWN,
+        )
+    finally:
+        moe_offload_stage_op.reset_moe_offload_graph_warmup_active(token)
+
+    assert runtime.stage_calls == 0
+    assert runtime.cached is not None
+    assert runtime.events[-1][2]["decision"] == "multi_wave"
+    assert runtime.events[-1][2]["decision_source"] == "graph_warmup"
+
+
+def test_stage_op_profile_fit_keeps_single_slot_staging(monkeypatch):
+    import torch
+
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_impl
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_offload_stage_op
+
+    class FakeRuntime:
+        config = SimpleNamespace(
+            b2_wave_prefill=False,
+            num_slots=2,
+            max_num_seqs_hint=0,
+        )
+
+        def __init__(self):
+            self.cached = None
+            self.stage_calls = []
+
+        def is_static_residency_regime(self, num_logical_experts):
+            return False
+
+        def should_use_fixed_slot_plan_for_layer(self, layer_id):
+            return True
+
+        def is_layer_registered(self, layer_id):
+            return True
+
+        def stage_fixed_slot_plan(self, **kwargs):
+            self.stage_calls.append(kwargs)
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(runtime_impl, "_is_current_graph_capturing", lambda: False)
+    monkeypatch.setattr(runtime_impl, "get_moe_offload_runtime", lambda: runtime)
+
+    token = moe_offload_stage_op.set_moe_offload_profile_run_active(True)
+    try:
+        moe_offload_stage_op._moe_offload_stage_impl(
+            torch.tensor([[0, 1, 1, 0]], dtype=torch.int64),
+            layer_id=7,
+            num_logical_experts=64,
+            phase=moe_offload_stage_op.PHASE_UNKNOWN,
+        )
+    finally:
+        moe_offload_stage_op.reset_moe_offload_profile_run_active(token)
+
+    assert runtime.cached is None
+    assert runtime.stage_calls == [
+        {
+            "layer_id": 7,
+            "active_experts": (0, 1),
+            "num_logical_experts": 64,
+        }
+    ]
 
 
 def test_stage_op_does_not_defer_decode_overflow_without_shape_hint(monkeypatch):

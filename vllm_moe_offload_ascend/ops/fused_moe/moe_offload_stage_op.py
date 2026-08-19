@@ -44,6 +44,8 @@ fixed-slot layers; unsupported cases fall back before entering this seam.
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
+from time import perf_counter
 
 import torch
 
@@ -66,15 +68,71 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # For all three known phases, an active union larger than num_slots is handed
 # to the exact pair-wave executor. Every routed pair is computed once, so this
 # is a capacity mechanism rather than an approximation.
-#   PHASE_UNKNOWN (-1)— no reliable metadata (profile/dummy run).  Use only the
-#                       narrow overflow handshake (cache route-stats, let the
-#                       downstream B2 path decide) — do NOT treat as a confirmed
-#                       decode, which is what previously corrupted log2phy.
+#   PHASE_UNKNOWN (-1)— no reliable metadata. A vLLM profile/dummy forward is
+#                       identified separately by the model-runner context below.
+#                       Only that explicit profile context may automatically hand
+#                       an overflow to B2; ordinary unknown forwards retain the
+#                       fail-closed behavior used for decode safety.
 # ---------------------------------------------------------------------------
 PHASE_DECODE: int = 0
 PHASE_PREFILL: int = 1
 PHASE_MIXED: int = 2
 PHASE_UNKNOWN: int = -1
+
+
+# ``_dummy_run(is_profile=True)`` is vLLM's authoritative marker for memory
+# profiling. It is scoped around the dummy forward by patch_fused_moe, rather
+# than inferred from profile-output configuration or token shape. Keeping this
+# as a ContextVar means concurrent model-runner threads cannot leak the marker
+# into a serving forward.
+_PROFILE_RUN_ACTIVE: ContextVar[bool] = ContextVar(
+    "latchmoe_profile_run_active",
+    default=False,
+)
+
+# Graph capture starts with a regular ``_dummy_run`` warm-up that has neither
+# ``is_profile`` nor serving attention metadata. It is not a decode request:
+# it exists only to prepare the captured graph. Keep this distinct from memory
+# profiling so serving forwards can never inherit the capacity-planning policy.
+_GRAPH_WARMUP_ACTIVE: ContextVar[bool] = ContextVar(
+    "latchmoe_graph_warmup_active",
+    default=False,
+)
+
+
+def set_moe_offload_profile_run_active(active: bool) -> object:
+    """Enter or leave the vLLM profile/dummy-run context."""
+    return _PROFILE_RUN_ACTIVE.set(bool(active))
+
+
+def reset_moe_offload_profile_run_active(token: object) -> None:
+    """Restore the profile/dummy-run context after a wrapped dummy forward."""
+    _PROFILE_RUN_ACTIVE.reset(token)
+
+
+def is_moe_offload_profile_run_active() -> bool:
+    """Whether the current forward is vLLM's explicit profile/dummy run."""
+    return bool(_PROFILE_RUN_ACTIVE.get())
+
+
+def set_moe_offload_graph_warmup_active(active: bool) -> object:
+    """Enter or leave the narrow graph warm-up/capture preparation context."""
+    return _GRAPH_WARMUP_ACTIVE.set(bool(active))
+
+
+def reset_moe_offload_graph_warmup_active(token: object) -> None:
+    """Restore graph warm-up context after the model runner finishes capture."""
+    _GRAPH_WARMUP_ACTIVE.reset(token)
+
+
+def is_moe_offload_graph_warmup_active() -> bool:
+    """Whether the current forward belongs to graph warm-up or capture setup."""
+    return bool(_GRAPH_WARMUP_ACTIVE.get())
+
+
+def is_moe_offload_adaptive_wave_context() -> bool:
+    """Whether a non-serving dummy forward may plan capacity-bounded waves."""
+    return is_moe_offload_profile_run_active() or is_moe_offload_graph_warmup_active()
 
 
 # Env-gated diagnostics (SEW_SEAM_PROBE): count how many times the seam op runs,
@@ -222,14 +280,18 @@ def _moe_offload_stage_impl(
     #   Known prefill/decode/mixed phases all defer capacity overflow to the exact
     #   pair-wave executor. The stage seam caches the same route snapshot consumed
     #   by the downstream executor, so it never leaves stale log2phy state behind.
-    #   PHASE_UNKNOWN → narrow overflow handshake only: profile/dummy runs do not
-    #                   expose phase metadata, so defer only when the working set
-    #                   cannot fit AND the batch is too large to be a one-token-per-
-    #                   seq decode (token_count_hint > max_num_seqs_hint), i.e. we
-    #                   cannot rule out prefill.  The downstream B2 path consumes
-    #                   this exact route-stats record before it is allowed to run.
+    #   Explicit profile/dummy run or graph warm-up → choose single-slot staging
+    #                   or B2 exactly from the observed union. This avoids
+    #                   coupling capacity preparation to a guessed token shape
+    #                   or an oversized slot bank.
+    #   Other PHASE_UNKNOWN forwards retain the old narrow overflow handshake so
+    #                   an unclassified serving decode cannot accidentally use B2.
     phase = int(phase)
     active_count = len(active_experts)
+    profile_run_active = is_moe_offload_profile_run_active()
+    graph_warmup_active = is_moe_offload_graph_warmup_active()
+    adaptive_wave_context = profile_run_active or graph_warmup_active
+    profile_decision_start = perf_counter() if adaptive_wave_context else 0.0
     known_phase = phase in (PHASE_PREFILL, PHASE_DECODE, PHASE_MIXED)
     b2_phase_match = known_phase and runtime.should_use_b2_pair_waves(
         layer_id=layer_id,
@@ -245,10 +307,37 @@ def _moe_offload_stage_impl(
         and runtime.should_use_fixed_slot_plan_for_layer(layer_id)
         and active_count > int(runtime.config.num_slots)
     )
-    if b2_phase_match or b2_overflow_fallback:
+    b2_profile_adaptive_overflow = (
+        adaptive_wave_context
+        and active_count > int(runtime.config.num_slots)
+    )
+    if adaptive_wave_context:
+        record_profile_event = getattr(runtime, "_record_profile_event", None)
+        if callable(record_profile_event):
+            record_profile_event(
+                "profile_adaptive_wave_decision",
+                layer_id=layer_id,
+                start=profile_decision_start,
+                payload={
+                    "active_expert_count": active_count,
+                    "num_slots": int(runtime.config.num_slots),
+                    "decision": (
+                        "multi_wave"
+                        if b2_profile_adaptive_overflow
+                        else "single_slot"
+                    ),
+                    "forward_phase": phase,
+                    "decision_source": (
+                        "profile"
+                        if profile_run_active
+                        else "graph_warmup"
+                    ),
+                },
+            )
+    if b2_phase_match or b2_overflow_fallback or b2_profile_adaptive_overflow:
         route_stats_cache_enabled = str(
             os.getenv("VLLM_ASCEND_MOE_OFFLOAD_ROUTE_STATS_CACHE", "0")
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        ).strip().lower() in {"1", "true", "yes", "on"} or b2_profile_adaptive_overflow
         device_pair_planning = str(
             os.getenv("VLLM_ASCEND_MOE_OFFLOAD_DEVICE_PAIR_PLANNING", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -290,6 +379,7 @@ def _moe_offload_stage_impl(
                 f"num_slots={runtime.config.num_slots} "
                 f"phase_match={int(b2_phase_match)} "
                 f"overflow_fallback={int(b2_overflow_fallback)} "
+                f"profile_adaptive={int(b2_profile_adaptive_overflow)} "
                 f"route_cache={int(route_stats_cache_enabled)} "
                 f"tokens={token_count_hint} "
                 f"max_num_seqs_hint={max_num_seqs_hint}",
