@@ -23,7 +23,8 @@ import inspect
 import os
 import sys
 from collections.abc import Callable
-from dataclasses import replace
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
@@ -31,6 +32,10 @@ from typing import Any
 
 
 _MIX_PLACEMENT_AITER_INIT_LOCK = RLock()
+_EXTERNAL_SHARED_OVERLAP_STATE: ContextVar[Any | None] = ContextVar(
+    "external_shared_overlap_state",
+    default=None,
+)
 
 
 def _summarize_fused_shared_ids(shared_ids: Any) -> list[int]:
@@ -3387,6 +3392,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             return out
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
+        _launch_external_shared_overlap_if_active(before_dispatch_evt)
         b2_out = self._maybe_run_b2_wave_prefill(
             fused_experts_input,
             before_dispatch_evt,
@@ -3468,7 +3474,149 @@ def _wrap_setup_moe_comm_method(_comm: Any, original_setup_moe_comm_method: Call
             pass
 
 
+@dataclass
+class _ExternalSharedOverlapState:
+    """Own one external-shared launch issued from the B2 dispatch boundary."""
+
+    layer: Any
+    hidden_states: Any
+    shared_stream: Any
+    launched: bool = False
+    part1_out: Any = None
+    finished: bool = False
+    shared_out: Any = None
+
+    def launch(self, dispatch_ready_evt: Any | None) -> bool:
+        if self.launched:
+            return False
+
+        import torch
+        from vllm_ascend.utils import npu_stream_switch
+
+        if dispatch_ready_evt is None:
+            dispatch_ready_evt = torch.npu.current_stream().record_event()
+        with npu_stream_switch(self.shared_stream, enabled=True):
+            torch.npu.current_stream().wait_event(dispatch_ready_evt)
+            # The first projection depends only on hidden_states.  Issue it
+            # before routed B2 staging so the two streams have a real chance
+            # to overlap.  The activation/down projection is intentionally
+            # deferred until the routed combine boundary; queueing both
+            # projections here would let shared work finish before routed
+            # compute starts, which is merely multistream scheduling, not
+            # overlap.
+            self.part1_out = self.layer._shared_experts_part1(self.hidden_states)
+        self.launched = True
+        return True
+
+    def finish(self, before_combine_evt: Any | None) -> bool:
+        if self.finished:
+            return False
+        if not self.launched:
+            self.launch(dispatch_ready_evt=None)
+
+        import torch
+        from vllm_ascend.utils import npu_stream_switch
+
+        with npu_stream_switch(self.shared_stream, enabled=True):
+            if before_combine_evt is not None:
+                # This event is recorded before routed token-combine.  The
+                # default stream can therefore enqueue combine while the
+                # shared stream runs its second projection.
+                torch.npu.current_stream().wait_event(before_combine_evt)
+            self.shared_out = self.layer._shared_experts_part2(
+                self.hidden_states,
+                self.part1_out,
+            )
+        self.finished = True
+        return True
+
+
+def _launch_external_shared_overlap_if_active(dispatch_ready_evt: Any | None) -> bool:
+    state = _EXTERNAL_SHARED_OVERLAP_STATE.get()
+    return bool(state is not None and state.launch(dispatch_ready_evt))
+
+
+def _patch_external_shared_multistream_overlap(_fused_moe: Any) -> None:
+    """Launch external shared compute from the B2 routed-dispatch boundary.
+
+    Upstream ``shared_forward_impl`` invokes ``forward_impl`` before it switches
+    to the shared-expert stream.  That is semantically correct, but a B2
+    multi-wave routed path can finish issuing and executing every routed kernel
+    before the shared stream receives its first projection.  The stream exists
+    without any useful overlap.
+
+    The external-router shared path depends only on ``hidden_states``.  The B2
+    comm hook records an event immediately before routed staging/compute, then
+    launches the first shared projection on the stable shared stream.  The
+    second projection waits for the routed combine boundary, so the default
+    stream waits for the complete shared producer only before the tuple is
+    returned.
+    """
+
+    cls = getattr(_fused_moe, "AscendFusedMoE", None)
+    if cls is None or getattr(cls, "_latchmoe_external_shared_overlap_patch", False):
+        return
+
+    original_shared_forward = cls.shared_forward_impl
+
+    def _eligible(self) -> bool:
+        # This hook deliberately admits only the same narrow mode that the
+        # capability matrix exposes.  Internal-router/gate overlap and
+        # multi-card coordination retain the upstream schedule.
+        if not bool(getattr(self, "multistream_overlap_shared_expert", False)):
+            return False
+        if bool(getattr(self, "shared_multistream_overlap_gate", False)):
+            return False
+        if bool(getattr(self, "is_internal_router", False)):
+            return False
+        if getattr(self, "_shared_experts", None) is None:
+            return False
+        moe_config = getattr(self, "moe_config", None)
+        return all(
+            int(getattr(moe_config, field, 1) or 1) == 1
+            for field in ("dp_size", "ep_size", "tp_size", "pcp_size")
+        )
+
+    def shared_forward_impl(self, hidden_states, router_logits):
+        if not _eligible(self):
+            return original_shared_forward(self, hidden_states, router_logits)
+
+        import torch
+        from vllm_ascend.utils import shared_experts_calculation_stream
+
+        default_stream = torch.npu.current_stream()
+        shared_stream = shared_experts_calculation_stream()
+        state = _ExternalSharedOverlapState(
+            layer=self,
+            hidden_states=hidden_states,
+            shared_stream=shared_stream,
+        )
+        token = _EXTERNAL_SHARED_OVERLAP_STATE.set(state)
+        try:
+            fused_moe_results = self.forward_impl(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                return_with_event=True,
+            )
+        finally:
+            _EXTERNAL_SHARED_OVERLAP_STATE.reset(token)
+
+        # An unsupported comm path retains a correctness-first schedule. The
+        # B2 path launches part 1 at dispatch and part 2 at the routed combine
+        # boundary; no device-wide synchronization is used in either case.
+        state.finish(getattr(fused_moe_results, "before_combine_evt", None))
+
+        default_stream.wait_stream(shared_stream)
+        return state.shared_out, fused_moe_results.routed_out
+
+    shared_forward_impl._latchmoe_external_shared_overlap_patch = True
+    shared_forward_impl.__wrapped__ = original_shared_forward
+    cls.shared_forward_impl = shared_forward_impl
+    cls._latchmoe_external_shared_overlap_patch = True
+
+
 def _patch_fused_moe_runtime_hooks(_fused_moe: Any) -> None:
+    _patch_external_shared_multistream_overlap(_fused_moe)
     _patch_ascend_mix_placement_aiter_compat(_fused_moe)
     _patch_unquantized_moe_method(_fused_moe)
     _patch_ascend_moe_runner(_fused_moe)

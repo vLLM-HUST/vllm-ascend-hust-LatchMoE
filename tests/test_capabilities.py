@@ -30,6 +30,8 @@ def _layer(**overrides):
         "routed_scaling_factor": 1.0,
         "custom_routing_function": None,
         "is_internal_router": False,
+        "multistream_overlap_gate": False,
+        "multistream_overlap_shared_expert": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -74,6 +76,35 @@ def test_external_shared_complex_router_descriptor_is_implemented():
     assert descriptor.selection.correction_bias is True
     assert descriptor.selection.routed_scaling_factor == 1.8
     assert evaluate_support(descriptor).enabled is True
+
+
+def test_external_shared_multistream_descriptor_is_implemented():
+    descriptor = describe_layer_capability(
+        _layer(
+            n_shared_experts=1,
+            multistream_overlap_shared_expert=True,
+        ),
+        _runner(_shared_experts=SimpleNamespace(expert_gate=object())),
+    )
+
+    assert descriptor.shared_mode == "external_resident"
+    assert descriptor.overlap_mode == "shared_expert_multistream"
+    assert evaluate_support(descriptor).enabled is True
+
+
+def test_other_overlap_modes_remain_fail_closed():
+    descriptor = describe_layer_capability(
+        _layer(
+            n_shared_experts=1,
+            multistream_overlap_gate=True,
+        ),
+        _runner(_shared_experts=SimpleNamespace(expert_gate=object())),
+    )
+
+    support = evaluate_support(descriptor)
+
+    assert support.state == "unsupported"
+    assert "unsupported_overlap_mode:shared_gate_multistream" in support.blockers
 
 
 def test_internal_router_and_gated_shared_do_not_depend_on_model_name():

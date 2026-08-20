@@ -98,6 +98,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--npu-profiler-dir",
+        help=(
+            "Optional directory for a torch_npu profiler trace of generation. "
+            "Profiling starts after model load and stops when requests finish."
+        ),
+    )
+    parser.add_argument(
         "--disable-ascend-norm-quant-fusion",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -448,6 +455,16 @@ def _build_llm_kwargs(args: argparse.Namespace, config: dict[str, Any], mode: st
         additional_config["ascend_compilation_config"] = compile_config
     if additional_config:
         kwargs["additional_config"] = additional_config
+    npu_profiler_dir = getattr(args, "npu_profiler_dir", None)
+    if npu_profiler_dir:
+        kwargs["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": str(Path(npu_profiler_dir).resolve()),
+            # Stack collection makes full-model traces needlessly large and is
+            # not needed to establish NPU stream overlap.
+            "torch_profiler_with_stack": False,
+            "ignore_frontend": True,
+        }
     compilation_config = _smoke_compilation_config(
         mode=mode,
         enforce_eager=bool(args.enforce_eager),
@@ -524,8 +541,22 @@ def run_smoke(
         )
         for req in requests
     ]
+    profiler_dir = getattr(args, "npu_profiler_dir", None)
+    profiler_started = False
+    if profiler_dir:
+        Path(profiler_dir).mkdir(parents=True, exist_ok=True)
+        llm.start_profile("latchmoe")
+        profiler_started = True
     gen_t0 = time.perf_counter()
-    outputs = llm.generate([req["prompt"] for req in requests], sampling_params, use_tqdm=False)
+    try:
+        outputs = llm.generate(
+            [req["prompt"] for req in requests],
+            sampling_params,
+            use_tqdm=False,
+        )
+    finally:
+        if profiler_started:
+            llm.stop_profile()
     gen_s = time.perf_counter() - gen_t0
 
     _write_outputs_jsonl(output_dir, outputs)
@@ -545,6 +576,9 @@ def run_smoke(
                 getattr(args, "disable_ascend_norm_quant_fusion", False)
             ),
             "ascend_additional_config": llm_kwargs.get("additional_config", {}),
+            "npu_profiler_dir": (
+                str(Path(profiler_dir).resolve()) if profiler_dir else None
+            ),
             "load_seconds": load_s,
             "manifest": str(args.manifest),
             "buckets": args.buckets,

@@ -264,8 +264,19 @@ def evaluate_support(descriptor: MoeCapabilityDescriptor) -> CapabilitySupport:
         blockers.append(f"unsupported_weight_mode:{descriptor.weight_mode}")
     if descriptor.parallel_mode != "single_npu":
         blockers.append(f"unsupported_parallel_mode:{descriptor.parallel_mode}")
-    if descriptor.overlap_mode != "none":
+    # The pinned Ascend backend owns the stream/event schedule for external
+    # resident shared experts.  Admit only that narrowly-defined mode here;
+    # gate overlap and fused/mix-placement remain fail-closed until they have
+    # their own exactness and timeline qualification.
+    if descriptor.overlap_mode not in {"none", "shared_expert_multistream"}:
         blockers.append(f"unsupported_overlap_mode:{descriptor.overlap_mode}")
+    elif (
+        descriptor.overlap_mode == "shared_expert_multistream"
+        and descriptor.shared_mode != "external_resident"
+    ):
+        blockers.append(
+            "unsupported_overlap_mode:shared_expert_multistream"
+        )
     return CapabilitySupport(
         state="unsupported" if blockers else "implemented",
         blockers=tuple(blockers),
