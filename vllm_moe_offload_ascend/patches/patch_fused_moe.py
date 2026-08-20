@@ -36,6 +36,11 @@ _EXTERNAL_SHARED_OVERLAP_STATE: ContextVar[Any | None] = ContextVar(
     "external_shared_overlap_state",
     default=None,
 )
+_EXTERNAL_SHARED_OVERLAP_STREAM: Any | None = None
+_SKIP_SINGLE_LOCAL_EXPERT_DEVICE_SYNC: ContextVar[bool] = ContextVar(
+    "skip_single_local_expert_device_sync",
+    default=False,
+)
 
 
 def _summarize_fused_shared_ids(shared_ids: Any) -> list[int]:
@@ -539,6 +544,155 @@ def _patch_rms_norm_bias_cann_compat() -> None:
         )
 
 
+def _patch_moe_gating_top_k_cann_compat() -> bool:
+    """Use the CANN-native MoE router when the optional Ascend op is absent.
+
+    The locked LatchMoE installation intentionally sets
+    ``COMPILE_CUSTOM_KERNELS=0``.  That leaves the hook seam importable, but
+    older vLLM-Ascend router code still unconditionally calls
+    ``_C_ascend.moe_gating_top_k`` for supported grouped-top-k tuples.  CANN 9
+    provides the equivalent ``torch_npu`` operator, so use it only when the
+    optional custom op is unavailable.  The custom-op path remains unchanged
+    when a full vLLM-Ascend kernel build is present.
+    """
+
+    try:
+        import torch
+        import torch_npu
+        from vllm_ascend.device import device_op
+    except Exception:
+        return False
+
+    try:
+        if hasattr(torch.ops._C_ascend, "moe_gating_top_k"):
+            return False
+    except Exception:
+        return False
+
+    adaptor = getattr(device_op, "BaseDeviceAdaptor", None)
+    original = getattr(adaptor, "moe_gating_top_k", None)
+    if adaptor is None or not callable(original):
+        return False
+    if getattr(original, "_latchmoe_cann_moe_gating_compat", False):
+        return False
+
+    def _native_moe_gating_top_k(
+        x,
+        *,
+        k,
+        k_group,
+        group_count,
+        group_select_mode,
+        renorm,
+        norm_type,
+        out_flag,
+        routed_scaling_factor=1.0,
+        eps=1e-20,
+        bias_opt=None,
+    ):
+        # CANN 9's public op supports renorm=0.  Apply the optional final
+        # top-k normalization in Python, matching vLLM's native router
+        # contract and avoiding the unsupported custom-op ABI.
+        topk_weights, topk_ids, out = torch_npu.npu_moe_gating_top_k(
+            x,
+            k,
+            bias=bias_opt,
+            k_group=k_group,
+            group_count=group_count,
+            group_select_mode=group_select_mode,
+            renorm=0,
+            norm_type=norm_type,
+            out_flag=out_flag,
+            routed_scaling_factor=routed_scaling_factor,
+            eps=eps,
+        )
+        if renorm:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(torch.finfo(topk_weights.dtype).eps)
+        return topk_weights, topk_ids.to(torch.int32), out
+
+    _native_moe_gating_top_k._latchmoe_cann_moe_gating_compat = True
+    _native_moe_gating_top_k.__wrapped__ = original
+    adaptor.moe_gating_top_k = staticmethod(_native_moe_gating_top_k)
+    print(
+        "LATCHMOE_CANN_COMPAT moe_gating_top_k=native_fallback "
+        "reason=missing__C_ascend_moe_gating_top_k",
+        flush=True,
+    )
+    return True
+
+
+def _patch_moe_init_routing_cann_compat() -> bool:
+    """Use CANN's native MoE dispatch op when the optional custom op is absent."""
+
+    try:
+        import torch
+        import torch_npu
+        from vllm_ascend.device import device_op
+    except Exception:
+        return False
+
+    try:
+        if hasattr(torch.ops._C_ascend, "npu_moe_init_routing_custom"):
+            return False
+    except Exception:
+        return False
+
+    adaptor = getattr(device_op, "BaseDeviceAdaptor", None)
+    original = getattr(adaptor, "npu_moe_init_routing", None)
+    if adaptor is None or not callable(original):
+        return False
+    if getattr(original, "_latchmoe_cann_moe_init_routing_compat", False):
+        return False
+
+    def _native_moe_init_routing(
+        hidden_states,
+        topk_ids,
+        *,
+        scale=None,
+        active_num,
+        expert_num,
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        active_expert_range=None,
+        quant_mode=-1,
+    ):
+        if quant_mode not in (-1, 1):
+            raise RuntimeError(
+                "native npu_moe_init_routing_v2 supports only quant modes -1 and 1"
+            )
+        if active_num <= 0:
+            active_num = int(hidden_states.shape[0] * topk_ids.shape[1])
+        if active_expert_range is None:
+            active_expert_range = [0, int(expert_num)]
+        return torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            scale=scale,
+            active_num=active_num,
+            expert_capacity=-1,
+            expert_num=expert_num,
+            drop_pad_mode=0,
+            expert_tokens_num_type=expert_tokens_num_type,
+            expert_tokens_num_flag=expert_tokens_num_flag,
+            quant_mode=quant_mode,
+            active_expert_range=active_expert_range,
+            row_idx_type=0,
+        )
+
+    _native_moe_init_routing._latchmoe_cann_moe_init_routing_compat = True
+    _native_moe_init_routing.__wrapped__ = original
+    adaptor.npu_moe_init_routing = staticmethod(_native_moe_init_routing)
+    print(
+        "LATCHMOE_CANN_COMPAT moe_init_routing=native_fallback "
+        "reason=missing__C_ascend_npu_moe_init_routing_custom",
+        flush=True,
+    )
+    return True
+
+
 def _install_cann_compat_when_ready() -> bool:
     """Install only backend compatibility fixes after Ascend op registration."""
 
@@ -648,6 +802,8 @@ def _install_runtime_patches_when_ready() -> bool:
 
     importlib.import_module("vllm_ascend.ops.register_custom_ops")
     _patch_rms_norm_bias_cann_compat()
+    _patch_moe_gating_top_k_cann_compat()
+    _patch_moe_init_routing_cann_compat()
     _register_plugin_ops()
     _install_runtime_module_patches()
     return True
@@ -978,6 +1134,68 @@ def _patch_gdn_causal_conv1d_tensor_abi_when_loaded() -> None:
     attention_class._forward_core = _forward_core_with_tensor_abi
 
 
+def _patch_single_local_expert_device_sync() -> None:
+    """Remove vLLM-Ascend's redundant world-size-one dispatch drain.
+
+    ``TokenDispatcherWithAll2AllV._preprocess`` calls
+    ``torch.npu.synchronize()`` when ``num_local_experts == 1``.  Its only
+    purpose in that branch is to avoid constructing a local-expert permutation
+    that is not needed for a one-device/one-EP run; the returned CPU split
+    arrays already carry the required dependency.  The drain serializes the
+    H2D transfer stream with the shared stream, so it is incompatible with the
+    shared/H2D acceptance target.
+
+    Keep the upstream method and all non-single-local-expert behavior intact.
+    A context-local guard makes only this narrow call site a no-op and leaves
+    unrelated synchronization calls untouched.
+    """
+
+    try:
+        import torch
+        from vllm_ascend.ops.fused_moe.token_dispatcher import (
+            TokenDispatcherWithAll2AllV,
+        )
+    except Exception:
+        return
+
+    current = getattr(torch.npu, "synchronize", None)
+    original_preprocess = getattr(TokenDispatcherWithAll2AllV, "_preprocess", None)
+    if not callable(current) or not callable(original_preprocess):
+        return
+    if getattr(current, "_latchmoe_single_local_expert_sync_guard", False):
+        return
+
+    def _synchronize(*args, **kwargs):
+        if _SKIP_SINGLE_LOCAL_EXPERT_DEVICE_SYNC.get():
+            return None
+        return current(*args, **kwargs)
+
+    _synchronize._latchmoe_single_local_expert_sync_guard = True
+    _synchronize.__wrapped__ = current
+    torch.npu.synchronize = _synchronize
+
+    if getattr(original_preprocess, "_latchmoe_single_local_expert_sync_patch", False):
+        return
+
+    def _preprocess_without_device_sync(self, topk_ids):
+        if int(getattr(self, "num_local_experts", 0) or 0) != 1:
+            return original_preprocess(self, topk_ids)
+        token = _SKIP_SINGLE_LOCAL_EXPERT_DEVICE_SYNC.set(True)
+        try:
+            return original_preprocess(self, topk_ids)
+        finally:
+            _SKIP_SINGLE_LOCAL_EXPERT_DEVICE_SYNC.reset(token)
+
+    _preprocess_without_device_sync._latchmoe_single_local_expert_sync_patch = True
+    _preprocess_without_device_sync.__wrapped__ = original_preprocess
+    TokenDispatcherWithAll2AllV._preprocess = _preprocess_without_device_sync
+    print(
+        "LATCHMOE_DEVICE_SYNC_PATCH status=enabled "
+        "scope=TokenDispatcherWithAll2AllV._preprocess num_local_experts=1",
+        flush=True,
+    )
+
+
 def _install_runtime_module_patches() -> None:
     from vllm_moe_offload_ascend.moe_offload.runtime import get_moe_offload_runtime, MoeOffloadDecisionPath
     from vllm_moe_offload_ascend.moe_offload.pipeline import get_moe_pipeline_profiler
@@ -986,6 +1204,8 @@ def _install_runtime_module_patches() -> None:
     _patch_model_runner_graph_warmup_context()
     _patch_gdn_causal_conv1d_tensor_abi()
     _patch_gdn_causal_conv1d_tensor_abi_when_loaded()
+    _patch_single_local_expert_device_sync()
+    _patch_external_shared_mlp_interleave_hook()
 
     try:
         import vllm_ascend.ops.fused_moe.moe_comm_method as _comm
@@ -2173,6 +2393,14 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                         known_miss=not bool(hit_experts),
                     )
                 )
+                # Queue the first routed H2D wave before submitting shared
+                # part 1.  The shared stream now overlaps the transfer
+                # itself, while routed MLP remains gated by ready_event below.
+                if (
+                    _EXTERNAL_SHARED_OVERLAP_STATE.get() is not None
+                    and int(stage_payload.get("h2d_bytes", 0)) > 0
+                ):
+                    _launch_external_shared_overlap_if_active(before_dispatch_evt)
                 stage_issue_ms = (perf_counter() - stage_start) * 1000.0
                 stage_issue_sequence += 1
                 issue_end_time = perf_counter()
@@ -2945,8 +3173,11 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
                 original_result = original_fused_experts(self, original_input)
                 original_routed_out = original_result.routed_out.clone()
             result = original_fused_experts(self, native_input)
-            torch.npu.synchronize()
             if compare_original:
+                # This is an opt-in diagnostic path only.  The serving path
+                # must return through stream/event dependencies and must not
+                # force a device-wide drain after every full-layer fallback.
+                torch.npu.synchronize()
                 import torch_npu
 
                 original_w1 = fused_experts_input.weights.w1
@@ -3353,6 +3584,10 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         )
 
     def fused_experts(self, fused_experts_input):
+        # The All2AllV dispatcher is imported lazily by vLLM-Ascend. Retry
+        # this narrow compatibility patch at the first actual MoE call so the
+        # single-local-expert branch cannot reintroduce a device-wide drain.
+        _patch_single_local_expert_device_sync()
         offload = fused_experts_input.offload
         runtime = get_moe_offload_runtime()
         if (
@@ -3392,13 +3627,15 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             return out
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
-        _launch_external_shared_overlap_if_active(before_dispatch_evt)
         b2_out = self._maybe_run_b2_wave_prefill(
             fused_experts_input,
             before_dispatch_evt,
         )
         if b2_out is not None:
             return b2_out
+        # Non-B2 paths have no routed staging wave to seed the overlap.  Launch
+        # the resident shared producer before the native routed MLP instead.
+        _launch_external_shared_overlap_if_active(before_dispatch_evt)
         try:
             return original_fused_experts(self, fused_experts_input)
         finally:
@@ -3476,7 +3713,7 @@ def _wrap_setup_moe_comm_method(_comm: Any, original_setup_moe_comm_method: Call
 
 @dataclass
 class _ExternalSharedOverlapState:
-    """Own one external-shared launch issued from the B2 dispatch boundary."""
+    """Own one shared producer launched at the routed staging seam."""
 
     layer: Any
     hidden_states: Any
@@ -3485,6 +3722,7 @@ class _ExternalSharedOverlapState:
     part1_out: Any = None
     finished: bool = False
     shared_out: Any = None
+    routed_gmm_calls: int = 0
 
     def launch(self, dispatch_ready_evt: Any | None) -> bool:
         if self.launched:
@@ -3497,13 +3735,13 @@ class _ExternalSharedOverlapState:
             dispatch_ready_evt = torch.npu.current_stream().record_event()
         with npu_stream_switch(self.shared_stream, enabled=True):
             torch.npu.current_stream().wait_event(dispatch_ready_evt)
-            # The first projection depends only on hidden_states.  Issue it
-            # before routed B2 staging so the two streams have a real chance
-            # to overlap.  The activation/down projection is intentionally
-            # deferred until the routed combine boundary; queueing both
-            # projections here would let shared work finish before routed
-            # compute starts, which is merely multistream scheduling, not
-            # overlap.
+            # The first projection depends only on hidden_states.  In B2 this
+            # is submitted immediately after the routed H2D wave is queued,
+            # giving the transfer and shared streams a real overlap window.
+            # The activation/down projection is intentionally deferred until
+            # the routed combine boundary; queueing both projections here
+            # would let shared work finish before routed compute starts,
+            # which is merely multistream scheduling, not overlap.
             self.part1_out = self.layer._shared_experts_part1(self.hidden_states)
         self.launched = True
         return True
@@ -3536,21 +3774,39 @@ def _launch_external_shared_overlap_if_active(dispatch_ready_evt: Any | None) ->
     return bool(state is not None and state.launch(dispatch_ready_evt))
 
 
+def _external_shared_overlap_stream() -> Any:
+    """Return the dedicated high-priority stream used by the overlap branch."""
+
+    global _EXTERNAL_SHARED_OVERLAP_STREAM
+    if _EXTERNAL_SHARED_OVERLAP_STREAM is None:
+        import torch_npu
+
+        # CANN 9 accepts stream priorities even though querying a priority
+        # from torch-npu is not implemented. Fall back to the upstream stream
+        # constructor for older backend ABIs.
+        try:
+            _EXTERNAL_SHARED_OVERLAP_STREAM = torch_npu.npu.Stream(priority=-1)
+        except Exception:
+            from vllm_ascend.utils import shared_experts_calculation_stream
+
+            _EXTERNAL_SHARED_OVERLAP_STREAM = shared_experts_calculation_stream()
+    return _EXTERNAL_SHARED_OVERLAP_STREAM
+
+
 def _patch_external_shared_multistream_overlap(_fused_moe: Any) -> None:
-    """Launch external shared compute from the B2 routed-dispatch boundary.
+    """Launch shared compute at the routed H2D staging seam.
 
     Upstream ``shared_forward_impl`` invokes ``forward_impl`` before it switches
-    to the shared-expert stream.  That is semantically correct, but a B2
-    multi-wave routed path can finish issuing and executing every routed kernel
-    before the shared stream receives its first projection.  The stream exists
-    without any useful overlap.
+    to the shared-expert stream.  The external seam records the hidden-state
+    readiness event, then the B2 communication hook queues the first routed
+    H2D/D2D stage and immediately launches shared part 1.  This makes
+    shared/H2D the primary overlap contract; shared/routed AI-core overlap is
+    only a secondary diagnostic and is not required for correctness.
 
-    The external-router shared path depends only on ``hidden_states``.  The B2
-    comm hook records an event immediately before routed staging/compute, then
-    launches the first shared projection on the stable shared stream.  The
+    The external-router shared path depends only on ``hidden_states``.  The
     second projection waits for the routed combine boundary, so the default
     stream waits for the complete shared producer only before the tuple is
-    returned.
+    returned.  No device-wide synchronization is part of this schedule.
     """
 
     cls = getattr(_fused_moe, "AscendFusedMoE", None)
@@ -3582,10 +3838,8 @@ def _patch_external_shared_multistream_overlap(_fused_moe: Any) -> None:
             return original_shared_forward(self, hidden_states, router_logits)
 
         import torch
-        from vllm_ascend.utils import shared_experts_calculation_stream
-
         default_stream = torch.npu.current_stream()
-        shared_stream = shared_experts_calculation_stream()
+        shared_stream = _external_shared_overlap_stream()
         state = _ExternalSharedOverlapState(
             layer=self,
             hidden_states=hidden_states,
@@ -3613,6 +3867,89 @@ def _patch_external_shared_multistream_overlap(_fused_moe: Any) -> None:
     shared_forward_impl.__wrapped__ = original_shared_forward
     cls.shared_forward_impl = shared_forward_impl
     cls._latchmoe_external_shared_overlap_patch = True
+
+
+def _patch_external_shared_mlp_interleave_hook() -> None:
+    """Retain an optional shared/routed compute diagnostic seam.
+
+    ``unified_apply_mlp`` enqueues routed gate/up projection, activation, and
+    down projection in one Python call.  Older/non-B2 paths may still use the
+    small hook below to place shared part 1 between routed projections.  The
+    primary schedule launches shared part 1 at the routed staging seam, so this hook
+    is a fallback/diagnostic only and never changes ordinary grouped matmul
+    calls outside the external-shared state context.
+    """
+
+    try:
+        import vllm_ascend.ops.fused_moe.moe_mlp as moe_mlp
+    except Exception:
+        return
+
+    torch_npu = getattr(moe_mlp, "torch_npu", None)
+    grouped_matmul = getattr(torch_npu, "npu_grouped_matmul", None)
+    if not callable(grouped_matmul):
+        return
+    if getattr(grouped_matmul, "_latchmoe_external_shared_interleave", False):
+        return
+
+    def _grouped_matmul_with_interleave(*args, **kwargs):
+        state = _EXTERNAL_SHARED_OVERLAP_STATE.get()
+        launch_evt = None
+        if state is not None and not state.launched:
+            routed_calls = int(getattr(state, "routed_gmm_calls", 0))
+            if routed_calls >= 1:
+                import torch
+
+                # Capture the post-gate/up boundary before submitting routed
+                # down projection. The shared launch is submitted immediately
+                # after down projection, so its high-priority stream can run
+                # while that routed kernel is active instead of being queued
+                # ahead of it.
+                launch_evt = torch.npu.current_stream().record_event()
+            state.routed_gmm_calls = routed_calls + 1
+        result = grouped_matmul(*args, **kwargs)
+        if launch_evt is not None:
+            _launch_external_shared_overlap_if_active(launch_evt)
+        return result
+
+    _grouped_matmul_with_interleave._latchmoe_external_shared_interleave = True
+    _grouped_matmul_with_interleave.__wrapped__ = grouped_matmul
+    torch_npu.npu_grouped_matmul = _grouped_matmul_with_interleave
+
+    try:
+        from vllm_ascend.device import device_op
+
+        adaptor = getattr(device_op, "BaseDeviceAdaptor", None)
+        gmm2 = getattr(adaptor, "npu_grouped_matmul_gmm2", None)
+        if adaptor is not None and callable(gmm2) and not getattr(
+            gmm2, "_latchmoe_external_shared_interleave", False
+        ):
+            @classmethod
+            def _gmm2_with_interleave(cls, *args, **kwargs):
+                state = _EXTERNAL_SHARED_OVERLAP_STATE.get()
+                launch_evt = None
+                if state is not None and not state.launched:
+                    import torch
+
+                    launch_evt = torch.npu.current_stream().record_event()
+                result = gmm2(*args, **kwargs)
+                if launch_evt is not None:
+                    _launch_external_shared_overlap_if_active(launch_evt)
+                return result
+
+            _gmm2_with_interleave.__func__._latchmoe_external_shared_interleave = True
+            _gmm2_with_interleave.__func__.__wrapped__ = gmm2
+            adaptor.npu_grouped_matmul_gmm2 = _gmm2_with_interleave
+    except Exception:
+        # The unquantized GLM path above is sufficient for the locked campaign;
+        # keep compatibility installation best-effort for other backend ABIs.
+        pass
+
+    print(
+        "LATCHMOE_EXTERNAL_SHARED_INTERLEAVE status=enabled "
+        "boundary=routed_gmm1_to_gmm2",
+        flush=True,
+    )
 
 
 def _patch_fused_moe_runtime_hooks(_fused_moe: Any) -> None:

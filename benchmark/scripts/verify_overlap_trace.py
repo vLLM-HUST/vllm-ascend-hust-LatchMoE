@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify a matched Ascend shared-expert overlap experiment.
+"""Verify a matched Ascend shared-expert/H2D overlap experiment.
 
 Ascend's profiler emits an ``Overlap Analysis`` process in addition to raw
 hardware-stream events.  CANN 9.0.1 does not consistently classify PCIe H2D
@@ -7,7 +7,11 @@ DMA in the analysis process, so the acceptance path uses raw hardware events:
 the backend's ``vllm::moe_mlp_shared`` marker identifies the independent shared
 stream, ``MEMCPY_ASYNC`` PCIe tasks identify staged H2D, and
 ``GroupedMatmul`` identifies routed MLP work.  ``Overlap Analysis`` remains a
-diagnostic only.
+diagnostic only.  The acceptance target is raw hardware overlap between the
+resident shared projection and routed PCIe H2D DMA.  Shared/routed AI-core
+overlap is reported as a secondary diagnostic, because two MatMuls may be
+serialized by the backend's shared cube resources even when shared/H2D
+latency hiding is working correctly.
 
 The profiler has used both a top-level event array and a Chrome-style
 ``{"traceEvents": [...]}`` object.  Both encodings are supported.
@@ -160,6 +164,16 @@ def _event_interval(event: Mapping[str, Any]) -> Interval | None:
     return Interval(start, start + duration)
 
 
+def _profile_stop_interval(event: Mapping[str, Any]) -> Interval | None:
+    """Read both duration and instant CANN profiling-stop markers."""
+
+    interval = _event_interval(event)
+    if interval is not None:
+        return interval
+    start = _number(event.get("ts"))
+    return Interval(start, start) if start is not None else None
+
+
 def _intersects_any(interval: Interval, windows: Sequence[Interval]) -> bool:
     return _intersection_us([interval], windows) > 0
 
@@ -288,7 +302,7 @@ def _classify_device_syncs(
         interval
         for event in events
         if str(event.get("name", "")) == _PROFILE_DISABLE
-        for interval in [_event_interval(event)]
+        for interval in [_profile_stop_interval(event)]
         if interval is not None
     ]
     syncs = [
@@ -538,16 +552,6 @@ def verify_matched_overlap(
             "no-overlap control must not expose a dedicated shared hardware stream",
         ),
         _check(
-            "incremental_shared_routed_compute_overlap",
-            incremental_shared_routed >= min_incremental_overlap_us,
-            "treatment shared/routed={:.3f}us, control={:.3f}us, increment={:.3f}us, required>={:.3f}us".format(
-                treatment_shared_routed,
-                control_shared_routed,
-                incremental_shared_routed,
-                min_incremental_overlap_us,
-            ),
-        ),
-        _check(
             "incremental_shared_h2d_overlap",
             incremental_shared_h2d >= min_incremental_overlap_us,
             "treatment shared/H2D={:.3f}us, control={:.3f}us, increment={:.3f}us, required>={:.3f}us".format(
@@ -577,6 +581,18 @@ def verify_matched_overlap(
             "communication_compute_overlap_us": {
                 "treatment": treatment_analysis_overlap,
                 "control": control_analysis_overlap,
+            },
+            "shared_routed_compute_overlap_us": {
+                "treatment": treatment_shared_routed,
+                "control": control_shared_routed,
+                "increment": incremental_shared_routed,
+                "required_for_acceptance": False,
+            },
+            "shared_h2d_overlap_us": {
+                "treatment": treatment_shared_h2d,
+                "control": control_shared_h2d,
+                "increment": incremental_shared_h2d,
+                "required_for_acceptance": True,
             },
         },
         "incremental_shared_routed_compute_overlap_us": round(

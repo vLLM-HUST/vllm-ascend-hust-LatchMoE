@@ -257,6 +257,7 @@ def configure_sew_offload_env(
     release_original_expert_weights: bool = False,
     layered_runtime: bool = False,
     fanout_threshold: int = 0,
+    wave_prefill: bool = False,
     trace_path: str = "moe_offload_trace.jsonl",
 ) -> None:
     if mode == "no_offload":
@@ -274,7 +275,13 @@ def configure_sew_offload_env(
         os.environ["VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS"] = str(int(num_slots))
     else:
         raise ValueError(f"unsupported smoke mode: {mode}")
-    os.environ["VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD"] = "0"
+    # B2 overlap requires the transfer stream to remain in flight while the
+    # resident shared producer runs.  Keep the historical synchronous setting
+    # for other smoke modes, but use async pinned-host staging for the matched
+    # shared/H2D qualification path.
+    os.environ["VLLM_ASCEND_MOE_OFFLOAD_ASYNC_LOAD"] = (
+        "1" if bool(wave_prefill) else "0"
+    )
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_MAX_PHASES"] = "1"
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS"] = resident_layer_ids
     os.environ["VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS"] = (
@@ -501,6 +508,7 @@ def run_smoke(
         release_original_expert_weights=getattr(args, "release_original_expert_weights", False),
         layered_runtime=getattr(args, "layered_runtime", False),
         fanout_threshold=getattr(args, "fanout_threshold", 0),
+        wave_prefill=bool(getattr(args, "wave_prefill", False)),
         trace_path=str(trace_jsonl_path),
     )
     router_parity_path = output_dir / "moe_router_parity.jsonl"

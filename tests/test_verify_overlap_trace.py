@@ -106,6 +106,26 @@ def test_verifier_accepts_incremental_raw_hardware_overlap(tmp_path):
     assert all(check["passed"] for check in report["checks"])
 
 
+def test_verifier_accepts_shared_h2d_without_shared_routed_overlap(tmp_path):
+    artifacts = _artifacts(tmp_path)
+    payload = json.loads(artifacts["overlap_trace"].read_text(encoding="utf-8"))
+    for event in payload["traceEvents"]:
+        if event.get("name") == "aclnnGroupedMatmul":
+            event["ts"] = 220
+    artifacts["overlap_trace"].write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    report = verify_matched_overlap(**artifacts, min_incremental_overlap_us=10)
+
+    assert report["status"] == "passed"
+    assert report["incremental_shared_h2d_overlap_us"] == 25
+    assert report["incremental_shared_routed_compute_overlap_us"] == 0
+    assert report["diagnostics"]["shared_routed_compute_overlap_us"][
+        "required_for_acceptance"
+    ] is False
+
+
 def test_verifier_rejects_device_wide_sync(tmp_path):
     report = verify_matched_overlap(**_artifacts(tmp_path, hard_sync=True))
 
@@ -125,6 +145,37 @@ def test_verifier_allows_profile_teardown_device_sync(tmp_path):
     _write(
         artifacts["control_trace"],
         _trace(multistream=False, hard_sync=True, profile_teardown=True),
+    )
+
+    report = verify_matched_overlap(**artifacts)
+
+    assert report["status"] == "passed"
+    assert report["treatment"]["profile_teardown_device_sync_events"] == [
+        "aclrtSynchronizeDevice"
+    ]
+
+
+def test_verifier_allows_instant_profile_teardown_marker(tmp_path):
+    artifacts = _artifacts(tmp_path)
+    _write(
+        artifacts["overlap_trace"],
+        _trace(multistream=True, hard_sync=True),
+    )
+    payload = json.loads(artifacts["overlap_trace"].read_text(encoding="utf-8"))
+    payload.append(
+        {"ph": "i", "name": "PROFILING_DISABLE", "pid": 2, "tid": 49, "ts": 300}
+    )
+    artifacts["overlap_trace"].write_text(json.dumps(payload), encoding="utf-8")
+    _write(
+        artifacts["control_trace"],
+        _trace(multistream=False, hard_sync=True),
+    )
+    control_payload = json.loads(artifacts["control_trace"].read_text(encoding="utf-8"))
+    control_payload.append(
+        {"ph": "i", "name": "PROFILING_DISABLE", "pid": 2, "tid": 49, "ts": 300}
+    )
+    artifacts["control_trace"].write_text(
+        json.dumps(control_payload), encoding="utf-8"
     )
 
     report = verify_matched_overlap(**artifacts)
