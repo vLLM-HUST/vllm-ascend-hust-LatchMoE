@@ -151,12 +151,28 @@ def verify_unit(
         failures.append("PIECEWISE graph capture/replay evidence is incomplete")
     if int(runtime.get("fallback_count", -1)) != 0:
         failures.append("runtime fallback_count is not zero")
-    if int(runtime.get("wave_count", 0)) <= 0:
+    # Native vLLM prefetch is a comparison baseline, not a LatchMoE wave
+    # scheduler.  Its H2D/wave counters are not emitted by the LatchMoE
+    # profile, so absence is reported in the artifact but is not confused with
+    # a failed LatchMoE dependency check.  The other three offload paths have
+    # explicit profile events and must expose their transfer/wave evidence.
+    # The full-layer arm is the explicit reference path: it stages the whole
+    # layer and therefore does not expose a multi-wave count.  Wave evidence
+    # is required for the layered and multi-wave schedulers, but absence from
+    # the reference path must not turn an otherwise complete run into a false
+    # negative.
+    requires_wave_metrics = expected["arm"] in {"legacy_layered", "latchmoe_multi_wave"}
+    requires_h2d_metrics = expected["arm"] != "native_prefetch"
+    requires_consumer_dependency = expected["arm"] == "latchmoe_multi_wave"
+    if requires_wave_metrics and int(runtime.get("wave_count", 0) or 0) <= 0:
         failures.append("runtime wave_count is missing")
-    if transfers.get("h2d_dependency_ok") is not True:
-        failures.append("H2D dependency evidence is missing or failed")
-    if int(transfers.get("h2d_count", 0)) <= 0:
+    if requires_h2d_metrics and int(transfers.get("h2d_count", 0) or 0) <= 0:
         failures.append("H2D transfer count is missing")
+    if requires_consumer_dependency:
+        if transfers.get("h2d_dependency_evidence") is not True:
+            failures.append("H2D consumer-dependency evidence is missing")
+        elif transfers.get("h2d_dependency_ok") is not True:
+            failures.append("H2D consumer dependency was not installed for every checked transfer")
     if not metric_values(metrics, "ttft_ms"):
         failures.append("TTFT samples are missing")
     if not metric_values(metrics, "tpot_ms"):

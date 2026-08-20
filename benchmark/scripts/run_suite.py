@@ -48,6 +48,31 @@ DEFAULT_CAPABILITY_REGISTRY = Path("benchmark/registry/model_registry_v2.json")
 IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
+def _piecewise_splitting_ops() -> list[str]:
+    """Return the locked vLLM 0.21 attention/KV split contract plus SEW seam."""
+    return [
+        "vllm::unified_attention_with_output",
+        "vllm::unified_mla_attention_with_output",
+        "vllm::mamba_mixer2",
+        "vllm::mamba_mixer",
+        "vllm::short_conv",
+        "vllm::linear_attention",
+        "vllm::plamo2_mamba_mixer",
+        "vllm::gdn_attention_core",
+        "vllm::gdn_attention_core_xpu",
+        "vllm::olmo_hybrid_gdn_full_forward",
+        "vllm::kda_attention",
+        "vllm::sparse_attn_indexer",
+        "vllm::rocm_aiter_sparse_attn_indexer",
+        "vllm::deepseek_v4_attention",
+        "vllm::unified_kv_cache_update",
+        "vllm::unified_mla_kv_cache_update",
+        "vllm::mla_forward",
+        "vllm::dsa_forward",
+        "vllm::moe_offload_stage",
+    ]
+
+
 def _command_output(command: list[str], *, cwd: Path | None = None) -> str | None:
     try:
         return subprocess.run(
@@ -253,6 +278,11 @@ def parse_args() -> argparse.Namespace:
         default="container",
     )
     parser.add_argument("--device", type=int, choices=(5, 6))
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="Override the HTTP server port for this isolated suite unit.",
+    )
     parser.add_argument("--runtime-image")
     parser.add_argument("--runtime-image-digest")
     parser.add_argument("--container-name")
@@ -448,7 +478,7 @@ def _managed_env(
             "VLLM_ENGINE_COMPILATION_CONFIG": json.dumps(
                 {
                     "cudagraph_mode": "PIECEWISE",
-                    "splitting_ops": ["vllm::moe_offload_stage"],
+                    "splitting_ops": _piecewise_splitting_ops(),
                 },
                 separators=(",", ":"),
             ),
@@ -873,6 +903,8 @@ def _write_suite_summary(suite_dir: Path, results: list[dict[str, Any]]) -> None
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
+    if args.port is not None:
+        config["server"]["port"] = int(args.port)
     if args.model_path:
         config["model"]["path"] = str(Path(args.model_path).resolve())
         config["model"]["tokenizer"] = str(Path(args.model_path).resolve())

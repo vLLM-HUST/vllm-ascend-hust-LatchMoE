@@ -129,6 +129,32 @@ def test_verifier_accepts_complete_matched_campaign(tmp_path: Path) -> None:
     assert not report["failures"]
 
 
+def test_verifier_does_not_require_wave_count_for_full_layer_reference(tmp_path: Path) -> None:
+    helpers = _module(HELPERS, "issue28_helpers_full_layer")
+    verifier = _module(VERIFY, "issue28_verify_full_layer")
+    contract = _contract()
+    contract["arms"][0]["name"] = "latchmoe_full_layer"
+    contract["arms"][1]["name"] = "native_prefetch"
+    for item in contract["order"]:
+        item["arm"] = "latchmoe_full_layer" if item["arm"] == "a" else "native_prefetch"
+    digest = helpers.contract_digest(contract)
+    reports = []
+    for item in helpers.expected_units(contract):
+        _success_unit(tmp_path, contract, digest, item)
+        runtime_path = tmp_path / item["unit_id"] / "runtime.json"
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        if item["arm"] == "latchmoe_full_layer":
+            runtime.pop("wave_count", None)
+        _write(runtime_path, runtime)
+        reports.append({**item, "unit_dir": str(tmp_path / item["unit_id"]), "status": "success", "returncode": 0})
+    campaign = _campaign(tmp_path, contract, reports)
+    contract_path = tmp_path / "contract.json"
+    _write(contract_path, contract)
+    report = verifier.verify_campaign(campaign, contract_path)
+    assert report["status"] == "passed"
+    assert not any("runtime wave_count" in failure for failure in report["failures"])
+
+
 def test_verifier_rejects_cross_arm_token_mismatch(tmp_path: Path) -> None:
     helpers = _module(HELPERS, "issue28_helpers_mismatch")
     verifier = _module(VERIFY, "issue28_verify_mismatch")

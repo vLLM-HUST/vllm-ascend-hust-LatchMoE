@@ -28,6 +28,7 @@ CAPACITY_MARKERS = (
     "ACL_ERROR_GE_MEMORY_ALLOCATION",
     "failed to allocate",
     "KV cache memory",
+    "no available memory for the cache blocks",
 )
 REQUIRED_SUCCESS_ARTIFACTS = (
     "metrics.json",

@@ -25,9 +25,9 @@
     "graph_mode": "PIECEWISE"
   },
   "runtime": {
-    "python": "/root/miniconda3/envs/vllm-hust-dev/bin/python",
-    "vllm_root": "/workspace/vllm-hust",
-    "seam_root": "/workspace/vllm-ascend-hust"
+    "python": "/root/miniconda3/envs/latchmoe/bin/python",
+    "vllm_root": "/workspace/latchmoe-locked-stack/vllm-hust",
+    "seam_root": "/workspace/latchmoe-locked-stack/vllm-ascend-hust"
   },
   "arms": [
     {
@@ -41,10 +41,10 @@
         "--contract", "{contract}", "--output-dir", "{unit_dir}",
         "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
         "--case", "full_resident", "--workload", "prefill_heavy",
-        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--device", "{device}", "--port", "{port}", "--python", "{python}", "--host-python", "{python}",
         "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
         "--manifest", "{request_manifest}", "--model-path", "{model_path}",
-        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+        "--dataset-path", "/workspace/latchmoe-issue26-npu5/manifests/issue26_prefill_heavy_v1.jsonl"
       ],
       "env": {
         "ASCEND_RT_VISIBLE_DEVICES": "5"
@@ -61,10 +61,10 @@
         "--contract", "{contract}", "--output-dir", "{unit_dir}",
         "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
         "--case", "native_prefetch", "--workload", "prefill_heavy",
-        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--device", "{device}", "--port", "{port}", "--python", "{python}", "--host-python", "{python}",
         "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
         "--manifest", "{request_manifest}", "--model-path", "{model_path}",
-        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+        "--dataset-path", "/workspace/latchmoe-issue26-npu5/manifests/issue26_prefill_heavy_v1.jsonl"
       ],
       "env": {
         "ASCEND_RT_VISIBLE_DEVICES": "5"
@@ -81,10 +81,10 @@
         "--contract", "{contract}", "--output-dir", "{unit_dir}",
         "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
         "--case", "legacy_layered", "--workload", "prefill_heavy",
-        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--device", "{device}", "--port", "{port}", "--python", "{python}", "--host-python", "{python}",
         "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
         "--manifest", "{request_manifest}", "--model-path", "{model_path}",
-        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+        "--dataset-path", "/workspace/latchmoe-issue26-npu5/manifests/issue26_prefill_heavy_v1.jsonl"
       ],
       "env": {
         "ASCEND_RT_VISIBLE_DEVICES": "5"
@@ -101,10 +101,10 @@
         "--contract", "{contract}", "--output-dir", "{unit_dir}",
         "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
         "--case", "latchmoe_full_layer", "--workload", "prefill_heavy",
-        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--device", "{device}", "--port", "{port}", "--python", "{python}", "--host-python", "{python}",
         "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
         "--manifest", "{request_manifest}", "--model-path", "{model_path}",
-        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+        "--dataset-path", "/workspace/latchmoe-issue26-npu5/manifests/issue26_prefill_heavy_v1.jsonl"
       ],
       "env": {
         "ASCEND_RT_VISIBLE_DEVICES": "5"
@@ -121,10 +121,10 @@
         "--contract", "{contract}", "--output-dir", "{unit_dir}",
         "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
         "--case", "latchmoe_multi_wave", "--workload", "prefill_heavy",
-        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--device", "{device}", "--port", "{port}", "--python", "{python}", "--host-python", "{python}",
         "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
         "--manifest", "{request_manifest}", "--model-path", "{model_path}",
-        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+        "--dataset-path", "/workspace/latchmoe-issue26-npu5/manifests/issue26_prefill_heavy_v1.jsonl"
       ],
       "env": {
         "ASCEND_RT_VISIBLE_DEVICES": "5"

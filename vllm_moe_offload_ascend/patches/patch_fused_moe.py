@@ -479,10 +479,19 @@ def _patch_rms_norm_quant_fusion_cann_compat() -> bool:
 def _patch_rms_norm_bias_cann_compat() -> None:
     """Use the supported torch_npu RMSNorm path on older CANN runtimes.
 
-    This affects only vLLM-Ascend's residual RMSNorm custom op. It deliberately
-    leaves the LatchMoE router -> stage -> MLP custom-op seam enabled.
+    This affects only vLLM-Ascend's RMSNorm compatibility boundaries (including
+    Gemma's no-residual form). It deliberately leaves the LatchMoE router ->
+    stage -> MLP custom-op seam enabled.
     """
-    if _opapi_supports_add_rms_norm_bias():
+    try:
+        import torch
+
+        custom_gemma_rms_norm_available = hasattr(
+            torch.ops._C_ascend, "npu_gemma_rms_norm"
+        )
+    except Exception:
+        custom_gemma_rms_norm_available = False
+    if _opapi_supports_add_rms_norm_bias() and custom_gemma_rms_norm_available:
         return
     changed = _patch_rms_norm_quant_fusion_cann_compat()
     try:
@@ -513,6 +522,15 @@ def _patch_rms_norm_bias_cann_compat() -> None:
             _original=original,
             _is_gemma=is_gemma,
         ):
+            if residual is None and _is_gemma and not custom_gemma_rms_norm_available:
+                import torch_npu
+
+                x, _ = torch_npu.npu_rms_norm(
+                    x,
+                    1.0 + self.weight,
+                    self.variance_epsilon,
+                )
+                return x
             if residual is None:
                 return _original(self, x, residual)
 
@@ -964,6 +982,8 @@ def _patch_model_runner_graph_warmup_context() -> None:
 
 
 _GDN_CAUSAL_CONV1D_OP_NAME = "npu_causal_conv1d_custom"
+_GDN_FUSED_GATING_OP_NAME = "npu_fused_gdn_gating"
+_GDN_RECURRENT_DELTA_RULE_OP_NAME = "npu_recurrent_gated_delta_rule"
 _GDN_CAUSAL_CONV1D_TENSOR_ARGS = (
     "query_start_loc_opt",
     "cache_indices_opt",
@@ -971,6 +991,7 @@ _GDN_CAUSAL_CONV1D_TENSOR_ARGS = (
     "num_accepted_tokens_opt",
 )
 _GDN_CUSTOM_OP_VENDOR_ENV = "ASCEND_CUSTOM_OPP_PATH"
+_GDN_PYTORCH_FALLBACK_ENV = "LATCHMOE_ENABLE_GDN_PYTORCH_FALLBACK"
 _GDN_CUSTOM_OP_VENDOR_RELATIVE_PATH = Path(
     "_cann_ops_custom/vendors/custom_transformer"
 )
@@ -1109,6 +1130,340 @@ def _patch_gdn_causal_conv1d_tensor_abi(torch_module: object | None = None) -> b
     return True
 
 
+def _gdn_causal_conv1d_fallback_host_values(value: object) -> list[int] | None:
+    """Materialize the small host-side argument vectors used by GDN.
+
+    The pinned vLLM-Ascend frontend passes tuples while newer custom-op
+    frontends pass device tensors.  The fallback is intentionally eager and
+    qualification-only, so converting a tensor to a bounded host list is
+    preferable to silently guessing a layout.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, (tuple, list)):
+        if not value:
+            return None
+        return [int(item) for item in value]
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            return [int(item) for item in value.detach().to("cpu").flatten().tolist()]
+    except Exception:
+        pass
+    raise TypeError(f"Unsupported GDN causal-conv argument type: {type(value)!r}")
+
+
+def _gdn_causal_conv1d_pytorch_fallback(
+    output: object,
+    x: object,
+    weight: object,
+    *,
+    conv_state: object,
+    bias_opt: object = None,
+    query_start_loc_opt: object = None,
+    cache_indices_opt: object = None,
+    initial_state_mode_opt: object = None,
+    num_accepted_tokens_opt: object = None,
+    activation_mode: int = 0,
+    pad_slot_id: int = -1,
+    run_mode: int = 0,
+) -> object:
+    """Qualification fallback for CANN builds without the GDN custom op.
+
+    CANN 9.0.1 on the available 910B device does not expose
+    ``npu_causal_conv1d_custom``.  This preserves that operator's eager
+    prefill/decode state semantics with depthwise ``conv1d`` while retaining
+    the original output/state ABI.  Speculative decoding is deliberately
+    rejected because its sliding-state semantics are not covered here.
+    """
+
+    import torch
+    import torch.nn.functional as functional
+
+    accepted_tokens = _gdn_causal_conv1d_fallback_host_values(num_accepted_tokens_opt)
+    if accepted_tokens:
+        raise RuntimeError(
+            "LatchMoE GDN PyTorch fallback does not support speculative decoding"
+        )
+    if x.dim() != 2 or weight.dim() != 2 or conv_state.dim() != 3:
+        raise RuntimeError(
+            "LatchMoE GDN PyTorch fallback expects x=[tokens,dim], "
+            "weight=[kernel,dim], conv_state=[slots,kernel-1,dim]"
+        )
+
+    query_start_loc = _gdn_causal_conv1d_fallback_host_values(query_start_loc_opt)
+    cache_indices = _gdn_causal_conv1d_fallback_host_values(cache_indices_opt)
+    initial_state_mode = _gdn_causal_conv1d_fallback_host_values(initial_state_mode_opt)
+    if query_start_loc is None:
+        query_start_loc = [0, int(x.size(0))]
+    if cache_indices is None:
+        cache_indices = list(range(len(query_start_loc) - 1))
+    if len(query_start_loc) != len(cache_indices) + 1:
+        raise RuntimeError(
+            "LatchMoE GDN PyTorch fallback received inconsistent sequence metadata"
+        )
+    if initial_state_mode is not None and len(initial_state_mode) != len(cache_indices):
+        raise RuntimeError(
+            "LatchMoE GDN PyTorch fallback received inconsistent initial-state metadata"
+        )
+
+    kernel_width, feature_dim = (int(weight.size(0)), int(weight.size(1)))
+    state_len = kernel_width - 1
+    if state_len <= 0 or int(conv_state.size(1)) < state_len:
+        raise RuntimeError("LatchMoE GDN PyTorch fallback received an invalid state shape")
+    if int(x.size(1)) != feature_dim or int(conv_state.size(2)) != feature_dim:
+        raise RuntimeError("LatchMoE GDN PyTorch fallback received mismatched feature dimensions")
+
+    # The custom-op ABI stores [kernel, dim], whereas torch.nn.functional.conv1d
+    # expects one depthwise filter per channel: [dim, 1, kernel].
+    conv_weight = weight.to(dtype=conv_state.dtype).transpose(0, 1).unsqueeze(1).contiguous()
+    bias = None if bias_opt is None else bias_opt.to(dtype=conv_state.dtype).contiguous()
+    activation = {0: None, 1: "silu"}.get(int(activation_mode))
+    if activation_mode not in (0, 1):
+        raise RuntimeError(f"Unsupported GDN fallback activation mode: {activation_mode!r}")
+
+    # The custom op's state layout is [slot, kernel-1, dim].  Keep the code
+    # explicit so a future frontend cannot accidentally transpose the cache.
+    for sequence_index, slot in enumerate(cache_indices):
+        start = int(query_start_loc[sequence_index])
+        end = int(query_start_loc[sequence_index + 1])
+        if end <= start or int(slot) == int(pad_slot_id):
+            continue
+        if slot < 0 or slot >= int(conv_state.size(0)):
+            raise RuntimeError(f"GDN fallback cache slot out of range: {slot}")
+
+        state = conv_state[int(slot), :state_len]
+        use_initial_state = int(run_mode) == 1
+        if initial_state_mode is not None:
+            use_initial_state = bool(initial_state_mode[sequence_index])
+        prior = state if use_initial_state else torch.zeros_like(state)
+        sequence_x = x[start:end]
+        conv_input = torch.cat((prior, sequence_x), dim=0).transpose(0, 1).unsqueeze(0)
+        sequence_output = functional.conv1d(
+            conv_input,
+            conv_weight,
+            bias,
+            padding=0,
+            groups=feature_dim,
+        )[:, :, -sequence_x.size(0) :]
+        if activation == "silu":
+            sequence_output = functional.silu(sequence_output)
+        output[start:end].copy_(sequence_output.squeeze(0).transpose(0, 1).to(output.dtype))
+        conv_state[int(slot), :state_len].copy_(
+            conv_input[:, :, -state_len:].squeeze(0).transpose(0, 1)
+        )
+    return output
+
+
+def _patch_gdn_causal_conv1d_pytorch_fallback(torch_module: object | None = None) -> bool:
+    """Opt into a narrow eager fallback when the matching CANN op is absent."""
+
+    if not _to_bool_env(_GDN_PYTORCH_FALLBACK_ENV, "0"):
+        return False
+    if torch_module is None:
+        import torch as torch_module
+    try:
+        namespace = torch_module.ops._C_ascend
+        current = getattr(namespace, _GDN_CAUSAL_CONV1D_OP_NAME)
+    except (AttributeError, RuntimeError):
+        current = None
+    if current is not None:
+        return False
+    setattr(namespace, _GDN_CAUSAL_CONV1D_OP_NAME, _gdn_causal_conv1d_pytorch_fallback)
+    print(
+        "LATCHMOE_BACKEND_COMPAT gdn_causal_conv1d=pytorch_fallback "
+        f"env={_GDN_PYTORCH_FALLBACK_ENV}",
+        flush=True,
+    )
+    return True
+
+
+def _gdn_fused_gating_pytorch_fallback(
+    A_log: object,
+    a: object,
+    b: object,
+    dt_bias: object,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[object, object]:
+    """Compatibility implementation for the absent fused GDN gating op."""
+
+    import torch
+
+    compute_dtype = torch.float32
+    A_log_f = A_log.to(compute_dtype)
+    a_f = a.to(compute_dtype)
+    b_f = b.to(compute_dtype)
+    dt_bias_f = dt_bias.to(compute_dtype)
+    x = a_f + dt_bias_f.unsqueeze(0)
+    beta_x = beta * x
+    softplus_x = torch.where(
+        beta_x <= threshold,
+        (1.0 / beta) * torch.log1p(torch.exp(beta_x)),
+        x,
+    )
+    g = (-torch.exp(A_log_f.unsqueeze(0)) * softplus_x).unsqueeze(0)
+    beta_output = torch.sigmoid(b_f).to(b.dtype).unsqueeze(0)
+    return g, beta_output
+
+
+def _patch_gdn_fused_gating_pytorch_fallback(torch_module: object | None = None) -> bool:
+    """Install the opt-in gating fallback only when Ascend custom ops are absent."""
+
+    if not _to_bool_env(_GDN_PYTORCH_FALLBACK_ENV, "0"):
+        return False
+    if torch_module is None:
+        import torch as torch_module
+    try:
+        namespace = torch_module.ops._C_ascend
+        current = getattr(namespace, _GDN_FUSED_GATING_OP_NAME)
+    except (AttributeError, RuntimeError):
+        current = None
+    if current is not None:
+        return False
+    setattr(namespace, _GDN_FUSED_GATING_OP_NAME, _gdn_fused_gating_pytorch_fallback)
+    print(
+        "LATCHMOE_BACKEND_COMPAT gdn_fused_gating=pytorch_fallback "
+        f"env={_GDN_PYTORCH_FALLBACK_ENV}",
+        flush=True,
+    )
+    return True
+
+
+def _gdn_recurrent_delta_rule_npu_fallback(
+    query: object,
+    key: object,
+    value: object,
+    state: object,
+    *,
+    beta: object = None,
+    scale: float | None = None,
+    actual_seq_lengths: object = None,
+    ssm_state_indices: object = None,
+    num_accepted_tokens: object = None,
+    g: object = None,
+    gk: object = None,
+) -> object:
+    """Bridge the vLLM-Ascend name to CANN's public recurrent GDN op."""
+
+    import torch_npu
+
+    return torch_npu.npu_recurrent_gated_delta_rule(
+        query,
+        key,
+        value,
+        state,
+        beta=beta,
+        scale=scale,
+        actual_seq_lengths=actual_seq_lengths,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        g=g,
+        gk=gk,
+    )
+
+
+def _patch_gdn_recurrent_delta_rule_npu_fallback(torch_module: object | None = None) -> bool:
+    """Bridge the public CANN recurrent op when the extension-owned symbol is absent."""
+
+    if not _to_bool_env(_GDN_PYTORCH_FALLBACK_ENV, "0"):
+        return False
+    if torch_module is None:
+        import torch as torch_module
+    try:
+        namespace = torch_module.ops._C_ascend
+        current = getattr(namespace, _GDN_RECURRENT_DELTA_RULE_OP_NAME)
+    except (AttributeError, RuntimeError):
+        current = None
+    if current is not None:
+        return False
+    try:
+        import torch_npu
+
+        if not hasattr(torch_npu, _GDN_RECURRENT_DELTA_RULE_OP_NAME):
+            return False
+    except Exception:
+        return False
+    setattr(namespace, _GDN_RECURRENT_DELTA_RULE_OP_NAME, _gdn_recurrent_delta_rule_npu_fallback)
+    print(
+        "LATCHMOE_BACKEND_COMPAT gdn_recurrent_delta_rule=public_npu "
+        f"env={_GDN_PYTORCH_FALLBACK_ENV}",
+        flush=True,
+    )
+    return True
+
+
+def _patch_gdn_chunk_pytorch_fallback(torch_module: object | None = None) -> bool:
+    """Use vLLM-Ascend's existing reference chunk kernel if AscendC is absent."""
+
+    if not _to_bool_env(_GDN_PYTORCH_FALLBACK_ENV, "0"):
+        return False
+    if torch_module is None:
+        import torch as torch_module
+    try:
+        getattr(torch_module.ops._C_ascend, "chunk_gated_delta_rule_fwd_h")
+        return False
+    except (AttributeError, RuntimeError):
+        pass
+
+    try:
+        import torch
+        from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import (
+            chunk_gated_delta_rule_pytorch,
+        )
+        import vllm_ascend.ops.gdn as gdn_module
+    except Exception:
+        return False
+    current = getattr(gdn_module, "chunk_gated_delta_rule", None)
+    if getattr(current, "_latchmoe_gdn_chunk_fallback", False):
+        return True
+
+    def _chunk_fallback(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=None,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        prebuilt_meta=None,
+        head_first=False,
+        use_qk_l2norm_in_kernel=False,
+        **kwargs,
+    ):
+        del scale, prebuilt_meta, kwargs
+        return chunk_gated_delta_rule_pytorch(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            head_first=head_first,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+
+    _chunk_fallback._latchmoe_gdn_chunk_fallback = True
+    _chunk_fallback.__wrapped__ = current
+    disabled_fallback = torch.compiler.disable(_chunk_fallback)
+    disabled_fallback._latchmoe_gdn_chunk_fallback = True
+    gdn_module.chunk_gated_delta_rule = disabled_fallback
+    print(
+        "LATCHMOE_BACKEND_COMPAT gdn_chunk=pytorch_fallback "
+        f"env={_GDN_PYTORCH_FALLBACK_ENV}",
+        flush=True,
+    )
+    return True
+
+
 def _patch_gdn_causal_conv1d_tensor_abi_when_loaded() -> None:
     """Retry the ABI patch at the first GDN core call after lazy op loading."""
 
@@ -1123,6 +1478,7 @@ def _patch_gdn_causal_conv1d_tensor_abi_when_loaded() -> None:
     original = current
 
     def _forward_core_with_tensor_abi(self, *args, **kwargs):
+        _patch_gdn_causal_conv1d_pytorch_fallback()
         _patch_gdn_causal_conv1d_tensor_abi()
         # Custom-op registration is complete by the first forward. Avoid a
         # per-layer compatibility probe after that point.
@@ -1202,6 +1558,10 @@ def _install_runtime_module_patches() -> None:
 
     _patch_model_runner_profile_context()
     _patch_model_runner_graph_warmup_context()
+    _patch_gdn_causal_conv1d_pytorch_fallback()
+    _patch_gdn_fused_gating_pytorch_fallback()
+    _patch_gdn_recurrent_delta_rule_npu_fallback()
+    _patch_gdn_chunk_pytorch_fallback()
     _patch_gdn_causal_conv1d_tensor_abi()
     _patch_gdn_causal_conv1d_tensor_abi_when_loaded()
     _patch_single_local_expert_device_sync()

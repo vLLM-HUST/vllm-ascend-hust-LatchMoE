@@ -16,7 +16,12 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from issue28_campaign import contract_digest, load_contract, read_json  # noqa: E402
+from issue28_campaign import (  # noqa: E402
+    contains_capacity_marker,
+    contract_digest,
+    load_contract,
+    read_json,
+)
 
 
 def _write(path: Path, payload: dict[str, Any]) -> None:
@@ -39,7 +44,14 @@ def _copy_if_present(source: Path, target: Path, names: list[str]) -> list[str]:
     return copied
 
 
-def _materialize_artifacts(source: Path, target: Path, contract: dict[str, Any], digest: str) -> None:
+def _materialize_artifacts(
+    source: Path,
+    target: Path,
+    contract: dict[str, Any],
+    digest: str,
+    *,
+    arm_name: str,
+) -> None:
     benchmark = read_json(source / "benchmark.json") if (source / "benchmark.json").is_file() else {}
     per_request = benchmark.get("per_request") or []
     ttft_ms: list[float] = []
@@ -75,22 +87,37 @@ def _materialize_artifacts(source: Path, target: Path, contract: dict[str, Any],
     _write(target / "outputs.json", {**identity, "request_outputs": outputs})
     server_log = (source / "server.log").read_text(encoding="utf-8", errors="replace") if (source / "server.log").is_file() else ""
     profile = _jsonl(source / "moe_profile.jsonl")
-    wave_counts = [
-        int(((record.get("payload") or {}).get("wave_summary") or {}).get("wave_count") or 0)
-        for record in profile
-    ]
+    wave_counts = []
+    for record in profile:
+        payload = record.get("payload") or {}
+        summary = payload.get("wave_summary") or {}
+        wave_count = summary.get("wave_count") or payload.get("n_waves")
+        if wave_count:
+            wave_counts.append(int(wave_count))
     fallback_count = sum(
         1
         for record in profile
         if (record.get("payload") or {}).get("fallback_reason") not in (None, "")
     )
+    if "LATCHMOE_GRAPH_CONFIG cudagraph_mode=PIECEWISE" in server_log:
+        graph_mode = "PIECEWISE"
+    elif "cudagraph_mode=<CUDAGraphMode.PIECEWISE" in server_log:
+        graph_mode = "PIECEWISE"
+    elif "CUDAGraphMode.FULL_AND_PIECEWISE" in server_log:
+        graph_mode = "FULL_AND_PIECEWISE"
+    elif "CUDAGraphMode.PIECEWISE" in server_log:
+        graph_mode = "PIECEWISE"
+    else:
+        graph_mode = "unknown"
     _write(target / "runtime.json", {
         **identity,
-        "graph_mode": "PIECEWISE" if "cudagraph_mode=PIECEWISE" in server_log else "unknown",
+        "arm": arm_name,
+        "graph_mode": graph_mode,
         "graph_capture": "Graph capturing finished" in server_log,
         "graph_replay": "Replaying aclgraph" in server_log,
         "fallback_count": fallback_count,
-        "wave_count": max(wave_counts or [1]),
+        "wave_count": max(wave_counts) if wave_counts else None,
+        "wave_count_available": bool(wave_counts),
     })
     npu_samples = _jsonl(source / "npu_samples.jsonl")
     hbm_values = [float(item["hbm_usage_percent"]) for item in npu_samples if item.get("hbm_usage_percent") is not None]
@@ -100,18 +127,32 @@ def _materialize_artifacts(source: Path, target: Path, contract: dict[str, Any],
         "hbm_peak_percent": max(hbm_values) if hbm_values else None,
         "hbm_peak_mb": max(hbm_values) * hbm_capacity_mb / 100.0 if hbm_values and hbm_capacity_mb else None,
     })
-    h2d_events = [
-        record for record in profile
-        if int((record.get("payload") or {}).get("h2d_bytes") or 0) > 0
-    ]
-    dependency_ok = bool(h2d_events) and all(
-        (record.get("payload") or {}).get("consumer_dependency_installed") is True
-        for record in h2d_events
-    )
+    h2d_events = []
+    dependency_checks = []
+    for record in profile:
+        payload = record.get("payload") or {}
+        summary = payload.get("wave_summary") or {}
+        h2d_bytes = int(payload.get("h2d_bytes") or summary.get("h2d_bytes") or 0)
+        if h2d_bytes <= 0:
+            continue
+        h2d_events.append({"name": record.get("name"), "h2d_bytes": h2d_bytes})
+        if "consumer_dependency_installed" in payload:
+            dependency_checks.append(payload["consumer_dependency_installed"] is True)
+    if dependency_checks:
+        dependency_evidence = True
+        dependency_ok = bool(h2d_events) and all(dependency_checks)
+    else:
+        dependency_evidence = False
+        dependency_ok = None
     _write(target / "transfers.json", {
         **identity,
+        "arm": arm_name,
         "h2d_count": len(h2d_events),
         "h2d_dependency_ok": dependency_ok,
+        "h2d_dependency_evidence": dependency_evidence,
+        "h2d_bytes": sum(item["h2d_bytes"] for item in h2d_events),
+        "h2d_event_names": sorted({str(item["name"]) for item in h2d_events}),
+        "h2d_instrumentation": "latchmoe_profile" if h2d_events else "not_observed",
     })
 
 
@@ -123,6 +164,7 @@ def main() -> int:
     parser.add_argument("--case", required=True)
     parser.add_argument("--workload", required=True)
     parser.add_argument("--device", required=True, type=int)
+    parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--python", required=True, type=Path)
     parser.add_argument("--host-python", required=True, type=Path)
     parser.add_argument("--vllm-root", required=True, type=Path)
@@ -144,7 +186,7 @@ def main() -> int:
         "--config", str(args.config.resolve()), "--output-root", str(suite_root),
         "--case", args.case, "--workload", args.workload,
         "--managed-backend", "locked-host", "--server-manager", str(REPO_ROOT / "benchmark/scripts/manage_locked_host_runtime.py"),
-        "--device", str(args.device), "--host-python", str(args.host_python.resolve()),
+        "--device", str(args.device), "--port", str(args.port), "--host-python", str(args.host_python.resolve()),
         "--vllm-root", str(args.vllm_root.resolve()), "--seam-root", str(args.seam_root.resolve()),
         "--release-ack-dir", str(output / "release-acks"), "--python", str(args.python.resolve()),
         "--manifest", str(args.manifest.resolve()), "--model-path", str(args.model_path.resolve()),
@@ -155,7 +197,15 @@ def main() -> int:
         command.extend(["--max-requests", str(args.max_requests)])
     completed = subprocess.run(command, cwd=REPO_ROOT, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(completed.stdout, end="")
-    suites = sorted(path for path in suite_root.glob("sew-offload-ascend-v1-*") if path.is_dir())
+    # The suite name is supplied by the selected YAML config.  Issue #28 uses
+    # issue28-glm-prefill-v1, while the historical default was
+    # sew-offload-ascend-v1.  Identify the one materialized suite by its
+    # manifest instead of hard-coding the historical prefix.
+    suites = sorted(
+        path
+        for path in suite_root.iterdir()
+        if path.is_dir() and (path / "suite_manifest.json").is_file()
+    )
     if len(suites) != 1:
         _write(output / "unit_result.json", {"status": "failed", "release_status": "not_released", "error": f"expected one suite directory, found {len(suites)}", "raw_artifacts": ["stdout.log"]})
         return completed.returncode or 1
@@ -167,8 +217,16 @@ def main() -> int:
         "server.log", "client.log", "launcher_lifecycle.log", "moe_profile.jsonl", "moe_trace.jsonl", "npu_samples.jsonl", "release_ack.json", "benchmark.json", "summary.md", "PASSED.txt", "FAILED.txt",
     ])
     source_result = read_json(source / "unit_result.json") if (source / "unit_result.json").is_file() else {}
-    status = "success" if source_result.get("status") == "ok" and completed.returncode == 0 else "failed"
-    _materialize_artifacts(source, output, contract, digest)
+    source_logs = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in (source / "server.log", source / "client.log")
+        if path.is_file()
+    )
+    if completed.returncode != 0 and contains_capacity_marker(source_logs):
+        status = "capacity_failure"
+    else:
+        status = "success" if source_result.get("status") == "ok" and completed.returncode == 0 else "failed"
+    _materialize_artifacts(source, output, contract, digest, arm_name=args.case)
     raw = [name for name in copied if name not in {"unit_manifest.json", "unit_result.json"}]
     raw.extend(name for name in ("metrics.json", "outputs.json", "runtime.json", "memory.json", "transfers.json") if name not in raw)
     _write(output / "unit_result.json", {

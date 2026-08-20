@@ -13,6 +13,8 @@ from vllm_moe_offload_ascend.patches.patch_fused_moe import (
     _install_runtime_patches_when_ready,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
+    _patch_moe_gating_top_k_cann_compat,
+    _patch_moe_init_routing_cann_compat,
     _patch_kv_cache_capacity_backstop,
     _unpack_mlp_apply_result,
 )
@@ -499,6 +501,123 @@ def test_cann_compat_install_does_not_install_moe_runtime(monkeypatch):
     ]
 
 
+def test_cann_moe_gating_falls_back_to_native_op(monkeypatch):
+    import types
+
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    calls = []
+
+    def native_moe_gating_top_k(x, k, **kwargs):
+        calls.append((x, k, kwargs))
+        return (
+            torch.tensor([[1.0, 3.0]], dtype=torch.float32),
+            torch.tensor([[7, 9]], dtype=torch.int64),
+            torch.zeros((1, 4), dtype=torch.float32),
+        )
+
+    fake_torch_npu = types.ModuleType("torch_npu")
+    fake_torch_npu.npu_moe_gating_top_k = native_moe_gating_top_k
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    class BaseDeviceAdaptor:
+        @staticmethod
+        def moe_gating_top_k(*args, **kwargs):
+            raise AssertionError("the missing custom op path was not patched")
+
+    device_op = types.ModuleType("vllm_ascend.device.device_op")
+    device_op.BaseDeviceAdaptor = BaseDeviceAdaptor
+    device_package = types.ModuleType("vllm_ascend.device")
+    device_package.device_op = device_op
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device", device_package)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+
+    assert patch_fused_moe._patch_moe_gating_top_k_cann_compat() is True
+    weights, ids, out = BaseDeviceAdaptor.moe_gating_top_k(
+        torch.zeros((1, 4)),
+        k=2,
+        k_group=1,
+        group_count=1,
+        group_select_mode=1,
+        renorm=1,
+        norm_type=0,
+        out_flag=False,
+    )
+
+    assert calls[0][1:] == (2, {
+        "bias": None,
+        "k_group": 1,
+        "group_count": 1,
+        "group_select_mode": 1,
+        "renorm": 0,
+        "norm_type": 0,
+        "out_flag": False,
+        "routed_scaling_factor": 1.0,
+        "eps": 1e-20,
+    })
+    torch.testing.assert_close(weights, torch.tensor([[0.25, 0.75]]))
+    assert ids.dtype == torch.int32
+    assert out.shape == (1, 4)
+    assert patch_fused_moe._patch_moe_gating_top_k_cann_compat() is False
+
+
+def test_cann_moe_init_routing_falls_back_to_native_op(monkeypatch):
+    import types
+
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    calls = []
+
+    def native_moe_init_routing_v2(hidden_states, topk_ids, **kwargs):
+        calls.append((hidden_states, topk_ids, kwargs))
+        return ("sorted", "row_idx", "expert_tokens", "scale")
+
+    fake_torch_npu = types.ModuleType("torch_npu")
+    fake_torch_npu.npu_moe_init_routing_v2 = native_moe_init_routing_v2
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    class BaseDeviceAdaptor:
+        @staticmethod
+        def npu_moe_init_routing(*args, **kwargs):
+            raise AssertionError("the missing custom op path was not patched")
+
+    device_op = types.ModuleType("vllm_ascend.device.device_op")
+    device_op.BaseDeviceAdaptor = BaseDeviceAdaptor
+    device_package = types.ModuleType("vllm_ascend.device")
+    device_package.device_op = device_op
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device", device_package)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+
+    assert patch_fused_moe._patch_moe_init_routing_cann_compat() is True
+    hidden_states = torch.zeros((2, 4))
+    topk_ids = torch.zeros((2, 2), dtype=torch.int32)
+    result = BaseDeviceAdaptor.npu_moe_init_routing(
+        hidden_states,
+        topk_ids,
+        active_num=-1,
+        expert_num=4,
+    )
+
+    assert result == ("sorted", "row_idx", "expert_tokens", "scale")
+    assert calls[0][2] == {
+        "scale": None,
+        "active_num": 4,
+        "expert_capacity": -1,
+        "expert_num": 4,
+        "drop_pad_mode": 0,
+        "expert_tokens_num_type": 1,
+        "expert_tokens_num_flag": True,
+        "quant_mode": -1,
+        "active_expert_range": [0, 4],
+        "row_idx_type": 0,
+    }
+    assert patch_fused_moe._patch_moe_init_routing_cann_compat() is False
+
+
 def test_adapt_patch_retries_complete_ready_path(monkeypatch):
     import vllm_ascend.utils as ascend_utils
 
@@ -572,6 +691,10 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
         None,
         "next_residual",
     )
+    fake_torch_npu.npu_rms_norm = lambda x, weight, eps: (
+        ("gemma-normalized", x, weight, eps),
+        "gemma-residual",
+    )
 
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(patch_fused_moe, "_opapi_supports_add_rms_norm_bias", lambda: False)
@@ -590,9 +713,10 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
         "next_residual",
     )
     assert FakeGemmaRMSNorm().forward_oot("x") == (
-        "gemma-original",
+        "gemma-normalized",
         "x",
-        None,
+        4.0,
+        1e-6,
     )
 
 
