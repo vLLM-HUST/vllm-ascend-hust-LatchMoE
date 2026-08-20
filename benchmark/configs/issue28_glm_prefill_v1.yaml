@@ -1,0 +1,198 @@
+benchmark:
+  id: issue28_glm_prefill_v1
+  config_version: 1
+  suite: issue28-glm-prefill-v1
+  description: Fixed matched campaign contract for GLM-4.7-Flash on one Ascend NPU.
+
+model:
+  name: glm-4.7-flash
+  served_model_name: glm-4.7-flash
+  path: /workspace/shared_models/strict-models/GLM-4.7-Flash
+  tokenizer: /workspace/shared_models/strict-models/GLM-4.7-Flash
+  dtype: bfloat16
+  tensor_parallel_size: 1
+  trust_remote_code: true
+
+hardware:
+  vendor: Huawei
+  chip_model: 910B-class
+  chip_count: 1
+  target_device: single_npu
+
+dataset:
+  source: sharegpt
+  local_path: /workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+  manifest_path: benchmark/artifacts/workloads/issue26_prefill_heavy_v1.jsonl
+  seed: 42
+  random_dataset_allowed: false
+  synthetic_smoke_allowed: false
+
+server:
+  command: latchmoe
+  host: 127.0.0.1
+  port: 8028
+  startup_timeout_s: 1200
+  shutdown_timeout_s: 30
+  common_args:
+    - serve
+    - "{model_path}"
+    - --served-model-name
+    - "{served_model_name}"
+    - --trust-remote-code
+    - --dtype
+    - "{dtype}"
+    - --tensor-parallel-size
+    - "{tensor_parallel_size}"
+    - --host
+    - "{host}"
+    - --port
+    - "{port}"
+    - --max-num-seqs
+    - "{max_num_seqs}"
+    - --max-model-len
+    - "{max_model_len}"
+    - --max-num-batched-tokens
+    - "{max_num_batched_tokens}"
+    - --gpu-memory-utilization
+    - "{gpu_memory_utilization}"
+    - --no-enable-prefix-caching
+
+client:
+  endpoint: /v1/chat/completions
+  request_timeout_s: 900
+  concurrency: 1
+  tokenizer_count_output_tokens: true
+
+serving_shape:
+  max_num_seqs: 1
+  max_model_len: 512
+  max_num_batched_tokens: 512
+  gpu_memory_utilization: 0.90
+
+workload_buckets:
+  - name: prefill_heavy
+    title: Issue #28 fixed prefill-heavy workload
+    default_enabled: true
+    prompt_tokens:
+      - 256
+      - 512
+    output_tokens: 32
+    num_requests: 64
+    tags:
+      - issue28
+      - prefill
+      - matched
+
+cases:
+  - name: full_resident
+    title: Full-resident capacity baseline
+    role: baseline
+    default_enabled: false
+    expected_status: success_or_capacity_failure
+    experiment_groups: [issue28_matched]
+    description: Full-resident baseline; capacity failure is retained as evidence.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE:
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+  - name: native_prefetch
+    title: Native vLLM expert prefetch baseline
+    role: baseline
+    default_enabled: false
+    expected_status: success
+    experiment_groups: [issue28_matched]
+    description: Native prefetch with the same model, request and serving shape.
+    server_args:
+      - --offload-backend
+      - prefetch
+      - --cpu-offload-gb
+      - "14"
+      - --offload-params
+      - experts
+      - --offload-group-size
+      - "4"
+      - --offload-num-in-group
+      - "1"
+      - --offload-prefetch-step
+      - "1"
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_GB:
+  - name: legacy_layered
+    title: Legacy layered plugin baseline
+    role: baseline
+    default_enabled: false
+    expected_status: success
+    experiment_groups: [issue28_matched]
+    description: Plugin layered path without the fixed-slot SEW dataplane.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED:
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "0"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+  - name: latchmoe_full_layer
+    title: LatchMoE full-layer staging
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups: [issue28_matched]
+    description: Fixed-slot LatchMoE with reference full-layer prefill.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "4"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE: full_layer
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS: "1"
+  - name: latchmoe_multi_wave
+    title: LatchMoE multi-wave prefill
+    role: ablation
+    default_enabled: false
+    expected_status: success
+    experiment_groups: [issue28_matched]
+    description: Fixed-slot LatchMoE with work-conserving multi-wave prefill.
+    env:
+      VLLM_ASCEND_MOE_OFFLOAD_ENABLED: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_GB: "14"
+      VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS: "4"
+      VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_WAVE_PREFILL: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_B2_OVERFLOW_MODE: multi_wave
+      VLLM_ASCEND_MOE_OFFLOAD_TRANSFER_AWARE_SCHEDULE: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_CPU_FIRST_LOAD: "1"
+      VLLM_ASCEND_MOE_OFFLOAD_RELEASE_ORIGINAL_EXPERT_WEIGHTS: "1"
+
+experiments:
+  issue28_matched:
+    title: Issue #28 three-repeat matched campaign
+    workloads: [prefill_heavy]
+    cases:
+      - full_resident
+      - native_prefetch
+      - legacy_layered
+      - latchmoe_full_layer
+      - latchmoe_multi_wave
+
+metrics:
+  serving: [successful_requests, failed_requests, ttft_ms, tpot_ms, output_throughput]
+  memory: [hbm_peak_mb, hbm_peak_percent]
+  transfer: [h2d_count, h2d_dependency_ok]
+  runtime: [graph_mode, graph_capture, graph_replay, fallback_count, wave_count]
+
+artifact_contract:
+  unit_manifest: unit_manifest.json
+  unit_result: unit_result.json
+  runner_result: runner_result.json
+  stdout: stdout.log
+  stderr: stderr.log
+  metrics: metrics.json
+  outputs: outputs.json
+  runtime: runtime.json
+  memory: memory.json
+  transfers: transfers.json

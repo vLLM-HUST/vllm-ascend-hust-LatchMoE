@@ -1,0 +1,151 @@
+{
+  "schema": "latchmoe.issue28.campaign/v1",
+  "campaign_id": "issue28-glm-prefill-v1",
+  "description": "Frozen matched campaign contract for GLM-4.7-Flash on one Ascend NPU.",
+  "model": {
+    "name": "glm-4.7-flash",
+    "checkpoint": "/workspace/shared_models/strict-models/GLM-4.7-Flash",
+    "config_sha256": "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb",
+    "dtype": "bfloat16"
+  },
+  "request_manifest": {
+    "path": "/workspace/latchmoe-issue26-npu5/manifests/issue26_prefill_heavy_v1.jsonl",
+    "sha256": "5c0a46fa93b4782c056923088fb5d88c5286148fca59652d414002961c368b1a",
+    "request_count": 1,
+    "order_frozen": true
+  },
+  "serving": {
+    "device": 5,
+    "hbm_capacity_mb": 65536,
+    "kv_cache_memory_mb": 512,
+    "num_slots": 4,
+    "max_num_seqs": 1,
+    "max_model_len": 512,
+    "max_num_batched_tokens": 512,
+    "graph_mode": "PIECEWISE"
+  },
+  "runtime": {
+    "python": "/root/miniconda3/envs/vllm-hust-dev/bin/python",
+    "vllm_root": "/workspace/vllm-hust",
+    "seam_root": "/workspace/vllm-ascend-hust"
+  },
+  "arms": [
+    {
+      "name": "full_resident",
+      "role": "baseline",
+      "expected_status": "success_or_capacity_failure",
+      "repeats": 3,
+      "case": "full_resident",
+      "command": [
+        "{python}", "{repo_root}/benchmark/scripts/run_issue28_unit.py",
+        "--contract", "{contract}", "--output-dir", "{unit_dir}",
+        "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
+        "--case", "full_resident", "--workload", "prefill_heavy",
+        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
+        "--manifest", "{request_manifest}", "--model-path", "{model_path}",
+        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+      ],
+      "env": {
+        "ASCEND_RT_VISIBLE_DEVICES": "5"
+      }
+    },
+    {
+      "name": "native_prefetch",
+      "role": "baseline",
+      "expected_status": "success",
+      "repeats": 3,
+      "case": "native_prefetch",
+      "command": [
+        "{python}", "{repo_root}/benchmark/scripts/run_issue28_unit.py",
+        "--contract", "{contract}", "--output-dir", "{unit_dir}",
+        "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
+        "--case", "native_prefetch", "--workload", "prefill_heavy",
+        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
+        "--manifest", "{request_manifest}", "--model-path", "{model_path}",
+        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+      ],
+      "env": {
+        "ASCEND_RT_VISIBLE_DEVICES": "5"
+      }
+    },
+    {
+      "name": "legacy_layered",
+      "role": "baseline",
+      "expected_status": "success",
+      "repeats": 3,
+      "case": "legacy_layered",
+      "command": [
+        "{python}", "{repo_root}/benchmark/scripts/run_issue28_unit.py",
+        "--contract", "{contract}", "--output-dir", "{unit_dir}",
+        "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
+        "--case", "legacy_layered", "--workload", "prefill_heavy",
+        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
+        "--manifest", "{request_manifest}", "--model-path", "{model_path}",
+        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+      ],
+      "env": {
+        "ASCEND_RT_VISIBLE_DEVICES": "5"
+      }
+    },
+    {
+      "name": "latchmoe_full_layer",
+      "role": "latchmoe",
+      "expected_status": "success",
+      "repeats": 3,
+      "case": "latchmoe_full_layer",
+      "command": [
+        "{python}", "{repo_root}/benchmark/scripts/run_issue28_unit.py",
+        "--contract", "{contract}", "--output-dir", "{unit_dir}",
+        "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
+        "--case", "latchmoe_full_layer", "--workload", "prefill_heavy",
+        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
+        "--manifest", "{request_manifest}", "--model-path", "{model_path}",
+        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+      ],
+      "env": {
+        "ASCEND_RT_VISIBLE_DEVICES": "5"
+      }
+    },
+    {
+      "name": "latchmoe_multi_wave",
+      "role": "latchmoe",
+      "expected_status": "success",
+      "repeats": 3,
+      "case": "latchmoe_multi_wave",
+      "command": [
+        "{python}", "{repo_root}/benchmark/scripts/run_issue28_unit.py",
+        "--contract", "{contract}", "--output-dir", "{unit_dir}",
+        "--config", "{repo_root}/benchmark/configs/issue28_glm_prefill_v1.yaml",
+        "--case", "latchmoe_multi_wave", "--workload", "prefill_heavy",
+        "--device", "{device}", "--python", "{python}", "--host-python", "{python}",
+        "--vllm-root", "{vllm_root}", "--seam-root", "{seam_root}",
+        "--manifest", "{request_manifest}", "--model-path", "{model_path}",
+        "--dataset-path", "/workspace/shared_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+      ],
+      "env": {
+        "ASCEND_RT_VISIBLE_DEVICES": "5"
+      }
+    }
+  ],
+  "order": [
+    {"arm": "full_resident", "repeat": 1},
+    {"arm": "native_prefetch", "repeat": 1},
+    {"arm": "legacy_layered", "repeat": 1},
+    {"arm": "latchmoe_full_layer", "repeat": 1},
+    {"arm": "latchmoe_multi_wave", "repeat": 1},
+    {"arm": "latchmoe_multi_wave", "repeat": 2},
+    {"arm": "latchmoe_full_layer", "repeat": 2},
+    {"arm": "legacy_layered", "repeat": 2},
+    {"arm": "native_prefetch", "repeat": 2},
+    {"arm": "full_resident", "repeat": 2},
+    {"arm": "full_resident", "repeat": 3},
+    {"arm": "native_prefetch", "repeat": 3},
+    {"arm": "legacy_layered", "repeat": 3},
+    {"arm": "latchmoe_full_layer", "repeat": 3},
+    {"arm": "latchmoe_multi_wave", "repeat": 3}
+  ]
+}
