@@ -13,10 +13,19 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUN_SUITE_PATH = REPO_ROOT / "benchmark" / "scripts" / "run_suite.py"
+MANAGER_PATH = REPO_ROOT / "benchmark" / "scripts" / "manage_locked_host_runtime.py"
 
 
 def _load_run_suite():
     spec = importlib.util.spec_from_file_location("managed_run_suite_test", RUN_SUITE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_manager():
+    spec = importlib.util.spec_from_file_location("managed_host_manager_test", MANAGER_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -128,7 +137,30 @@ def test_locked_host_env_pins_custody_and_piecewise_graph(tmp_path: Path) -> Non
     assert env["LATCHMOE_CUSTODY_STATE"].endswith("custody_state.json")
     compilation = json.loads(env["VLLM_ENGINE_COMPILATION_CONFIG"])
     assert compilation["cudagraph_mode"] == "PIECEWISE"
-    assert compilation["splitting_ops"] == ["vllm::moe_offload_stage"]
+    assert "vllm::deepseek_v4_attention" in compilation["splitting_ops"]
+    assert "vllm::unified_kv_cache_update" in compilation["splitting_ops"]
+    assert compilation["splitting_ops"][-1] == "vllm::moe_offload_stage"
+
+
+def test_locked_host_manager_consumes_piecewise_compilation_config(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VLLM_ENGINE_COMPILATION_CONFIG",
+        '{"cudagraph_mode":"PIECEWISE","splitting_ops":["vllm::moe_offload_stage"]}',
+    )
+    manager = _load_manager()
+    args = manager._compilation_config_args([])
+    assert args[0] == "--compilation-config"
+    assert json.loads(args[1]) == {
+        "cudagraph_mode": "PIECEWISE",
+        "splitting_ops": ["vllm::moe_offload_stage"],
+    }
+
+
+def test_locked_host_manager_rejects_compilation_config_override(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ENGINE_COMPILATION_CONFIG", '{"cudagraph_mode":"PIECEWISE"}')
+    manager = _load_manager()
+    with pytest.raises(ValueError, match="must not override"):
+        manager._compilation_config_args(["--compilation-config"])
 
 
 def test_locked_host_manager_stops_only_its_process_group(tmp_path: Path) -> None:

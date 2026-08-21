@@ -13,6 +13,8 @@ from vllm_moe_offload_ascend.patches.patch_fused_moe import (
     _install_runtime_patches_when_ready,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
+    _patch_moe_gating_top_k_cann_compat,
+    _patch_moe_init_routing_cann_compat,
     _patch_kv_cache_capacity_backstop,
     _unpack_mlp_apply_result,
 )
@@ -499,6 +501,123 @@ def test_cann_compat_install_does_not_install_moe_runtime(monkeypatch):
     ]
 
 
+def test_cann_moe_gating_falls_back_to_native_op(monkeypatch):
+    import types
+
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    calls = []
+
+    def native_moe_gating_top_k(x, k, **kwargs):
+        calls.append((x, k, kwargs))
+        return (
+            torch.tensor([[1.0, 3.0]], dtype=torch.float32),
+            torch.tensor([[7, 9]], dtype=torch.int64),
+            torch.zeros((1, 4), dtype=torch.float32),
+        )
+
+    fake_torch_npu = types.ModuleType("torch_npu")
+    fake_torch_npu.npu_moe_gating_top_k = native_moe_gating_top_k
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    class BaseDeviceAdaptor:
+        @staticmethod
+        def moe_gating_top_k(*args, **kwargs):
+            raise AssertionError("the missing custom op path was not patched")
+
+    device_op = types.ModuleType("vllm_ascend.device.device_op")
+    device_op.BaseDeviceAdaptor = BaseDeviceAdaptor
+    device_package = types.ModuleType("vllm_ascend.device")
+    device_package.device_op = device_op
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device", device_package)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+
+    assert patch_fused_moe._patch_moe_gating_top_k_cann_compat() is True
+    weights, ids, out = BaseDeviceAdaptor.moe_gating_top_k(
+        torch.zeros((1, 4)),
+        k=2,
+        k_group=1,
+        group_count=1,
+        group_select_mode=1,
+        renorm=1,
+        norm_type=0,
+        out_flag=False,
+    )
+
+    assert calls[0][1:] == (2, {
+        "bias": None,
+        "k_group": 1,
+        "group_count": 1,
+        "group_select_mode": 1,
+        "renorm": 0,
+        "norm_type": 0,
+        "out_flag": False,
+        "routed_scaling_factor": 1.0,
+        "eps": 1e-20,
+    })
+    torch.testing.assert_close(weights, torch.tensor([[0.25, 0.75]]))
+    assert ids.dtype == torch.int32
+    assert out.shape == (1, 4)
+    assert patch_fused_moe._patch_moe_gating_top_k_cann_compat() is False
+
+
+def test_cann_moe_init_routing_falls_back_to_native_op(monkeypatch):
+    import types
+
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    calls = []
+
+    def native_moe_init_routing_v2(hidden_states, topk_ids, **kwargs):
+        calls.append((hidden_states, topk_ids, kwargs))
+        return ("sorted", "row_idx", "expert_tokens", "scale")
+
+    fake_torch_npu = types.ModuleType("torch_npu")
+    fake_torch_npu.npu_moe_init_routing_v2 = native_moe_init_routing_v2
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    class BaseDeviceAdaptor:
+        @staticmethod
+        def npu_moe_init_routing(*args, **kwargs):
+            raise AssertionError("the missing custom op path was not patched")
+
+    device_op = types.ModuleType("vllm_ascend.device.device_op")
+    device_op.BaseDeviceAdaptor = BaseDeviceAdaptor
+    device_package = types.ModuleType("vllm_ascend.device")
+    device_package.device_op = device_op
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device", device_package)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.device.device_op", device_op)
+
+    assert patch_fused_moe._patch_moe_init_routing_cann_compat() is True
+    hidden_states = torch.zeros((2, 4))
+    topk_ids = torch.zeros((2, 2), dtype=torch.int32)
+    result = BaseDeviceAdaptor.npu_moe_init_routing(
+        hidden_states,
+        topk_ids,
+        active_num=-1,
+        expert_num=4,
+    )
+
+    assert result == ("sorted", "row_idx", "expert_tokens", "scale")
+    assert calls[0][2] == {
+        "scale": None,
+        "active_num": 4,
+        "expert_capacity": -1,
+        "expert_num": 4,
+        "drop_pad_mode": 0,
+        "expert_tokens_num_type": 1,
+        "expert_tokens_num_flag": True,
+        "quant_mode": -1,
+        "active_expert_range": [0, 4],
+        "row_idx_type": 0,
+    }
+    assert patch_fused_moe._patch_moe_init_routing_cann_compat() is False
+
+
 def test_adapt_patch_retries_complete_ready_path(monkeypatch):
     import vllm_ascend.utils as ascend_utils
 
@@ -572,6 +691,10 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
         None,
         "next_residual",
     )
+    fake_torch_npu.npu_rms_norm = lambda x, weight, eps: (
+        ("gemma-normalized", x, weight, eps),
+        "gemma-residual",
+    )
 
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(patch_fused_moe, "_opapi_supports_add_rms_norm_bias", lambda: False)
@@ -590,9 +713,10 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
         "next_residual",
     )
     assert FakeGemmaRMSNorm().forward_oot("x") == (
-        "gemma-original",
+        "gemma-normalized",
         "x",
-        None,
+        4.0,
+        1e-6,
     )
 
 
@@ -1357,6 +1481,144 @@ def test_register_rebinds_already_imported_hook_globals(monkeypatch):
     )
     assert token_dispatcher.get_moe_pipeline_profiler.__module__ == (
         "vllm_moe_offload_ascend.moe_offload.pipeline"
+    )
+
+
+def test_external_shared_multistream_starts_at_routed_dispatch(monkeypatch):
+    """The external shared first projection must be issued before B2 work."""
+    import torch
+
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    import vllm_ascend.utils as ascend_utils
+
+    events = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def record_event(self):
+            events.append(("record_event", self.name))
+            return "hidden_states_ready"
+
+        def wait_event(self, event):
+            events.append(("wait_event", self.name, event))
+
+        def wait_stream(self, stream):
+            events.append(("wait_stream", self.name, stream.name))
+
+    default_stream = FakeStream("default")
+    shared_stream = FakeStream("shared")
+
+    class FakeNpu:
+        active_stream = default_stream
+
+        @classmethod
+        def current_stream(cls):
+            return cls.active_stream
+
+        @classmethod
+        def stream(cls, target):
+            class StreamContext:
+                def __enter__(self):
+                    self.previous = FakeNpu.active_stream
+                    FakeNpu.active_stream = target
+
+                def __exit__(self, exc_type, exc, traceback):
+                    FakeNpu.active_stream = self.previous
+
+            return StreamContext()
+
+    monkeypatch.setattr(torch, "npu", FakeNpu)
+    monkeypatch.setattr(
+        ascend_utils,
+        "shared_experts_calculation_stream",
+        lambda: shared_stream,
+    )
+
+    class FakeAscendFusedMoE:
+        _latchmoe_external_shared_overlap_patch = False
+
+        def __init__(self):
+            self.multistream_overlap_shared_expert = True
+            self.shared_multistream_overlap_gate = False
+            self.is_internal_router = False
+            self._shared_experts = object()
+            self.moe_config = SimpleNamespace(
+                dp_size=1,
+                ep_size=1,
+                tp_size=1,
+                pcp_size=1,
+            )
+
+        def shared_forward_impl(self, hidden_states, router_logits):
+            events.append(("upstream", hidden_states, router_logits))
+            return "upstream"
+
+        def _shared_experts_part1(self, hidden_states):
+            events.append(("shared_part1", hidden_states))
+            return "part1"
+
+        def forward_impl(self, *, hidden_states, router_logits, return_with_event):
+            dispatch_ready = default_stream.record_event()
+            assert patch_fused_moe._launch_external_shared_overlap_if_active(
+                dispatch_ready
+            )
+            events.append(("routed", hidden_states, router_logits, return_with_event))
+            return SimpleNamespace(
+                routed_out="routed_out",
+                before_combine_evt="routed_combine_ready",
+            )
+
+        def _shared_experts_part2(self, hidden_states, part1):
+            events.append(("shared_part2", hidden_states, part1))
+            return "shared_out"
+
+    fake_fused_moe = SimpleNamespace(AscendFusedMoE=FakeAscendFusedMoE)
+    patch_fused_moe._patch_external_shared_multistream_overlap(fake_fused_moe)
+
+    layer = FakeAscendFusedMoE()
+    assert layer.shared_forward_impl("hidden", "router") == ("shared_out", "routed_out")
+    assert events == [
+        ("record_event", "default"),
+        ("wait_event", "shared", "hidden_states_ready"),
+        ("shared_part1", "hidden"),
+        ("routed", "hidden", "router", True),
+        ("wait_event", "shared", "routed_combine_ready"),
+        ("shared_part2", "hidden", "part1"),
+        ("wait_stream", "default", "shared"),
+    ]
+
+
+def test_external_shared_multistream_leaves_internal_router_upstream(monkeypatch):
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class FakeAscendFusedMoE:
+        _latchmoe_external_shared_overlap_patch = False
+
+        def __init__(self):
+            self.multistream_overlap_shared_expert = True
+            self.shared_multistream_overlap_gate = False
+            self.is_internal_router = True
+            self._shared_experts = object()
+            self.moe_config = SimpleNamespace(
+                dp_size=1,
+                ep_size=1,
+                tp_size=1,
+                pcp_size=1,
+            )
+
+        def shared_forward_impl(self, hidden_states, router_logits):
+            return ("upstream", hidden_states, router_logits)
+
+    fake_fused_moe = SimpleNamespace(AscendFusedMoE=FakeAscendFusedMoE)
+    patch_fused_moe._patch_external_shared_multistream_overlap(fake_fused_moe)
+
+    layer = FakeAscendFusedMoE()
+    assert layer.shared_forward_impl("hidden", "router") == (
+        "upstream",
+        "hidden",
+        "router",
     )
 
 
@@ -3296,6 +3558,7 @@ def test_graph_tools_default_to_graph_mode_and_reject_forced_eager(monkeypatch):
             max_num_batched_tokens=2,
             with_native_offload_backend=False,
             disable_ascend_norm_quant_fusion=True,
+            npu_profiler_dir=None,
         ),
         {
             "model": {"path": "/unused", "tensor_parallel_size": 1},
@@ -3339,6 +3602,7 @@ def test_smoke_runner_records_validated_ascend_additional_config(monkeypatch):
             with_native_offload_backend=False,
             disable_ascend_norm_quant_fusion=False,
             ascend_additional_config=args.ascend_additional_config,
+            npu_profiler_dir=None,
         ),
         {
             "model": {"path": "/unused", "tensor_parallel_size": 1},
@@ -3347,3 +3611,49 @@ def test_smoke_runner_records_validated_ascend_additional_config(monkeypatch):
         "fixed_slot_sync",
     )
     assert llm_kwargs["additional_config"] == {"mix_placement": True}
+
+
+def test_smoke_runner_can_configure_a_generation_only_npu_profiler(monkeypatch):
+    from benchmark.scripts import run_fixed_slot_smoke as benchmark_smoke
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_fixed_slot_smoke.py",
+            "--output-dir",
+            "/tmp/smoke",
+            "--npu-profiler-dir",
+            "/tmp/npu-profile",
+        ],
+    )
+
+    args = benchmark_smoke.parse_args()
+    assert args.npu_profiler_dir == "/tmp/npu-profile"
+    llm_kwargs = benchmark_smoke._build_llm_kwargs(
+        SimpleNamespace(
+            model="/models/glm",
+            enforce_eager=False,
+            gpu_memory_utilization=0.4,
+            kv_cache_memory_mb=256,
+            max_model_len=64,
+            max_num_seqs=1,
+            max_num_batched_tokens=2,
+            with_native_offload_backend=False,
+            disable_ascend_norm_quant_fusion=False,
+            ascend_additional_config={},
+            npu_profiler_dir=args.npu_profiler_dir,
+        ),
+        {
+            "model": {"path": "/unused", "tensor_parallel_size": 1},
+            "dataset": {"seed": 42},
+        },
+        "fixed_slot_sync",
+    )
+
+    assert llm_kwargs["profiler_config"] == {
+        "profiler": "torch",
+        "torch_profiler_dir": "/tmp/npu-profile",
+        "torch_profiler_with_stack": False,
+        "ignore_frontend": True,
+    }

@@ -1,6 +1,7 @@
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_moe_offload_ascend.patches import patch_fused_moe
@@ -184,3 +185,61 @@ def test_gdn_tensor_abi_adapter_preserves_matching_tensor_identity(monkeypatch):
     )
 
     assert fake_op.calls[0][4]["query_start_loc_opt"] is query_start_loc
+
+
+def test_gdn_pytorch_fallback_preserves_prefill_state(monkeypatch):
+    fake_namespace = SimpleNamespace()
+    fake_torch = SimpleNamespace(ops=SimpleNamespace(_C_ascend=fake_namespace))
+    monkeypatch.setenv(patch_fused_moe._GDN_PYTORCH_FALLBACK_ENV, "1")
+
+    assert patch_fused_moe._patch_gdn_causal_conv1d_pytorch_fallback(fake_torch)
+    fallback = getattr(
+        fake_namespace,
+        patch_fused_moe._GDN_CAUSAL_CONV1D_OP_NAME,
+    )
+
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    weight = torch.ones(3, 4)
+    conv_state = torch.zeros(2, 2, 4)
+    output = torch.empty_like(x)
+    fallback(
+        output,
+        x,
+        weight,
+        conv_state=conv_state,
+        query_start_loc_opt=(0, 2),
+        cache_indices_opt=(1,),
+        initial_state_mode_opt=(0,),
+        activation_mode=0,
+        run_mode=0,
+    )
+
+    assert torch.equal(output, torch.tensor([[0, 1, 2, 3], [4, 6, 8, 10]], dtype=torch.float32))
+    assert torch.equal(conv_state[1], x)
+
+
+def test_gdn_pytorch_fallback_rejects_speculative_state(monkeypatch):
+    monkeypatch.setenv(patch_fused_moe._GDN_PYTORCH_FALLBACK_ENV, "1")
+    with pytest.raises(RuntimeError, match="speculative decoding"):
+        patch_fused_moe._gdn_causal_conv1d_pytorch_fallback(
+            torch.empty(1, 4),
+            torch.empty(1, 4),
+            torch.empty(3, 4),
+            conv_state=torch.empty(1, 2, 4),
+            num_accepted_tokens_opt=(1,),
+        )
+
+
+def test_gdn_fused_gating_fallback_matches_reference_shapes():
+    A_log = torch.tensor([-1.0, 0.0])
+    a = torch.tensor([[0.0, 1.0], [2.0, -1.0]])
+    b = torch.tensor([[0.0, 1.0], [-1.0, 2.0]])
+    dt_bias = torch.tensor([0.5, -0.5])
+
+    g, beta_output = patch_fused_moe._gdn_fused_gating_pytorch_fallback(
+        A_log, a, b, dt_bias
+    )
+
+    assert g.shape == (1, 2, 2)
+    assert beta_output.shape == (1, 2, 2)
+    assert torch.all((beta_output >= 0) & (beta_output <= 1))

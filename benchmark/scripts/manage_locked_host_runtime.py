@@ -60,6 +60,23 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _compilation_config_args(extra_args: list[object]) -> list[str]:
+    raw = os.environ.get("VLLM_ENGINE_COMPILATION_CONFIG", "")
+    if not raw:
+        return []
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("VLLM_ENGINE_COMPILATION_CONFIG must be JSON") from exc
+    if not isinstance(config, dict):
+        raise ValueError("VLLM_ENGINE_COMPILATION_CONFIG must be a JSON object")
+    if any(str(item) in {"--compilation-config", "-cc"} for item in extra_args):
+        raise ValueError(
+            "VLLM_ENGINE_EXTRA_ARGS_JSON must not override VLLM_ENGINE_COMPILATION_CONFIG"
+        )
+    return ["--compilation-config", json.dumps(config, separators=(",", ":"))]
+
+
 def _start(path: Path) -> dict:
     current = _status(path)
     if current["active_state"] == "active":
@@ -108,6 +125,7 @@ def _start(path: Path) -> dict:
     extra_args = json.loads(os.environ.get("VLLM_ENGINE_EXTRA_ARGS_JSON", "[]"))
     if not isinstance(extra_args, list) or "--enforce-eager" in extra_args:
         raise ValueError("invalid or forced-eager VLLM_ENGINE_EXTRA_ARGS_JSON")
+    command.extend(_compilation_config_args(extra_args))
     command.extend(str(item) for item in extra_args)
     child_env = dict(os.environ)
     child_env["ASCEND_RT_VISIBLE_DEVICES"] = _required_env("VLLM_ENGINE_NPU_DEVICES")
