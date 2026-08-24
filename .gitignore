@@ -17,7 +17,9 @@ benchmark/artifacts/reports/
 paper/.aris/
 
 # Local paper packaging and generated build metadata
-paper/artifact_bundle/
+paper/artifact_bundle/*.tar.zst
+paper/artifact_bundle/artifact_manifest.json
+paper/artifact_bundle/artifact_manifest_v2.json
 paper/main.fdb_latexmk
 paper/main.fls
 paper/main.synctex.gz

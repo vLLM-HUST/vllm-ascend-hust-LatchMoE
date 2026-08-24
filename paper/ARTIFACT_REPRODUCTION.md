@@ -19,9 +19,11 @@ The exact source paths and SHA-256 digests are retained in
 `paper/data/resource_ledgers.json`, and
 `paper/data/audits/motivation_reaudit.json`. In the current workspace these
 roots live outside the paper directory. A portable archive of the current raw
-roots is now staged at
-`paper/artifact_bundle/latchmoe_raw_20260824_v3.tar.zst`; its SHA-256 and a
-file-level digest manifest are recorded in
+roots was generated locally at
+`paper/artifact_bundle/latchmoe_raw_20260824_v3.tar.zst`; because it is about
+73 MB, the archive is intentionally excluded from Git and should be uploaded
+as a release asset or object-store artifact. Its SHA-256 and file-level digest
+manifest are recorded in the checked-in
 `paper/artifact_bundle/artifact_manifest_v3.json`. The archive contains the
 three Motivation traces, the formal baseline/overlap/capacity campaigns, the
 one-request feasibility bundle, all three model qualification roots, the
