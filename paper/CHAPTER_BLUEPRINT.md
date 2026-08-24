@@ -70,13 +70,13 @@ but the paper may not rely on appendices for acceptance-critical evidence.
 4. Figure 1 remains evidence for the structural conflict. It must be rebuilt
    as vector artwork with at least 8 pt, preferably 9 pt, final-size text.
 
-## Remaining Evaluation Sequence
+## Evaluation execution status
 
-1. Run matched graph-compatible no-offload, native prefetch, legacy layered,
-   and LatchMoE cases on the same manifest and serving contract.
-2. Complete 14/28-GiB and 8/16/32/64-slot sensitivity with retained failures.
-3. Repeat mixed, decode-heavy, prefill-heavy, and long-context workloads.
-4. Add concurrency and a second supported MoE model before making a broad
-   serving claim.
-5. Report three independent starts, dispersion, exact-token gates, graph
-   fallback counts, HBM accounting, and raw artifact identities for every cell.
+The matched graph-compatible baseline, overlap, and 16/32/64-slot campaigns
+are complete, with exact-token and lifecycle gates plus portable raw artifacts.
+The three requested models also have capability qualification and Motivation
+traces. Native-prefetch and legacy layered cells are retained as completed but
+non-comparable failures (30/96 token-array mismatches per arm). The remaining
+breadth items---a semantically comparable external baseline, repeated
+performance on a capacity-limited model, and concurrency sensitivity---remain
+open; the paper explicitly does not claim them.
