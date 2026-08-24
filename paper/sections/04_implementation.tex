@@ -62,10 +62,9 @@ and emits a release acknowledgement for the benchmark harness.
 The prefill path supports a configurable number of stage banks and prefetch
 depth. The qualified configuration uses two stage banks and depth one. Wave
 plans carry the original pair offsets needed for one native recombination, and
-strict validation rejects duplicate or missing coverage. A recoverable
-preflight or native-recombination qualification failure may select the explicit
-full-layer overflow mode; NPU, ACL, memory, address, and lifecycle failures are
-not swallowed by that path.
+strict validation rejects duplicate or missing coverage. A preflight-qualified
+overflow decision may select the explicit full-layer mode; NPU, ACL, memory,
+address, semantic, and lifecycle failures are not swallowed by that path.
 
 Profiling records JSONL events for layer registration, slot ownership,
 transfers, mapping publication, wave staging and compute, graph replay issue,
@@ -73,4 +72,3 @@ memory accounting, and service release. Benchmark manifests bind each run to
 the runtime revisions, model and workload digests, device, command line,
 environment, graph mode, and raw client/server artifacts. These records support
 the fail-closed checks used in Section~\ref{sec:evaluation}.
-

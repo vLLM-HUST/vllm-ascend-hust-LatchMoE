@@ -1462,6 +1462,10 @@ class MoeOffloadRuntime:
         device: torch.device,
         step_id: int | None = None,
         record_stage_profile: bool = False,
+        phase: str = "unknown",
+        num_tokens: int | None = None,
+        top_k: int | None = None,
+        expert_token_counts: dict[int, int] | None = None,
         **_: object,
     ) -> PreparedSlotWeights:
         if not self.should_use_fixed_slots:
@@ -1516,7 +1520,7 @@ class MoeOffloadRuntime:
             step_id=step_id,
             sample_rate=profile_sample_rate,
         )
-        collect_profile_details = bool(collect_profile) and _profile_expert_lists_enabled()
+        collect_profile_details = bool(collect_profile) and _profile_routing_trace_enabled()
         hit_experts: list[int] = []
         miss_experts: list[int] = []
         h2d_bytes = 0
@@ -1616,9 +1620,24 @@ class MoeOffloadRuntime:
                 "profile_sample_rate": int(profile_sample_rate),
             }
             if collect_profile_details:
+                resident_experts = sorted(
+                    int(slot.expert_key.expert_id)
+                    for slot in slot_bank.slots
+                    if slot.expert_key is not None
+                )
                 payload.update(
                     {
+                        "phase": str(phase),
+                        "num_tokens": None if num_tokens is None else int(num_tokens),
+                        "top_k": None if top_k is None else int(top_k),
                         "active_experts": [int(e) for e in unique_active_experts],
+                        "expert_token_counts": {
+                            str(int(expert_id)): int(count)
+                            for expert_id, count in sorted(
+                                (expert_token_counts or {}).items()
+                            )
+                        },
+                        "resident_experts": resident_experts,
                         "hit_experts": hit_experts,
                         "miss_experts": miss_experts,
                     }
@@ -1642,6 +1661,10 @@ class MoeOffloadRuntime:
         log2phy: torch.Tensor,
         step_id: int | None = None,
         record_stage_profile: bool = False,
+        phase: str = "unknown",
+        num_tokens: int | None = None,
+        top_k: int | None = None,
+        expert_token_counts: dict[int, int] | None = None,
     ) -> PreparedSlotWeights:
         """Stage decode slots and write the mapping directly into ``log2phy``.
 
@@ -1707,7 +1730,7 @@ class MoeOffloadRuntime:
             step_id=step_id,
             sample_rate=profile_sample_rate,
         )
-        collect_profile_details = bool(collect_profile) and _profile_expert_lists_enabled()
+        collect_profile_details = bool(collect_profile) and _profile_routing_trace_enabled()
         hit_experts: list[int] = []
         miss_experts: list[int] = []
         h2d_bytes = 0
@@ -1884,9 +1907,24 @@ class MoeOffloadRuntime:
                 "profile_sample_rate": int(profile_sample_rate),
             }
             if collect_profile_details:
+                resident_experts = sorted(
+                    int(slot.expert_key.expert_id)
+                    for slot in slot_bank.slots
+                    if slot.expert_key is not None
+                )
                 payload.update(
                     {
+                        "phase": str(phase),
+                        "num_tokens": None if num_tokens is None else int(num_tokens),
+                        "top_k": None if top_k is None else int(top_k),
                         "active_experts": [int(e) for e in unique_active_experts],
+                        "expert_token_counts": {
+                            str(int(expert_id)): int(count)
+                            for expert_id, count in sorted(
+                                (expert_token_counts or {}).items()
+                            )
+                        },
+                        "resident_experts": resident_experts,
                         "hit_experts": hit_experts,
                         "miss_experts": miss_experts,
                     }
@@ -2655,6 +2693,10 @@ class MoeOffloadRuntime:
         layer_id: int,
         active_experts: tuple[int, ...],
         num_logical_experts: int,
+        phase: str = "unknown",
+        num_tokens: int | None = None,
+        top_k: int | None = None,
+        expert_token_counts: dict[int, int] | None = None,
     ) -> "PreparedSlotWeights":
         """Eager pre-replay staging: host decision + H2D + in-place log2phy write.
 
@@ -2686,6 +2728,10 @@ class MoeOffloadRuntime:
             num_logical_experts=int(num_logical_experts),
             log2phy=buf,
             record_stage_profile=True,
+            phase=phase,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            expert_token_counts=expert_token_counts,
         )
         return PreparedSlotWeights(
             w1=prepared.w1,
@@ -2990,6 +3036,21 @@ def _to_bool_env(name: str, default: str = "0") -> bool:
 def _profile_expert_lists_enabled() -> bool:
     value = os.getenv("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "1")
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _profile_routing_trace_enabled() -> bool:
+    """Whether research profiles should retain logical routing metadata.
+
+    ``VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS`` is retained for compatibility with
+    existing benchmark runs. The explicit routing-trace switch is useful for
+    characterization campaigns because it documents why the larger payload was
+    requested without changing the default low-overhead profile.
+    """
+
+    return _profile_expert_lists_enabled() or _to_bool_env(
+        "VLLM_ASCEND_MOE_PROFILE_ROUTING_TRACE",
+        "0",
+    )
 
 
 def _decode_profile_sample_rate() -> int:

@@ -1,0 +1,144 @@
+{
+  "bundle": "/workspace/vllm-ascend-hust-LatchMoE/docs/evidence/bundles/issue-17-matched-ttft-31621de.tar.gz",
+  "bundle_sha256": "de682c4073263901cc632a7f3542509a9158bd733558dbbe548bb8ae4b4a8ab4",
+  "estimator": "exp(mean_start_pair(median_request(log(multi_wave/full_layer))))-1",
+  "failures": [],
+  "packaged_arms": {
+    "full_layer": {
+      "error_counts": 0,
+      "fallback_events": 0,
+      "output_tokens": 76800,
+      "repeats": 3,
+      "successful_requests": 600,
+      "throughput_tok_s_by_repeat": [
+        16.34112336327127,
+        16.088691516187158,
+        16.158035615620204
+      ],
+      "tpot_p50_ms_by_repeat": [
+        53.86995102526271,
+        54.73665769932268,
+        54.325109769706614
+      ],
+      "tpot_p95_ms_by_repeat": [
+        56.72428201214643,
+        57.781245059959474,
+        57.795374784291205
+      ],
+      "ttft_p50_ms_by_repeat": [
+        927.0603966433555,
+        931.9007699377835,
+        921.4484137482941
+      ],
+      "ttft_p50_ms_median": 927.0603966433555,
+      "ttft_p95_ms_by_repeat": [
+        970.7491186913104,
+        989.5272759255022,
+        980.8850226458163
+      ],
+      "ttft_p95_ms_median": 980.8850226458163
+    },
+    "multi_wave": {
+      "error_counts": 0,
+      "fallback_events": 0,
+      "output_tokens": 76800,
+      "repeats": 3,
+      "successful_requests": 600,
+      "throughput_tok_s_by_repeat": [
+        16.589733960140524,
+        16.826248878865446,
+        17.016015096696794
+      ],
+      "tpot_p50_ms_by_repeat": [
+        55.34371063367871,
+        54.422113422333496,
+        53.87164077728812
+      ],
+      "tpot_p95_ms_by_repeat": [
+        58.93593198488816,
+        57.677599341877794,
+        57.118593605991926
+      ],
+      "ttft_p50_ms_by_repeat": [
+        602.4460927583277,
+        600.6501929368824,
+        598.7233757041395
+      ],
+      "ttft_p50_ms_median": 600.6501929368824,
+      "ttft_p95_ms_by_repeat": [
+        759.9617935484275,
+        755.6806009728462,
+        752.1157110342757
+      ],
+      "ttft_p95_ms_median": 755.6806009728462
+    }
+  },
+  "packaged_comparison": {
+    "paired_reductions": [
+      {
+        "pair": 1,
+        "ttft_p50_reduction_percent": 35.0154429053783,
+        "ttft_p95_reduction_percent": 21.713882720496333
+      },
+      {
+        "pair": 2,
+        "ttft_p50_reduction_percent": 35.545691954199846,
+        "ttft_p95_reduction_percent": 23.63216059243439
+      },
+      {
+        "pair": 3,
+        "ttft_p50_reduction_percent": 35.023668523272455,
+        "ttft_p95_reduction_percent": 23.322744901789164
+      }
+    ],
+    "ttft_p50_reduction_percent": 35.20916273506231,
+    "ttft_p95_reduction_percent": 22.959308835760282
+  },
+  "paired_effects": [
+    {
+      "pair": 1,
+      "requests": 200,
+      "tpot_effect": 0.025364083218927025,
+      "ttft_effect": -0.3502266702996354
+    },
+    {
+      "pair": 2,
+      "requests": 200,
+      "tpot_effect": -0.00404322814652236,
+      "ttft_effect": -0.353575591687039
+    },
+    {
+      "pair": 3,
+      "requests": 200,
+      "tpot_effect": -0.013465127215843142,
+      "ttft_effect": -0.349962448643939
+    }
+  ],
+  "paired_statistics": {
+    "tpot": {
+      "equivalent_within_5_percent": true,
+      "estimate": 0.0024829856600441236,
+      "interval": {
+        "confidence": 0.9,
+        "lower": -0.011359797515815229,
+        "replicates": 10000,
+        "seed": 20260823,
+        "upper": 0.01676466701448177
+      }
+    },
+    "ttft": {
+      "equivalent_within_5_percent": false,
+      "estimate": -0.35125699034945923,
+      "interval": {
+        "confidence": 0.95,
+        "lower": -0.35674104692157643,
+        "replicates": 10000,
+        "seed": 20260823,
+        "upper": -0.345962509928103
+      }
+    }
+  },
+  "schema_version": "latchmoe-issue17-paper-audit-v1",
+  "status": "passed",
+  "verified_members": 66
+}

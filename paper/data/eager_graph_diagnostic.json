@@ -1,0 +1,61 @@
+{
+  "exact_output_token_match": true,
+  "failures": [],
+  "latency_ms": {
+    "eager": {
+      "tpot_median": 262.0424580139418,
+      "ttft_median": 2235.6619834899902
+    },
+    "graph": {
+      "tpot_median": 140.6332946692904,
+      "ttft_median": 2165.771722793579
+    },
+    "graph_relative_effect": {
+      "tpot": -0.46331867081704725,
+      "ttft": -0.03126155081248405
+    }
+  },
+  "output_token_ids_sha256": "f7a34d73ede25d1837762ef5843c6bb7b83d695f62ca9cc04eee6f07d451980a",
+  "profile_event_counts": {
+    "eager": {
+      "graph_replay_issue": 0,
+      "graph_slot_address_validate": 48,
+      "total": 531
+    },
+    "graph": {
+      "graph_replay_issue": 97,
+      "graph_slot_address_validate": 48,
+      "total": 724
+    }
+  },
+  "schema_version": "latchmoe-eager-graph-diagnostic-v1",
+  "scope": {
+    "concurrency": 1,
+    "device_visibility": "ASCEND_RT_VISIBLE_DEVICES=6",
+    "interpretation": "qualification diagnostic, not a variance or throughput campaign",
+    "model": "/root/data/shared_models/strict-models/Qwen3-30B-A3B",
+    "offload_gb": 14,
+    "output_tokens": 4,
+    "requests_per_mode": 1,
+    "slots": 32
+  },
+  "source_files": {
+    "eager": {
+      "outputs": "benchmark/artifacts/eager_graph_probe_20260824/eager_spawn3/outputs.jsonl",
+      "outputs_sha256": "eb2460646b618e4ab45cdf087243451a90c967bd589c89aac7263c1a88ba8f1e",
+      "profile": "benchmark/artifacts/eager_graph_probe_20260824/eager_spawn3/moe_offload_profile.jsonl",
+      "profile_sha256": "5dc32e93d5710f36ab9f61b05238064ef046f7bca8db871cba3e9d65c74ab84b",
+      "summary": "benchmark/artifacts/eager_graph_probe_20260824/eager_spawn3/summary.json",
+      "summary_sha256": "0e974ef727af53448060b0c63de38f8139b7e37a114e96a0bbb0b9c9a2c0f23a"
+    },
+    "graph": {
+      "outputs": "benchmark/artifacts/eager_graph_probe_20260824/graph_spawn/outputs.jsonl",
+      "outputs_sha256": "eb2460646b618e4ab45cdf087243451a90c967bd589c89aac7263c1a88ba8f1e",
+      "profile": "benchmark/artifacts/eager_graph_probe_20260824/graph_spawn/moe_offload_profile.jsonl",
+      "profile_sha256": "4facd8f4d7deb9a41f3fe31895540b2b58876eb970529bbb2e34d2dcc17e6f4a",
+      "summary": "benchmark/artifacts/eager_graph_probe_20260824/graph_spawn/summary.json",
+      "summary_sha256": "55998ecf487296658a3f85ef47305f9091caacc20fcc261e937b7fb90c99dae7"
+    }
+  },
+  "status": "passed"
+}

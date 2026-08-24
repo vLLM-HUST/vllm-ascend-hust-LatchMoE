@@ -4,9 +4,9 @@
 \paragraph{Sparse MoE inference.}
 Sparsely gated MoE models increase parameter capacity while activating a
 subset of experts for each token
-\cite{shazeer2017outrageously,fedus2022switch,du2022glam,rajbhandari2022deepspeedmoe}.
+~\cite{shazeer2017outrageously,fedus2022switch,du2022glam,rajbhandari2022deepspeedmoe}.
 Systems for large MoE models also combine routing with model and expert
-parallelism \cite{rajbhandari2022deepspeedmoe,li2023lina}. LatchMoE does not
+parallelism~\cite{rajbhandari2022deepspeedmoe,li2023lina}. LatchMoE does not
 change the model, router, or expert computation. It addresses the runtime
 storage interface used when expert weights cannot remain fully resident on one
 accelerator.
@@ -15,28 +15,29 @@ accelerator.
 Expert-offloading systems reduce host-to-device movement or its exposed cost
 through caching, prediction, prefetching, mixed precision, fine-grained
 placement, and pipelined execution
-\cite{hwang2024pregated,xue2024moeinfinity,kong2024swapmoe,song2024promoe,tang2024hobbit,cao2025moelightning,fang2025klotski,li2026commitmoe}.
-FlexGen studies coordinated placement and execution across heterogeneous
-memory for dense-model inference \cite{flexgen}. These directions decide which
-weights to retain or move and when to move them. LatchMoE is complementary: its
-placement-plan interface can accept such decisions, while its contribution is
-the fixed physical slot, persistent mapping, and lifecycle abstraction that
-keeps replacement compatible with captured MoE execution.
+~\cite{hwang2024pregated,xue2024moeinfinity,kong2024swapmoe,song2024promoe,tang2024hobbit,cao2025moelightning,fang2025klotski,li2026commitmoe}.
+Recent CPU--GPU hybrid serving also stream-loads MoE prefill weights and
+overlaps CPU and GPU work, while FlexGen coordinates heterogeneous placement
+for dense models~\cite{cloudmoe2026,flexgen}. These systems decide which work or
+weights to place, retain, and move. LatchMoE addresses an orthogonal execution
+constraint: changing a cache decision must not change the weight storage bound
+to replayed expert computation. Its placement interface therefore feeds fixed
+slots and versioned leases instead of becoming part of the captured ABI.
 
 \paragraph{Graph-based inference execution.}
-Nimble compiles dynamic neural-network execution, while
+Nimble compiles dynamic neural-network execution~\cite{kwon2020nimble}, while
 FlashInfer provides graph-oriented mechanisms for customizable LLM inference
-\cite{kwon2020nimble,ye2025flashinfer}. vLLM reduces serving overhead through
-continuous batching and paged KV-cache management \cite{vllm}. LatchMoE
-focuses on a different mutable resource: expert weights. It inserts an explicit
-eager boundary between captured routing and captured expert computation, then
-keeps the downstream weight and mapping allocations stable while their
-contents change.
+~\cite{ye2025flashinfer}. GraCE uses compiler transformations to
+increase graph coverage~\cite{grace2026}. vTensor decouples computation from
+physical-page management while exposing a continuous virtual address
+~\cite{vtensor2024}, while ECHO makes dynamic KV-cache eviction and recall
+graph-friendly~\cite{echo2026}. LatchMoE instead
+manages executable weights selected by a captured router and ordered against
+transfer and MLP computation. An eager seam exposes a fixed slot/map ABI to the
+downstream graph.
 
 \paragraph{Positioning.}
-Prior offloading work primarily optimizes the dynamic placement decision;
-graph-oriented runtimes primarily optimize reuse of repeated execution.
-LatchMoE connects these concerns by defining which state must remain stable and
-which state may change between captured regions. It leaves policy quality to
-the former line of work and preserves the replay interface required by the
-latter.
+LatchMoE joins dynamic placement with graph replay by separating logical
+ownership from graph-visible allocation and checking each ownership
+interval as a lease. UVA alone supplies neither bounded HBM replacement nor
+ready-before-publication and release-before-reuse ordering.

@@ -4,16 +4,20 @@ TECTONIC ?= tectonic
 
 all: main.pdf
 
-figures: figures/matched_ttft.pdf
-
-figures/matched_ttft.pdf: scripts/plot_issue17_ttft.py ../docs/evidence/bundles/issue-17-matched-ttft-31621de.tar.gz
-	python scripts/plot_issue17_ttft.py \
-		--bundle ../docs/evidence/bundles/issue-17-matched-ttft-31621de.tar.gz \
-		--output $@
-
 SECTIONS := $(wildcard sections/*.tex)
+FIGURES := \
+	figures/latchmoe_architecture.pdf \
+	figures/motivation_characterization.pdf \
+	figures/baseline_mechanisms.pdf \
+	figures/capacity_sensitivity.pdf
+GENERATED_TABLES := \
+	generated/formal_results_macros.tex \
+	generated/qualification_table.tex \
+	generated/resource_table.tex
 
-main.pdf: main.tex $(SECTIONS) references.bib figures/matched_ttft.pdf
+figures: $(FIGURES)
+
+main.pdf: main.tex $(SECTIONS) references.bib $(FIGURES) $(GENERATED_TABLES)
 	$(TECTONIC) --keep-logs --keep-intermediates main.tex
 
 clean:

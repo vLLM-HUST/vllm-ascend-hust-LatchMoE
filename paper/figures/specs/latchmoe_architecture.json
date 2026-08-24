@@ -1,0 +1,82 @@
+{
+  "title": "LatchMoE graph-compatible dynamic expert residency",
+  "canvas": {"width": 1060, "height": 900},
+  "style": {
+    "font_family": "Arial, Helvetica, sans-serif",
+    "font_size": 20,
+    "bg_color": "#FFFFFF",
+    "palette": ["#0072B2", "#E69F00", "#009E73", "#666666", "#D55E00"]
+  },
+  "nodes": [
+    {"id": "descriptor", "label": "Capability descriptor", "sublabel": "router • ABI • shared lane", "x": 125, "y": 65, "width": 200, "height": 72, "shape": "rounded", "fill": "#F2F2F2", "stroke": "#666666", "font_size": 20},
+    {"id": "preflight", "label": "Preflight seam", "sublabel": "validate complete tuple", "x": 340, "y": 65, "width": 200, "height": 72, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 20},
+    {"id": "allocate", "label": "Allocate stable storage", "sublabel": "slots • map • shared weights", "x": 570, "y": 65, "width": 230, "height": 72, "shape": "rounded", "fill": "#E2F4EE", "stroke": "#009E73", "font_size": 20},
+    {"id": "capture", "label": "Capture graph pieces", "sublabel": "router + expert compute", "x": 817.5, "y": 65, "width": 235, "height": 72, "shape": "rounded", "fill": "#E5F4FB", "stroke": "#0072B2", "font_size": 20},
+    {"id": "reject", "label": "Reject unsupported tuple", "sublabel": "before capture", "x": 377.5, "y": 145, "width": 275, "height": 58, "shape": "rounded", "fill": "#FCE8E3", "stroke": "#D55E00", "text_color": "#8C2D04", "font_size": 21},
+
+    {"id": "hidden", "label": "Hidden\nstates", "x": 70, "y": 405, "width": 80, "height": 78, "shape": "rounded", "fill": "#F2F2F2", "stroke": "#666666", "font_size": 18},
+    {"id": "router_badge", "label": "GRAPH", "x": 215, "y": 245, "width": 100, "height": 28, "shape": "rounded", "fill": "#0072B2", "stroke": "#0072B2", "text_color": "#FFFFFF", "font_size": 17},
+    {"id": "stage_badge", "label": "EAGER", "x": 400, "y": 245, "width": 100, "height": 28, "shape": "rounded", "fill": "#E69F00", "stroke": "#E69F00", "text_color": "#FFFFFF", "font_size": 17},
+    {"id": "stable_badge", "label": "REPLAY-STABLE", "x": 595, "y": 245, "width": 155, "height": 28, "shape": "rounded", "fill": "#009E73", "stroke": "#009E73", "text_color": "#FFFFFF", "font_size": 17},
+    {"id": "mlp_badge", "label": "GRAPH", "x": 790, "y": 245, "width": 100, "height": 28, "shape": "rounded", "fill": "#0072B2", "stroke": "#0072B2", "text_color": "#FFFFFF", "font_size": 17},
+    {"id": "routing_rail", "label": "IDs + weights forwarded unchanged", "x": 717.5, "y": 285, "width": 575, "height": 28, "shape": "rounded", "fill": "#FFFFFF", "stroke": "#0072B2", "text_color": "#005A8D", "font_size": 17},
+    {"id": "router", "label": "1  Native router", "sublabel": "IDs + weights", "x": 272.5, "y": 350, "width": 165, "height": 82, "shape": "rounded", "fill": "#E5F4FB", "stroke": "#0072B2", "font_size": 21},
+    {"id": "stage", "label": "2  Plan + stage", "sublabel": "reads IDs only", "x": 452.5, "y": 350, "width": 175, "height": 82, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 21},
+    {"id": "stable", "label": "3  Stable slots + map", "sublabel": "fixed addresses", "x": 652.5, "y": 350, "width": 205, "height": 82, "shape": "rounded", "fill": "#E2F4EE", "stroke": "#009E73", "font_size": 21},
+    {"id": "mlp", "label": "4  Routed MLP", "sublabel": "same graph", "x": 852.5, "y": 350, "width": 175, "height": 82, "shape": "rounded", "fill": "#E5F4FB", "stroke": "#0072B2", "font_size": 21},
+    {"id": "combine", "label": "5  Native\ncombine", "x": 990, "y": 405, "width": 90, "height": 82, "shape": "rounded", "fill": "#F2F2F2", "stroke": "#666666", "font_size": 18},
+    {"id": "host", "label": "CPU-first routed weights", "x": 560, "y": 435, "width": 220, "height": 58, "shape": "rounded", "fill": "#E2F4EE", "stroke": "#009E73", "font_size": 18},
+    {"id": "shared_compute", "label": "Shared expert\ncompute once", "x": 205, "y": 520, "width": 215, "height": 72, "shape": "rounded", "fill": "#E5F4FB", "stroke": "#0072B2", "font_size": 18},
+    {"id": "shared_weights", "label": "Resident shared weights", "x": 220, "y": 435, "width": 210, "height": 58, "shape": "rounded", "fill": "#E2F4EE", "stroke": "#009E73", "font_size": 18},
+
+    {"id": "protocol_link", "label": "miss / overflow waves", "x": 400, "y": 590, "width": 175, "height": 28, "shape": "rounded", "fill": "#FFFFFF", "stroke": "#E69F00", "text_color": "#8A5C00", "font_size": 17},
+    {"id": "transfer_badge", "label": "TRANSFER STREAM", "x": 125, "y": 660, "width": 190, "height": 30, "shape": "rounded", "fill": "#E69F00", "stroke": "#E69F00", "text_color": "#FFFFFF", "font_size": 17},
+    {"id": "consumer_badge", "label": "CONSUMER STREAM", "x": 125, "y": 770, "width": 190, "height": 30, "shape": "rounded", "fill": "#0072B2", "stroke": "#0072B2", "text_color": "#FFFFFF", "font_size": 17},
+    {"id": "assign", "label": "Assign bank", "sublabel": "new owner + version", "x": 310, "y": 660, "width": 180, "height": 64, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 21},
+    {"id": "h2d", "label": "H2D wave k+1", "sublabel": "into Bank 1-b", "x": 500, "y": 660, "width": 180, "height": 64, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 21},
+    {"id": "validate", "label": "Validate lease", "sublabel": "owner + version", "x": 690, "y": 660, "width": 180, "height": 64, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 21},
+    {"id": "publish", "label": "Ready, then\npublish map", "x": 885, "y": 660, "width": 190, "height": 64, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 18},
+    {"id": "overlap_badge", "label": "OVERLAP", "x": 490, "y": 715, "width": 110, "height": 28, "shape": "rounded", "fill": "#FFFFFF", "stroke": "#666666", "text_color": "#555555", "font_size": 17},
+    {"id": "compute", "label": "Replay wave k", "sublabel": "Bank b computing", "x": 317.5, "y": 770, "width": 195, "height": 64, "shape": "rounded", "fill": "#E5F4FB", "stroke": "#0072B2", "font_size": 21},
+    {"id": "release", "label": "Compute event", "sublabel": "releases Bank b", "x": 535, "y": 770, "width": 210, "height": 72, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 21},
+    {"id": "reuse", "label": "Reuse unblocked", "sublabel": "only after release", "x": 745, "y": 770, "width": 190, "height": 64, "shape": "rounded", "fill": "#FFF1D6", "stroke": "#E69F00", "font_size": 21},
+    {"id": "next_replay", "label": "Replay wave k+1", "sublabel": "after ready event", "x": 945, "y": 770, "width": 190, "height": 64, "shape": "rounded", "fill": "#E5F4FB", "stroke": "#0072B2", "font_size": 21},
+    {"id": "reuse_rail", "label": "released Bank b → wave k+2 → Assign free bank", "x": 620, "y": 850, "width": 760, "height": 28, "shape": "rounded", "fill": "#FFFFFF", "stroke": "#D55E00", "text_color": "#8C2D04", "font_size": 17}
+  ],
+  "edges": [
+    {"from": "descriptor", "to": "preflight", "color": "#666666", "thickness": 2},
+    {"from": "preflight", "to": "allocate", "color": "#009E73", "thickness": 2},
+    {"from": "allocate", "to": "capture", "color": "#0072B2", "thickness": 2},
+    {"from": "preflight", "to": "reject", "style": "dashed", "color": "#D55E00", "thickness": 2},
+
+    {"from": "hidden", "to": "router", "color": "#0072B2", "thickness": 3},
+    {"from": "router", "to": "stage", "color": "#E69F00", "thickness": 3},
+    {"from": "stage", "to": "stable", "color": "#E69F00", "thickness": 3},
+    {"from": "stable", "to": "mlp", "color": "#009E73", "thickness": 3},
+    {"from": "mlp", "to": "combine", "color": "#0072B2", "thickness": 3},
+    {"from": "router", "to": "routing_rail", "style": "dashed", "color": "#0072B2", "thickness": 2},
+    {"from": "routing_rail", "to": "mlp", "style": "dashed", "color": "#0072B2", "thickness": 2},
+    {"from": "host", "to": "stage", "color": "#E69F00", "thickness": 2},
+    {"from": "hidden", "to": "shared_compute", "color": "#0072B2", "thickness": 2},
+    {"from": "shared_weights", "to": "shared_compute", "color": "#009E73", "thickness": 2},
+    {"from": "shared_compute", "to": "combine", "color": "#0072B2", "thickness": 2},
+
+    {"from": "stage", "to": "protocol_link", "style": "dashed", "color": "#E69F00", "thickness": 2},
+    {"from": "assign", "to": "h2d", "color": "#E69F00", "thickness": 2},
+    {"from": "h2d", "to": "validate", "color": "#E69F00", "thickness": 2},
+    {"from": "validate", "to": "publish", "color": "#E69F00", "thickness": 2},
+    {"from": "publish", "to": "next_replay", "style": "dashed", "color": "#0072B2", "thickness": 3},
+    {"from": "compute", "to": "release", "color": "#E69F00", "thickness": 2},
+    {"from": "release", "to": "reuse", "color": "#E69F00", "thickness": 2},
+    {"from": "reuse", "to": "reuse_rail", "color": "#D55E00", "style": "dashed", "thickness": 2}
+  ],
+  "groups": [
+    {"id": "init_group", "label": "(a) Initialization (once)", "node_ids": ["descriptor", "preflight", "allocate", "capture", "reject"], "fill": "#FAFAFA", "stroke": "#BDBDBD", "padding": 24},
+    {"id": "runtime_group", "label": "(b) Per MoE invocation: dynamic owners, replay-stable addresses", "node_ids": ["hidden", "router_badge", "stage_badge", "stable_badge", "mlp_badge", "routing_rail", "router", "stage", "stable", "mlp", "combine", "host", "shared_compute", "shared_weights"], "fill": "#FFFFFF", "stroke": "#8C8C8C", "padding": 22},
+    {"id": "lifecycle_group", "label": "(c) Versioned lease protocol: two banks pipeline transfer and compute", "node_ids": ["transfer_badge", "consumer_badge", "assign", "h2d", "validate", "publish", "overlap_badge", "compute", "release", "reuse", "next_replay", "reuse_rail"], "fill": "#FAFAFA", "stroke": "#8C8C8C", "padding": 20}
+  ],
+  "labels": [
+    {"text": "ROUTED LANE", "x": 30, "y": 305, "font_size": 17, "color": "#555555", "anchor": "start"},
+    {"text": "SHARED LANE", "x": 30, "y": 475, "font_size": 17, "color": "#555555", "anchor": "start"}
+  ]
+}

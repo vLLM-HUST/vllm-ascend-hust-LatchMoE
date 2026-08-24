@@ -24,6 +24,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-prefill-requests", type=int, default=1)
     parser.add_argument("--expected-requests", type=int, default=200)
     parser.add_argument("--cache-capacity", type=int, default=32)
+    parser.add_argument(
+        "--capacities",
+        default="",
+        help="Comma-separated offline slot capacities; defaults to --cache-capacity.",
+    )
+    parser.add_argument(
+        "--expert-bytes",
+        type=int,
+        default=0,
+        help="Optional per-expert bytes for HBM footprint reporting.",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +50,139 @@ def percentage(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 0.0
     return round(100.0 * numerator / denominator, 4)
+
+
+def parse_capacities(raw: str, fallback: int) -> list[int]:
+    if not raw.strip():
+        return [int(fallback)]
+    values = sorted({int(value.strip()) for value in raw.split(",") if value.strip()})
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("capacities must contain positive integers")
+    return values
+
+
+def nearest_rank_float(values: list[float], percentile: float) -> float:
+    if not values:
+        raise ValueError("cannot compute a percentile of an empty sample")
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return round(float(ordered[rank - 1]), 6)
+
+
+def _active_expert_set(event: dict[str, Any]) -> frozenset[int] | None:
+    value = event.get("active_experts")
+    if not isinstance(value, list):
+        return None
+    try:
+        return frozenset(int(expert_id) for expert_id in value)
+    except (TypeError, ValueError):
+        return None
+
+
+def summarize_temporal_dynamics(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize adjacent routing-set changes within each MoE layer.
+
+    Events from different layers are interleaved in the JSONL stream. Comparing
+    neighboring lines directly would therefore measure layer identity changes,
+    not routing dynamics. We retain the stream order separately for every layer
+    and compare only consecutive invocations of that layer.
+    """
+
+    by_layer: dict[int, list[frozenset[int]]] = {}
+    events_with_ids = 0
+    for event in events:
+        active = _active_expert_set(event)
+        if active is None:
+            continue
+        layer_id = int(event.get("_layer_id", event.get("layer_id", -1)))
+        by_layer.setdefault(layer_id, []).append(active)
+        events_with_ids += 1
+
+    jaccard: list[float] = []
+    new_expert_ratio: list[float] = []
+    changed_expert_count: list[int] = []
+    adjacent_pairs = 0
+    for histories in by_layer.values():
+        for previous, current in zip(histories, histories[1:]):
+            adjacent_pairs += 1
+            union = previous | current
+            intersection = previous & current
+            jaccard.append(len(intersection) / len(union) if union else 1.0)
+            new_expert_ratio.append(
+                len(current - previous) / len(current) if current else 0.0
+            )
+            changed_expert_count.append(len(current - previous))
+
+    result: dict[str, Any] = {
+        "events_with_active_expert_ids": events_with_ids,
+        "layers_with_active_expert_ids": len(by_layer),
+        "adjacent_same_layer_pairs": adjacent_pairs,
+    }
+    if not adjacent_pairs:
+        result["available"] = False
+        return result
+
+    result["available"] = True
+    result["jaccard"] = {
+        "min": round(min(jaccard), 6),
+        "p50_nearest_rank": nearest_rank_float(jaccard, 0.50),
+        "p95_nearest_rank": nearest_rank_float(jaccard, 0.95),
+        "max": round(max(jaccard), 6),
+    }
+    result["new_expert_ratio"] = {
+        "min": round(min(new_expert_ratio), 6),
+        "p50_nearest_rank": nearest_rank_float(new_expert_ratio, 0.50),
+        "p95_nearest_rank": nearest_rank_float(new_expert_ratio, 0.95),
+        "max": round(max(new_expert_ratio), 6),
+    }
+    result["changed_expert_count"] = {
+        "min": min(changed_expert_count),
+        "p50_nearest_rank": nearest_rank(changed_expert_count, 0.50),
+        "p95_nearest_rank": nearest_rank(changed_expert_count, 0.95),
+        "max": max(changed_expert_count),
+    }
+    return result
+
+
+def summarize_capacity_sweep(
+    events: list[dict[str, Any]],
+    *,
+    capacities: list[int],
+    expert_bytes: int = 0,
+) -> list[dict[str, Any]]:
+    """Estimate prefill overflow and wave pressure for offline capacities."""
+
+    active = [int(event["n_active"]) for event in events]
+    rows: list[dict[str, Any]] = []
+    for capacity in capacities:
+        waves = [math.ceil(value / capacity) for value in active]
+        overflow = sum(value > capacity for value in active)
+        row: dict[str, Any] = {
+            "capacity_experts": int(capacity),
+            "capacity_fraction_of_max": round(
+                float(capacity) / float(max(active)) if active else 0.0,
+                6,
+            ),
+            "overflow_invocations": int(overflow),
+            "overflow_rate_pct": percentage(overflow, len(active)),
+            "required_waves": {
+                "min": min(waves) if waves else 0,
+                "p50_nearest_rank": nearest_rank(waves, 0.50) if waves else 0,
+                "p95_nearest_rank": nearest_rank(waves, 0.95) if waves else 0,
+                "max": max(waves) if waves else 0,
+            },
+        }
+        if expert_bytes > 0:
+            active_bytes = [value * int(expert_bytes) for value in active]
+            row["expert_bytes"] = int(expert_bytes)
+            row["active_hbm_bytes"] = {
+                "p50_nearest_rank": nearest_rank(active_bytes, 0.50),
+                "p95_nearest_rank": nearest_rank(active_bytes, 0.95),
+                "max": max(active_bytes) if active_bytes else 0,
+            }
+            row["slot_budget_bytes"] = int(capacity) * int(expert_bytes)
+        rows.append(row)
+    return rows
 
 
 def sha256(path: Path) -> str:
@@ -71,7 +215,9 @@ def load_scoped_events(
                 prefill_seen += 1
                 if prefill_seen > skip_prefill_invocations:
                     in_scope = True
-                    prefill.append(event["payload"])
+                    payload = dict(event["payload"])
+                    payload["_layer_id"] = int(event["layer_id"])
+                    prefill.append(payload)
                 continue
 
             if in_scope and name == DECODE_EVENT:
@@ -92,7 +238,7 @@ def summarize_prefill(
     overflow = sum(value > cache_capacity for value in active)
     three_or_more = sum(value >= 3 for value in waves)
 
-    return {
+    summary = {
         "layer_invocations": len(events),
         "active_experts": {
             "min": min(active),
@@ -111,6 +257,8 @@ def summarize_prefill(
             "three_or_more_rate_pct": percentage(three_or_more, len(events)),
         },
     }
+    summary["temporal_dynamics"] = summarize_temporal_dynamics(events)
+    return summary
 
 
 def summarize_decode(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -123,7 +271,7 @@ def summarize_decode(events: list[dict[str, Any]]) -> dict[str, Any]:
     sample_rates = sorted({int(event.get("profile_sample_rate", 1)) for event in events})
     layer_invocations = Counter(int(event["_layer_id"]) for event in events)
 
-    return {
+    summary = {
         "sampled_layer_invocations": len(events),
         "profile_sample_rates": sample_rates,
         "layer_invocations": {
@@ -158,6 +306,8 @@ def summarize_decode(events: list[dict[str, Any]]) -> dict[str, Any]:
             "update_bearing_rate_pct": percentage(update_events, len(events)),
         },
     }
+    summary["temporal_dynamics"] = summarize_temporal_dynamics(events)
+    return summary
 
 
 def main() -> None:
@@ -166,6 +316,9 @@ def main() -> None:
         raise ValueError("managed layers and expected requests must be positive")
     if args.cache_capacity <= 0 or args.skip_prefill_requests < 0:
         raise ValueError("cache capacity must be positive and skipped requests non-negative")
+    capacities = parse_capacities(args.capacities, args.cache_capacity)
+    if args.expert_bytes < 0:
+        raise ValueError("expert bytes must be non-negative")
 
     skipped_invocations = args.skip_prefill_requests * args.managed_layers
     prefill, decode = load_scoped_events(
@@ -215,6 +368,11 @@ def main() -> None:
         "prefill": summarize_prefill(prefill, cache_capacity=args.cache_capacity),
         "decode": summarize_decode(decode),
     }
+    summary["prefill"]["capacity_sweep"] = summarize_capacity_sweep(
+        prefill,
+        capacities=capacities,
+        expert_bytes=args.expert_bytes,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")

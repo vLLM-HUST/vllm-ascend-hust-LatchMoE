@@ -1,0 +1,15 @@
+\begin{table*}[t]
+  \centering
+  \small
+  \caption{Three-model semantic and graph qualification. $L/E/S$ denotes managed MoE layers, routed experts per layer, and resident shared experts. Router/boundary counts are exact native comparisons; locks/replays are address locks and observed graph replays; overflow/H2D counts exercise wave composition and transfer leases. Every row passes all 11 gates, including exact end-to-end tokens and zero eager fallback.}
+  \label{tab:qualification}
+  \begin{tabular}{lrrrrrrc}
+    \toprule
+    Model & $L/E/S$ & top-$k$ & Router & Boundary & Locks/replays & Overflow/H2D & Result \\
+    \midrule
+    Qwen3-30B-A3B & 48/128/0 & 8 & 192 & 192 & 48/97 & 144/239 & Pass \\
+    GLM-4.7-Flash & 46/64/1 & 4 & 184 & 184 & 46/94 & 92/226 & Pass \\
+    Qwen3-Next-80B-A3B & 48/512/1 & 10 & 192 & 192 & 48/97 & 144/240 & Pass \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

@@ -1,0 +1,273 @@
+{
+  "decode": {
+    "active_experts": {
+      "max": 10,
+      "min": 10,
+      "p50_nearest_rank": 10,
+      "p95_nearest_rank": 10
+    },
+    "expert_cache_accesses": {
+      "hits": 572242,
+      "miss_rate_pct": 38.1975,
+      "misses": 353678
+    },
+    "layer_invocation_imbalance": {
+      "max": 1929,
+      "max_minus_min": 0,
+      "min": 1929
+    },
+    "layer_invocations": {
+      "0": 1929,
+      "1": 1929,
+      "10": 1929,
+      "11": 1929,
+      "12": 1929,
+      "13": 1929,
+      "14": 1929,
+      "15": 1929,
+      "16": 1929,
+      "17": 1929,
+      "18": 1929,
+      "19": 1929,
+      "2": 1929,
+      "20": 1929,
+      "21": 1929,
+      "22": 1929,
+      "23": 1929,
+      "24": 1929,
+      "25": 1929,
+      "26": 1929,
+      "27": 1929,
+      "28": 1929,
+      "29": 1929,
+      "3": 1929,
+      "30": 1929,
+      "31": 1929,
+      "32": 1929,
+      "33": 1929,
+      "34": 1929,
+      "35": 1929,
+      "36": 1929,
+      "37": 1929,
+      "38": 1929,
+      "39": 1929,
+      "4": 1929,
+      "40": 1929,
+      "41": 1929,
+      "42": 1929,
+      "43": 1929,
+      "44": 1929,
+      "45": 1929,
+      "46": 1929,
+      "47": 1929,
+      "5": 1929,
+      "6": 1929,
+      "7": 1929,
+      "8": 1929,
+      "9": 1929
+    },
+    "mapping_updates": {
+      "count": 344405,
+      "update_bearing_invocations": 86942,
+      "update_bearing_rate_pct": 93.898
+    },
+    "miss_bearing_invocations": {
+      "count": 87244,
+      "rate_pct": 94.2241
+    },
+    "profile_sample_rates": [
+      1
+    ],
+    "sampled_layer_invocations": 92592,
+    "temporal_dynamics": {
+      "adjacent_same_layer_pairs": 92544,
+      "available": true,
+      "changed_expert_count": {
+        "max": 10,
+        "min": 0,
+        "p50_nearest_rank": 6,
+        "p95_nearest_rank": 10
+      },
+      "events_with_active_expert_ids": 92592,
+      "jaccard": {
+        "max": 1.0,
+        "min": 0.0,
+        "p50_nearest_rank": 0.25,
+        "p95_nearest_rank": 0.666667
+      },
+      "layers_with_active_expert_ids": 48,
+      "new_expert_ratio": {
+        "max": 1.0,
+        "min": 0.0,
+        "p50_nearest_rank": 0.6,
+        "p95_nearest_rank": 1.0
+      }
+    }
+  },
+  "prefill": {
+    "active_experts": {
+      "max": 496,
+      "min": 103,
+      "p50_nearest_rank": 252,
+      "p95_nearest_rank": 401
+    },
+    "capacity_overflow": {
+      "capacity_experts": 32,
+      "overflow_invocations": 3072,
+      "overflow_rate_pct": 100.0
+    },
+    "capacity_sweep": [
+      {
+        "active_hbm_bytes": {
+          "max": 3120562176,
+          "p50_nearest_rank": 1585446912,
+          "p95_nearest_rank": 2522873856
+        },
+        "capacity_experts": 8,
+        "capacity_fraction_of_max": 0.016129,
+        "expert_bytes": 6291456,
+        "overflow_invocations": 3072,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 62,
+          "min": 13,
+          "p50_nearest_rank": 32,
+          "p95_nearest_rank": 51
+        },
+        "slot_budget_bytes": 50331648
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 3120562176,
+          "p50_nearest_rank": 1585446912,
+          "p95_nearest_rank": 2522873856
+        },
+        "capacity_experts": 16,
+        "capacity_fraction_of_max": 0.032258,
+        "expert_bytes": 6291456,
+        "overflow_invocations": 3072,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 31,
+          "min": 7,
+          "p50_nearest_rank": 16,
+          "p95_nearest_rank": 26
+        },
+        "slot_budget_bytes": 100663296
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 3120562176,
+          "p50_nearest_rank": 1585446912,
+          "p95_nearest_rank": 2522873856
+        },
+        "capacity_experts": 32,
+        "capacity_fraction_of_max": 0.064516,
+        "expert_bytes": 6291456,
+        "overflow_invocations": 3072,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 16,
+          "min": 4,
+          "p50_nearest_rank": 8,
+          "p95_nearest_rank": 13
+        },
+        "slot_budget_bytes": 201326592
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 3120562176,
+          "p50_nearest_rank": 1585446912,
+          "p95_nearest_rank": 2522873856
+        },
+        "capacity_experts": 64,
+        "capacity_fraction_of_max": 0.129032,
+        "expert_bytes": 6291456,
+        "overflow_invocations": 3072,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 8,
+          "min": 2,
+          "p50_nearest_rank": 4,
+          "p95_nearest_rank": 7
+        },
+        "slot_budget_bytes": 402653184
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 3120562176,
+          "p50_nearest_rank": 1585446912,
+          "p95_nearest_rank": 2522873856
+        },
+        "capacity_experts": 128,
+        "capacity_fraction_of_max": 0.258065,
+        "expert_bytes": 6291456,
+        "overflow_invocations": 3056,
+        "overflow_rate_pct": 99.4792,
+        "required_waves": {
+          "max": 4,
+          "min": 1,
+          "p50_nearest_rank": 2,
+          "p95_nearest_rank": 4
+        },
+        "slot_budget_bytes": 805306368
+      }
+    ],
+    "layer_invocations": 3072,
+    "required_capacity_groups": {
+      "counts": {
+        "10": 348,
+        "11": 253,
+        "12": 183,
+        "13": 109,
+        "14": 57,
+        "15": 38,
+        "16": 3,
+        "4": 16,
+        "5": 143,
+        "6": 351,
+        "7": 507,
+        "8": 607,
+        "9": 457
+      },
+      "three_or_more_invocations": 3072,
+      "three_or_more_rate_pct": 100.0
+    },
+    "temporal_dynamics": {
+      "adjacent_same_layer_pairs": 3024,
+      "available": true,
+      "changed_expert_count": {
+        "max": 238,
+        "min": 2,
+        "p50_nearest_rank": 77,
+        "p95_nearest_rank": 158
+      },
+      "events_with_active_expert_ids": 3072,
+      "jaccard": {
+        "max": 0.9375,
+        "min": 0.189974,
+        "p50_nearest_rank": 0.509091,
+        "p95_nearest_rank": 0.728814
+      },
+      "layers_with_active_expert_ids": 48,
+      "new_expert_ratio": {
+        "max": 0.68599,
+        "min": 0.006803,
+        "p50_nearest_rank": 0.315642,
+        "p95_nearest_rank": 0.536585
+      }
+    }
+  },
+  "schema_version": 1,
+  "scope": {
+    "analyzed_requests": 64,
+    "cache_capacity_experts_per_layer": 32,
+    "filter": "Start at the first prefill event after the configured skipped request groups; retain all later prefill and decode events.",
+    "managed_layers": 48,
+    "skipped_prefill_requests": 1
+  },
+  "source": {
+    "profile": "/workspace/latchmoe-motivation-qwen3-next-profile64/sew-offload-ascend-v1-20260822T050040Z/sew_28gb_autoslots/mixed_chat/moe_profile.jsonl",
+    "sha256": "25a66d46d8bfc513f4fa8c82660d808866d31441eba3402c3a7283ce26b64cfb"
+  }
+}

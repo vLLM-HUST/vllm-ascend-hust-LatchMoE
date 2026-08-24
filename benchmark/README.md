@@ -106,6 +106,23 @@ python benchmark/scripts/run_suite.py \
   --workload mixed_chat
 ```
 
+For routing characterization, add `--routing-profile`. This retains the
+logical active-expert IDs, per-expert token counts, phase, and residency fields
+needed for temporal-dynamics analysis, and forces full-rate decode profiling;
+ordinary benchmark profiles keep these larger fields disabled.
+
+```bash
+python benchmark/scripts/run_suite.py \
+  --case sew_14gb_autoslots \
+  --workload mixed_chat \
+  --routing-profile
+```
+
+For a characterization-only run, `--request-output-tokens N` overrides the
+per-request output budget without changing the tokenizer-specific manifest.
+This is useful for keeping very slow large-model traces bounded; it must not
+be used to compare throughput against runs with a different output budget.
+
 Summarize a completed run directory:
 
 ```bash

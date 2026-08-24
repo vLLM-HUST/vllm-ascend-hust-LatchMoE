@@ -30,21 +30,25 @@
       },
       "checkpoint_index_sha256": "df0d481ec595c55a0ba58426d517390c6214a566ec4ff1c8fc4bbce9f57b3c24",
       "config_sha256": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+      "evidence": {
+        "qualification_report": "/workspace/latchmoe-formal-20260824/qwen3-qualification-r1/qualification_report.json",
+        "qualification_report_sha256": "2986a5202cb26c71bf4518528f7c46abba4d6aa178ea9d56267e1de2cc677b94"
+      },
       "gates": {
-        "decode_cache_churn": "not_run",
-        "h2d_lease_release": "not_run",
-        "latchmoe_eager_diagnostic": "not_run",
-        "layer_boundary_parity": "not_run",
-        "native_oracle": "not_run",
-        "piecewise_capture": "not_run",
-        "piecewise_replay": "not_run",
-        "prefill_overflow": "not_run",
-        "router_parity": "not_run",
-        "token_exactness": "not_run",
-        "zero_eager_fallback": "not_run"
+        "decode_cache_churn": "passed",
+        "h2d_lease_release": "passed",
+        "latchmoe_eager_diagnostic": "passed",
+        "layer_boundary_parity": "passed",
+        "native_oracle": "passed",
+        "piecewise_capture": "passed",
+        "piecewise_replay": "passed",
+        "prefill_overflow": "passed",
+        "router_parity": "passed",
+        "token_exactness": "passed",
+        "zero_eager_fallback": "passed"
       },
       "id": "qwen3-30b-a3b",
-      "status": "not_run"
+      "status": "passed"
     },
     {
       "capability_config": {

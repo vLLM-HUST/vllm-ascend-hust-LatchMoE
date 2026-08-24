@@ -21,6 +21,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--max-requests", type=int, default=0)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=0,
+        help="Override each manifest record's maximum output-token budget.",
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--request-timeout-s", type=float, default=900.0)
     parser.add_argument("--tokenizer", default="")
@@ -257,6 +263,14 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--concurrency must be positive")
 
     requests = load_requests(args.manifest, bucket=args.bucket, max_requests=args.max_requests)
+    max_output_tokens = int(getattr(args, "max_output_tokens", 0) or 0)
+    if max_output_tokens:
+        if max_output_tokens <= 0:
+            raise ValueError("--max-output-tokens must be positive")
+        requests = [
+            {**request, "max_output_tokens": max_output_tokens}
+            for request in requests
+        ]
     tokenizer = _load_tokenizer(args.tokenizer)
     print(
         f"Loaded {len(requests)} requests for bucket={args.bucket}. "

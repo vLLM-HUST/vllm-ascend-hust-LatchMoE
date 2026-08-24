@@ -1,0 +1,259 @@
+{
+  "audit": "independent raw-event recomputation plus custody/provenance validation",
+  "models": [
+    {
+      "benchmark_sha256": "deb227eff423c7404cd6eb26cb5606929828836e2f6f090ca59a278d5372b0e1",
+      "custody": {
+        "benchmark_status": "ok",
+        "failed_requests": 0,
+        "host_python": "/root/miniconda3/envs/latchmoe/bin/python",
+        "physical_device": 5,
+        "release_status": "released",
+        "successful_requests": 200,
+        "unit_status": "ok"
+      },
+      "event_counts": {
+        "b2_work_conserving_prefill": 2412,
+        "decode_fixed_slot_stage": 304824,
+        "graph_replay_issue": 2425,
+        "graph_slot_address_lock": 12,
+        "graph_slot_address_validate": 12,
+        "prefill_stage_bank_allocate": 2,
+        "profile_adaptive_wave_decision": 24,
+        "register_layer_for_fixed_slots": 12,
+        "release_original_expert_weights": 12,
+        "slot_generation_protected_until_compute_complete": 12
+      },
+      "manifest_sha256": "7574bd13b4436b6b6cea63537a6f261670fc194e32a23d22bcfa44899c012c12",
+      "model": "Qwen3-30B-A3B",
+      "overlap_and_lifecycle": {
+        "decode_mapping_published_before_ready_violations": 0,
+        "decode_missing_consumer_dependency_violations": 0,
+        "h2d_bytes": 1578586079232,
+        "issued_before_compute_waves": 8571,
+        "mlp_ms": 7211.242,
+        "prefetch_after_compute_issues": 0,
+        "prefetch_before_compute_issues": 6171,
+        "stage_wait_ms": 1459.871,
+        "stage_wait_over_mlp": 0.202444,
+        "wave_count": 8571
+      },
+      "paper_facing": {
+        "capacity_32": {
+          "active_hbm_bytes": {
+            "max": 1189085184,
+            "p50_nearest_rank": 934281216,
+            "p95_nearest_rank": 1104150528
+          },
+          "capacity_experts": 32,
+          "capacity_fraction_of_max": 0.253968,
+          "expert_bytes": 9437184,
+          "overflow_invocations": 2400,
+          "overflow_rate_pct": 100.0,
+          "required_waves": {
+            "max": 4,
+            "min": 2,
+            "p50_nearest_rank": 4,
+            "p95_nearest_rank": 4
+          },
+          "slot_budget_bytes": 301989888
+        },
+        "decode_active_set_jaccard": {
+          "max": 1.0,
+          "min": 0.0,
+          "p50_nearest_rank": 0.333333,
+          "p95_nearest_rank": 0.6
+        },
+        "decode_miss_bearing_rate_pct": 68.7083,
+        "decode_miss_rate_pct": 20.5521,
+        "decode_update_bearing_rate_pct": 68.0938,
+        "prefill_active_experts": {
+          "max": 126,
+          "min": 58,
+          "p50_nearest_rank": 99,
+          "p95_nearest_rank": 117
+        }
+      },
+      "raw_profile": "/workspace/latchmoe-motivation-qwen3-fullrate-v2/sew-offload-ascend-v1-20260822T030434Z/sew_14gb_autoslots/mixed_chat/moe_profile.jsonl",
+      "raw_profile_sha256": "79e0ca2333c2a84a870ae9226d43c05f92a1ad2794784474ef378ef868f4607e",
+      "scope": {
+        "decode_layer_invocations": 304800,
+        "managed_layers": 12,
+        "prefill_layer_invocations": 2400,
+        "requests": 200
+      },
+      "status": "verified",
+      "summary_sha256": "07172a7fc4903e2560ff91cf2300b1f2832801daebd7ce08b78f9c7c6f3bcce2"
+    },
+    {
+      "benchmark_sha256": "e5886e0dd5f8a4258fd68793c821581f84cfbede92189c31e95acd693a0096e7",
+      "custody": {
+        "benchmark_status": "ok",
+        "failed_requests": 0,
+        "host_python": "/root/miniconda3/envs/latchmoe/bin/python",
+        "physical_device": 5,
+        "release_status": "released",
+        "successful_requests": 100,
+        "unit_status": "ok"
+      },
+      "event_counts": {
+        "b2_work_conserving_prefill": 1111,
+        "decode_fixed_slot_stage": 139722,
+        "graph_replay_issue": 1222,
+        "graph_slot_address_lock": 11,
+        "graph_slot_address_validate": 11,
+        "prefill_stage_bank_allocate": 2,
+        "profile_adaptive_wave_decision": 22,
+        "register_layer_for_fixed_slots": 11,
+        "release_original_expert_weights": 11,
+        "slot_generation_protected_until_compute_complete": 11
+      },
+      "manifest_sha256": "1490d732f80e93c065ee24e1ee1437416f876195474f59223010f79ec5f42e6f",
+      "model": "GLM-4.7-Flash",
+      "overlap_and_lifecycle": {
+        "decode_mapping_published_before_ready_violations": 0,
+        "decode_missing_consumer_dependency_violations": 0,
+        "h2d_bytes": 598072098816,
+        "issued_before_compute_waves": 2200,
+        "mlp_ms": 1631.009,
+        "prefetch_after_compute_issues": 0,
+        "prefetch_before_compute_issues": 1100,
+        "stage_wait_ms": 391.919,
+        "stage_wait_over_mlp": 0.240292,
+        "wave_count": 2200
+      },
+      "paper_facing": {
+        "capacity_32": {
+          "active_hbm_bytes": {
+            "max": 1207959552,
+            "p50_nearest_rank": 1151336448,
+            "p95_nearest_rank": 1207959552
+          },
+          "capacity_experts": 32,
+          "capacity_fraction_of_max": 0.5,
+          "expert_bytes": 18874368,
+          "overflow_invocations": 1100,
+          "overflow_rate_pct": 100.0,
+          "required_waves": {
+            "max": 2,
+            "min": 2,
+            "p50_nearest_rank": 2,
+            "p95_nearest_rank": 2
+          },
+          "slot_budget_bytes": 603979776
+        },
+        "decode_active_set_jaccard": {
+          "max": 1.0,
+          "min": 0.0,
+          "p50_nearest_rank": 0.142857,
+          "p95_nearest_rank": 0.6
+        },
+        "decode_miss_bearing_rate_pct": 41.0251,
+        "decode_miss_rate_pct": 14.02,
+        "decode_update_bearing_rate_pct": 40.3772,
+        "prefill_active_experts": {
+          "max": 64,
+          "min": 42,
+          "p50_nearest_rank": 61,
+          "p95_nearest_rank": 64
+        }
+      },
+      "raw_profile": "/workspace/latchmoe-motivation-glm-fullrate-v2/sew-offload-ascend-v1-20260822T034632Z/sew_14gb_autoslots/mixed_chat/moe_profile.jsonl",
+      "raw_profile_sha256": "8cc9f11118c5a94707f250465e48f2893acbb0ab3360d01290c55613755ceb1f",
+      "scope": {
+        "decode_layer_invocations": 139700,
+        "managed_layers": 11,
+        "prefill_layer_invocations": 1100,
+        "requests": 100
+      },
+      "status": "verified",
+      "summary_sha256": "e41c8fb723c7ccb005f676c2d2ad0bc83d0d871ededc4d7824895fb6eabe1dd4"
+    },
+    {
+      "benchmark_sha256": "887a08919180e99bf17171d81c175c8c55597cf13ae1a3706bfd52f4f6590df7",
+      "custody": {
+        "benchmark_status": "ok",
+        "failed_requests": 0,
+        "host_python": "/root/miniconda3/envs/latchmoe/bin/python",
+        "physical_device": 5,
+        "release_status": "released",
+        "successful_requests": 64,
+        "unit_status": "ok"
+      },
+      "event_counts": {
+        "b2_work_conserving_prefill": 3120,
+        "decode_fixed_slot_stage": 92689,
+        "graph_replay_issue": 194,
+        "graph_slot_address_lock": 48,
+        "graph_slot_address_validate": 48,
+        "prefill_stage_bank_allocate": 2,
+        "profile_adaptive_wave_decision": 96,
+        "register_layer_for_fixed_slots": 48,
+        "release_original_expert_weights": 48,
+        "slot_generation_protected_until_compute_complete": 48
+      },
+      "manifest_sha256": "d2b3a986fda24dc10bc669f8ff05288a397e8393fbd9fd5e20e6f49a5c912554",
+      "model": "Qwen3-Next-80B-A3B-Instruct",
+      "overlap_and_lifecycle": {
+        "decode_mapping_published_before_ready_violations": 0,
+        "decode_missing_consumer_dependency_violations": 0,
+        "h2d_bytes": 4621137346560,
+        "issued_before_compute_waves": 26695,
+        "mlp_ms": 27268.944,
+        "prefetch_after_compute_issues": 0,
+        "prefetch_before_compute_issues": 23623,
+        "stage_wait_ms": 4683.342,
+        "stage_wait_over_mlp": 0.171746,
+        "wave_count": 26695
+      },
+      "paper_facing": {
+        "capacity_32": {
+          "active_hbm_bytes": {
+            "max": 3120562176,
+            "p50_nearest_rank": 1585446912,
+            "p95_nearest_rank": 2522873856
+          },
+          "capacity_experts": 32,
+          "capacity_fraction_of_max": 0.064516,
+          "expert_bytes": 6291456,
+          "overflow_invocations": 3072,
+          "overflow_rate_pct": 100.0,
+          "required_waves": {
+            "max": 16,
+            "min": 4,
+            "p50_nearest_rank": 8,
+            "p95_nearest_rank": 13
+          },
+          "slot_budget_bytes": 201326592
+        },
+        "decode_active_set_jaccard": {
+          "max": 1.0,
+          "min": 0.0,
+          "p50_nearest_rank": 0.25,
+          "p95_nearest_rank": 0.666667
+        },
+        "decode_miss_bearing_rate_pct": 94.2241,
+        "decode_miss_rate_pct": 38.1975,
+        "decode_update_bearing_rate_pct": 93.898,
+        "prefill_active_experts": {
+          "max": 496,
+          "min": 103,
+          "p50_nearest_rank": 252,
+          "p95_nearest_rank": 401
+        }
+      },
+      "raw_profile": "/workspace/latchmoe-motivation-qwen3-next-profile64/sew-offload-ascend-v1-20260822T050040Z/sew_28gb_autoslots/mixed_chat/moe_profile.jsonl",
+      "raw_profile_sha256": "25a66d46d8bfc513f4fa8c82660d808866d31441eba3402c3a7283ce26b64cfb",
+      "scope": {
+        "decode_layer_invocations": 92592,
+        "managed_layers": 48,
+        "prefill_layer_invocations": 3072,
+        "requests": 64
+      },
+      "status": "verified",
+      "summary_sha256": "9261800569a73293a66b1905db7ad6406f3a29ba732e3fe7d12c3545ffcbac7d"
+    }
+  ],
+  "schema_version": 1,
+  "status": "verified"
+}

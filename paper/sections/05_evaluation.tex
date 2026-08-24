@@ -1,154 +1,222 @@
 \section{Evaluation}
 \label{sec:evaluation}
 
-Our current evaluation answers three questions within a deliberately narrow
-qualification boundary:
+We ask six questions. \textbf{Q1} tests semantic fidelity, graph replay, and
+the lifecycle contract across the three target models. \textbf{Q2} establishes
+baseline feasibility and quantifies the cost of bounded offloading relative to
+full residency. \textbf{Q3} measures capacity-bounded waves against
+graph-compatible full-layer staging. \textbf{Q4} isolates transfer--compute
+overlap. \textbf{Q5} varies slot capacity. \textbf{Q6} accounts for storage,
+transfer, and unsupported boundaries.
 
-\begin{description}
-  \item[Q1: Replay and correctness.] Does LatchMoE preserve graph-visible
-    addresses, transfer ordering, capacity bounds, and exact model outputs
-    across independent service starts?
-  \item[Q2: Multi-wave staging.] Under a matched graph-compatible contract,
-    how does capacity-bounded multi-wave prefill compare with blocking
-    full-layer staging?
-  \item[Q3: Mechanism exercise.] Does the online runtime issue next-wave
-    transfers before current-wave compute, preserve native recombination, and
-    account for its bounded storage?
-\end{description}
+\subsection{Experimental Methodology}
 
-These questions validate the runtime mechanism and one matched prefill result.
-They do not establish performance breadth across models, devices, memory
-budgets, workloads, or serving concurrency.
+\paragraph{Platform and software.}
+Experiments use one Ascend 910B2 with 65,536~MiB HBM and tensor parallelism
+one, hosted by a 192-core Kunpeng-920 server with 2.0~TiB DRAM. Models use BF16
+weights. The managed stack pins PyTorch 2.10.0, torch-npu 2.10.0.post2, vLLM
+commit \texttt{ad7125a}, and vLLM-Ascend commit \texttt{4806367}. Each run
+manifest records the complete command, model and dataset digests, source-tree
+digest, environment, device, graph mode, and service-release custody.
 
-\subsection{Experimental setup}
+\paragraph{Workloads and controls.}
+The matched baseline, overlap, and capacity campaigns draw from one frozen
+64-request ShareGPT prefill-heavy bucket with
+\FormalPromptMin--\FormalPromptMax prompt tokens (median
+\FormalPromptMedian), generate 32 tokens at temperature zero and seed 42,
+disable prefix caching, and set both client concurrency and
+\texttt{max\_num\_seqs} to one. The full-layer/multi-wave campaign uses a
+separate frozen 200-request ShareGPT manifest and 128 output tokens. Every
+formal unit starts a fresh service. Counterordered comparisons use three start
+pairs; the paired estimator is the exponential of the mean, across starts, of
+the median per-request log latency ratio. We report a 10,000-replicate
+hierarchical bootstrap with seed 20260823: 95\% intervals for TTFT effects and
+90\% intervals for the preregistered TPOT equivalence test (margin $\pm5\%$).
+For the Qwen3 performance campaigns, the 14-GiB AutoConfig manages 12 of the
+model's 48 MoE layers (one layer in each four-layer group); all four baseline
+arms and Q3--Q5 use this identical layer selection. Q1 is a separate
+capability qualification and exercises the model-specific layer counts shown
+in Table~\ref{tab:qualification}.
 
-All reported graph-only experiments use Qwen3-30B-A3B in BF16 on one physical
-Ascend 910B2 with tensor parallelism one. LatchMoE manages 12 MoE layers with a
-14-GiB host-offload target and 32 physical slots. The server uses
-\texttt{max\_num\_seqs=1}; client concurrency is one and prefix caching is
-disabled. Requests are drawn from a fixed ShareGPT manifest. The matched
-multi-wave experiment uses the same ordered 200-request manifest in every unit
-and generates 128 output tokens per request.
+\paragraph{Fail-closed gates.}
+A performance unit must complete all requests, match complete output-token
+arrays by request ID, capture and replay PIECEWISE ACLGraph, retain fixed slot
+and map addresses, publish no stale transfer, violate no owner/version lease,
+avoid eager fallback and NPU/ACL errors, emit a release acknowledgment, and
+retain raw client, server, profile, and HBM artifacts. A completed arm that
+fails exact-token comparison is retained but excluded from latency comparison.
 
-Every formal unit starts a fresh managed service, requires PIECEWISE ACLGraph
-capture and replay, retains raw client and server artifacts, and ends with a
-release acknowledgement and a physical HBM sample. Runs with eager fallback,
-forced eager execution, NPU/ACL errors, OOM, address changes, stale transfer
-events, or slot-generation violations fail validation. Exact output comparison
-uses request IDs and complete output-token arrays, not decoded string equality.
+\subsection{Q1: Does LatchMoE preserve semantics and replay?}
 
-\subsection{Q1: Replay-stable execution and exactness}
+\input{generated/qualification_table}
 
-Table~\ref{tab:lifecycle} summarizes three independent formal starts from the
-graph-lifecycle qualification. Each start serves 11 requests and 1,408 output
-tokens. The first repeat is compared with the preceding short gate, and later
-repeats are compared with the prior repeat. Across the three formal starts,
-all 33 requests and all 4,224 output tokens match exactly.
+Table~\ref{tab:qualification} covers routed-only Qwen3-30B-A3B, shared-expert
+GLM-4.7-Flash, and shared-expert Qwen3-Next-80B-A3B-Instruct. Each model is
+evaluated against the same 11 gate categories: native router parity, native
+layer-boundary parity, a native oracle where feasible, eager diagnostic parity, exact
+end-to-end tokens, graph capture and replay, zero eager fallback, overflow
+composition, decode cache churn, and H2D lease/release ordering. Qwen3-Next's
+native full-resident end-to-end subcheck is capacity-limited on this device;
+its native semantics are therefore checked at the router and layer boundary,
+while its end-to-end comparison uses the eager seam as the reference. The
+router and layer-boundary checks compare four records per managed layer. Across
+all three capability tuples, every captured slot/map address validates at
+replay, every managed layer releases its original expert bank, and the online
+profiles exercise both overflow waves and H2D leases. Thus, the seam preserves
+the evaluated native routing and combination contracts rather than merely
+producing a runnable graph.
 
-\begin{table}[t]
+This is a capability qualification, not workload breadth: each model uses one
+short request in each end-to-end mode (four generated tokens) plus a one-token
+overflow stress request. Qwen3 and GLM compare native, LatchMoE-eager, and
+LatchMoE-graph outputs. Qwen3-Next cannot materialize its native full-resident
+path on this 64-GiB device, so its end-to-end gate compares eager-seam and graph
+outputs; native semantics remain checked at the router and layer boundary.
+
+To expose the graph effect separately from the later multi-wave and overlap
+comparisons, we also ran a matched one-request qualification diagnostic on
+Qwen3 with the same 32-slot, 14-GiB configuration. The eager seam and
+PIECEWISE graph modes produced identical four-token output IDs; the observed
+TTFT was 2235.66~ms versus 2165.77~ms, and TPOT was 262.04 versus
+140.63~ms/token. The diagnostic recorded 48 slot-address validations in each
+mode and 97 non-synchronizing PIECEWISE replay events. This is direct
+graph-versus-eager evidence for the qualified path, but it is one request and
+therefore is not a repeated-start variance estimate, throughput result, or
+concurrency claim.
+
+\subsection{Q2: What baselines are feasible, and what does offloading cost?}
+
+We run three counterordered starts of four ACLGraph arms with an explicit
+512-MiB KV cache and \FormalRequestsPerBaselineUnit requests per unit:
+full-resident vLLM-Ascend, its native weight-prefetch path, the legacy layered
+offload path, and LatchMoE with a 14-GiB target. Full residency and LatchMoE
+each pass \FormalRequestsPerBaselineArm/\FormalRequestsPerBaselineArm{} exact
+requests. Native prefetch and legacy layered offload both complete
+\FormalRequestsPerBaselineArm/\FormalRequestsPerBaselineArm{} requests and
+capture/replay the graph, but respectively differ
+from the oracle on \NativeMismatchRequests{} and \LegacyMismatchRequests{}
+request-token arrays across their three starts. We therefore retain both as
+unsupported comparison cells and draw no performance conclusion from them.
+
+Full residency is a cost anchor, not a memory-matched offload baseline. Its
+repeat-median TTFT p50 and TPOT p50 are \FullResidentTTFTMedian~ms and
+\FullResidentTPOTMedian~ms/token, versus \LatchTTFTMedian~ms and
+\LatchTPOTMedian~ms/token for LatchMoE. The paired TTFT effect is
++\LatchVsFullTTFTEffect\% (95\% CI [+\LatchVsFullTTFTLower\%,
++\LatchVsFullTTFTUpper\%]); the TPOT effect is +\LatchVsFullTPOTEffect\%
+(95\% CI [+\LatchVsFullTPOTLower\%, +\LatchVsFullTPOTUpper\%]). This is the cost of
+host-backed expert replacement in the evaluated implementation. In return,
+the median sampled HBM peak falls from \FullResidentHBMPeak\% to
+\LatchHBMPeak\%, while exact output and graph replay remain qualified.
+
+\begin{figure*}[t]
   \centering
-  \small
-  \caption{LatchMoE preserves exact outputs and graph/lifecycle invariants
-  across three independent service starts. TTFT and TPOT are qualification
-  measurements, not a matched performance comparison.}
-  \label{tab:lifecycle}
-  \begin{tabular}{lrrr}
-    \toprule
-    Metric & Run 1 & Run 2 & Run 3 \\
-    \midrule
-    Successful requests & 11/11 & 11/11 & 11/11 \\
-    Exact output tokens & 1,408 & 1,408 & 1,408 \\
-    TTFT p50 (ms) & 573.64 & 537.70 & 573.11 \\
-    TPOT p50 (ms/token) & 55.33 & 55.93 & 53.56 \\
-    Peak/final HBM (\%) & 91/5 & 91/5 & 91/5 \\
-    Graph fallback events & 0 & 0 & 0 \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+  \includegraphics[width=\textwidth]{figures/baseline_mechanisms.pdf}
+  \Description{Two-panel evaluation. The left panel shows LatchMoE's TTFT and
+  TPOT latency ratios relative to full residency for three exact-token starts.
+  The right panel is a forest plot of paired TTFT and TPOT effects for bounded
+  waves and overlapped staging, including confidence intervals and the
+  plus-or-minus-five-percent TPOT equivalence band.}
+  \caption{Bounded offloading has an explicit full-resident cost, while its two
+  prefill mechanisms reduce exposed latency. (a) Bars are medians and points
+  are three fresh exact-token, counterordered starts (96 requests per arm);
+  the full-resident reference is 1.0.
+  Native-prefetch and legacy-offload arms are omitted because they fail the
+  exact-token comparability gate. (b) Bounded waves compare multi-wave against
+  full-layer staging (200 requests per unit); overlap compares prefetch depth
+  one against serial depth zero (64 requests per unit). Each contrast uses
+  three counterordered pairs. Points are paired log-ratio estimators; whiskers
+  are 95\% CIs for TTFT and 90\% CIs for TPOT. Lower is better. All experiments
+  use Qwen3-30B-A3B, one Ascend 910B2, and concurrency one.}
+  \label{fig:baseline-mechanisms}
+\end{figure*}
 
-The runtime-level gates also pass in every start. All 12 managed layers retain
-the slot-bank and logical-map pointers recorded at capture. Every checked
-compute lease preserves its owner and version until completion. Every recorded
-decode miss installs the consumer dependency and reaches readiness before the
-logical mapping is published. No multi-wave active set exceeds the 32-slot
-capacity, and every service emits a release acknowledgement before physical
-HBM returns to 5\%. These observations establish the replay and lifecycle
-contract for the evaluated configuration.
+\subsection{Q3: Do bounded waves improve full-layer staging?}
 
-\subsection{Q2: Matched multi-wave prefill}
+The graph-compatible full-layer arm materializes the layer working set before
+compute; the multi-wave arm is identical except that bounded banks execute and
+recombine the routed work in waves. Three AB/BA/AB pairs each serve
+\BoundedRequestsPerUnit{} requests. All six units complete
+\BoundedTotalRequests{} requests, match all \BoundedTotalTokens{} output token
+IDs, capture and replay, and record zero fallback or lifecycle error.
 
-We compare \emph{full-layer} staging, which materializes the layer's expert
-working set before compute, with \emph{multi-wave} staging, which executes the
-same routed work through bounded stage banks. The two arms differ only in the
-overflow-mode setting. We use a fixed AB/BA/AB order to form three matched
-pairs, with one fresh service start per unit.
+TTFT changes by \BoundedTTFTEffect\% with a 95\% CI of
+[\BoundedTTFTLower\%, \BoundedTTFTUpper\%]. As a conventional summary, the
+median across starts of TTFT p50 falls by
+\BoundedRepeatMedianTTFTReduction\%, and TTFT p95 falls by
+\BoundedRepeatTailTTFTReduction\%. TPOT's paired effect is
+\BoundedTPOTEffect\% with a 90\% CI of
+[\BoundedTPOTLower\%, \BoundedTPOTUpper\%], entirely within the
+preregistered $\pm5\%$ equivalence margin. The supported result is therefore a
+prefill-path TTFT reduction without a material TPOT change under this contract.
 
-\begin{figure}[t]
+\subsection{Q4: Does overlap contribute causally?}
+
+We next hold the wave plan, two stage banks, graph mode, slot capacity,
+workload, seeds, and source digest fixed, changing only prefetch depth from
+zero (serial staging) to one (overlap). Three AB/BA/AB pairs serve
+\OverlapRequestsPerUnit{} requests per unit; all \OverlapTotalRequests{}
+requests pass exact-token, graph, lifecycle, and release
+gates. Overlap changes TTFT by \OverlapTTFTEffect\% (95\% CI
+[\OverlapTTFTLower\%, \OverlapTTFTUpper\%]); the interval is entirely below
+zero and passes the preregistered causal-benefit gate. TPOT changes by
+\OverlapTPOTEffect\% (90\% CI [\OverlapTPOTLower\%,
+\OverlapTPOTUpper\%]). Its equivalence gate does \emph{not} pass because the
+lower bound extends beyond $-5\%$; we report the measured decrease rather than
+calling TPOT unchanged. This one-factor experiment supports overlap's causal
+contribution, while Q3 measures the complete multi-wave path.
+
+\subsection{Q5: How does slot capacity change behavior?}
+
+We sweep 16, 32, and 64 physical slots with the same model, 14-GiB target,
+512-MiB KV cache, first \CapacityRequests{} manifest requests, and runtime
+source digest. Each
+point is one fresh start and passes exact-token, graph, capacity, lifecycle,
+and release gates; latency is therefore descriptive rather than an uncertainty
+claim. Figure~\ref{fig:capacity} reports the resulting TTFT, average wave count,
+and persistent-slot storage. From 16 to 64 slots, TTFT p50 falls from
+\SlotsSixteenTTFTMedian{} to \SlotsSixtyFourTTFTMedian{}~ms
+(\CapacityTTFTMedianReduction\%), and p95 falls from
+\SlotsSixteenTTFTTail{} to \SlotsSixtyFourTTFTTail{}~ms
+(\CapacityTTFTTailReduction\%). Total waves fall from \SlotsSixteenWaves{} to
+\SlotsSixtyFourWaves{} and H2D volume from \SlotsSixteenHtwoDGiB{} to
+\SlotsSixtyFourHtwoDGiB{}~GiB, while the persistent slot bank grows from
+\SlotsSixteenSlotGiB{} to \SlotsSixtyFourSlotGiB{}~GiB and sampled peak HBM
+rises from \SlotsSixteenHBMPeak\% to \SlotsSixtyFourHBMPeak\%. This point
+quantifies the intended
+reuse--storage tradeoff; it is not a cross-workload scaling claim.
+
+\begin{figure*}[t]
   \centering
-  \includegraphics[width=\columnwidth]{figures/matched_ttft.pdf}
-  \caption{Capacity-bounded multi-wave staging reduces the repeat-median TTFT
-  p50 by 35.21\% and TTFT p95 by 22.96\% relative to graph-compatible
-  full-layer staging. Bars show the median of three independent service-start
-  summaries; whiskers show their minimum and maximum. The comparison uses one
-  Ascend 910B2, Qwen3-30B-A3B BF16, a 14-GiB offload target, 32 slots, and
-  concurrency one.}
-  \label{fig:matched-ttft}
-\end{figure}
+  \includegraphics[width=\textwidth]{figures/capacity_sensitivity.pdf}
+  \Description{Two-panel slot-capacity sensitivity. The left panel plots TTFT
+  p50 and p95 at 16, 32, and 64 slots. The right panel plots mean waves per
+  prefill-layer invocation and persistent slot-bank storage for those same
+  capacities.}
+  \caption{Online slot-capacity sensitivity for Qwen3-30B-A3B with one fresh
+  start per point. All other serving controls are fixed, including a 14-GiB
+  offload target, 512-MiB KV cache, \CapacityRequests{} requests, and
+  concurrency one on one Ascend 910B2 with BF16 and tensor parallelism one;
+  prefix caching is disabled. More
+  slots trade persistent HBM for fewer waves; latency values are descriptive.}
+  \label{fig:capacity}
+\end{figure*}
 
-\begin{table}[t]
-  \centering
-  \small
-  \caption{Matched full-layer and multi-wave results. Each arm aggregates
-  three fresh starts and 600 ShareGPT requests. Latency entries are the median
-  of the three repeat-level quantiles.}
-  \label{tab:matched}
-  \begin{tabular}{lrrr}
-    \toprule
-    Mode & TTFT p50 & TTFT p95 & TPOT p50 \\
-         & (ms) & (ms) & (ms/token) \\
-    \midrule
-    Full-layer & 927.06 & 980.89 & 54.33 \\
-    Multi-wave & 600.65 & 755.68 & 54.42 \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+\subsection{Q6: What resources and boundaries are explicit?}
 
-As Figure~\ref{fig:matched-ttft} and Table~\ref{tab:matched} show, the
-repeat-median TTFT p50 falls from 927.06 to 600.65~ms, a 35.21\% reduction.
-The corresponding TTFT p95 falls from 980.89 to 755.68~ms, a 22.96\%
-reduction. Pair-level p50 reductions range from 35.02\% to 35.55\%, and
-pair-level p95 reductions range from 21.71\% to 23.63\%.
+\input{generated/resource_table}
 
-TPOT does not show the same reduction. Its repeat-level p50 values are
-53.87/54.74/54.33~ms/token for full-layer and
-55.34/54.42/53.87~ms/token for multi-wave. The supported performance
-conclusion is therefore limited to time to first token in this prefill-heavy
-boundary, not a decode-speedup claim. Each arm completes 600/600 requests and
-76,800 output tokens. All six units produce identical token arrays, capture
-and replay the graph, record zero fallback and runtime error events, release
-their managed service, and return to 5\% final HBM.
-
-\subsection{Q3: Overlap, recombination, and memory bounds}
-
-The multi-wave stability profile contains 2,544 prefill-layer events and 9,077
-waves. Every wave is issued before its compute begins. The runtime submits
-6,533 next-wave prefetches before the current wave's compute and records no
-late after-compute prefetch issue. Aggregate stage wait is 1,593.87~ms across
-the profile, compared with 7,493.41~ms of profiled MLP time, and the maximum
-per-layer stage wait is 1.27~ms. These measurements show that the intended
-software-pipeline schedule executes online; they do not isolate the causal
-latency contribution of overlap.
-
-Exactness is checked separately from scheduling. Eleven trigger requests
-match the full-layer oracle for serial eager multi-wave, overlapped eager
-multi-wave, and overlapped graph multi-wave execution, covering 1,408 token IDs
-per mode. A tensor-level check over 136 BF16 routed pairs split across five
-interleaved waves is bitwise equal to the native combine. The only online
-combine mode in the qualified profile is the native-recombination path.
-
-The final memory ledger reports 13.50~GiB in the host expert store, 3.38~GiB
-in persistent device slots, and 0.56~GiB in two prefill stage banks. Total
-device slot and stage storage is 3.94~GiB. All 12 original expert-weight banks
-are released, no wave exceeds 32 slots, and the physical 65,536-MiB device
-peaks at 91\% HBM without an OOM or memory-growth failure.
-
+Table~\ref{tab:resources} accounts for each model's graph-qualified 32-slot
+run. Host storage scales with the managed expert pool, while device storage
+depends on expert shape, shared residency, and stage banks rather than total
+expert count alone. Slot/stage storage is 13.5/0.56~GiB for Qwen3,
+25.9/0~GiB for GLM, and 9.0/0.38~GiB for Qwen3-Next; mapping buffers are at most
+0.19~MiB. Host-control time is 10.06~s, 0.073~s, and 44.85~s, respectively.
+These workload-specific values are costs, not a cross-model ranking.
+Qualification profiles record every original managed bank
+release; formal performance and Motivation services additionally retain a
+service-level release acknowledgment. The capability preflight rejects
+unknown router adapters, fused shared/routed ownership, quantized expert
+layouts, multi-NPU execution, and shared-expert overlap before capture. These
+are retained system boundaries: the evaluation establishes a single-NPU BF16
+data plane, not silent fallback or support for unqualified tuples.

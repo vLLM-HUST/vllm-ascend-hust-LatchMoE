@@ -1,11 +1,7 @@
 \documentclass[sigplan,anonymous,review,nonacm]{acmart}
 \usepackage{booktabs}
 \usepackage{graphicx}
-\usepackage{tikz}
 \usepackage{xspace}
-\usetikzlibrary{arrows.meta,fit,positioning}
-
-\emergencystretch=1em
 
 \newcommand{\system}{LatchMoE\xspace}
 
@@ -14,28 +10,30 @@
 \author{Anonymous Author(s)}
 
 \begin{document}
+\input{generated/formal_results_macros}
 \begin{abstract}
-Sparse mixture-of-experts (MoE) models reduce arithmetic per token but retain a
-large parameter footprint.  Expert offloading can fit such models on a
-memory-constrained accelerator, yet conventional offloading changes weight
-locations on the decode path.  This behavior conflicts with graph replay,
-which relies on stable addresses and a repeatable execution topology; disabling
-replay exposes a host-bound decode path.
-
-We present \system, an expert-offloading runtime that separates dynamic expert
-residency from captured tensor addresses.  \system preallocates fixed device
-slots, stages routed experts outside the replay boundary, protects slots with
-an explicit transfer/compute lifecycle, and executes oversized prefill working
-sets in capacity-bounded waves.  The resulting data plane accepts placement
-plans without embedding a particular prediction policy.
-
-Our implementation uses vLLM-Ascend hooks. Three graph-only
-starts with Qwen3-30B-A3B verify exact outputs, stable addresses, transfer
-ordering, bounded residency, and service release. In three matched pairs,
-capacity-bounded multi-wave
-prefill reduces repeat-median TTFT p50 and p95 by 35.21\% and 22.96\%,
-respectively, relative to graph-compatible full-layer staging.  We bound this
-result to one model, device, memory configuration, and low-concurrency workload.
+Sparse mixture-of-experts models bound per-token arithmetic but retain a large
+parameter footprint. Expert offloading addresses this footprint, yet a bounded
+expert cache changes weight placement as routing changes, conflicting with the
+stable storage bindings expected by graph replay. Our key insight is that
+replay requires stable graph-visible storage, not static logical expert
+residency. We present \system, which stages routed experts across an eager seam
+into fixed device slots, executes oversized working sets in capacity-bounded
+waves, and uses versioned leases to order transfer readiness, mapping
+publication, computation, and reuse. A vLLM-Ascend implementation evaluates
+the three target models under 11 semantic, graph, and lifecycle gates;
+Qwen3-Next's native full-resident end-to-end subcheck is capacity-limited on
+this device. On Qwen3-30B-A3B, bounded waves
+change paired TTFT by \BoundedTTFTEffect\% in an internal comparison against
+graph-compatible full-layer staging; its 95\% CI is [\BoundedTTFTLower\%,
+\BoundedTTFTUpper\%]. Enabling overlap in a one-factor campaign changes TTFT by
+\OverlapTTFTEffect\%; its 95\% CI is [\OverlapTTFTLower\%,
+\OverlapTTFTUpper\%]. Performance results are scoped to
+one Ascend 910B2, BF16, tensor parallelism one, and serving concurrency one.
+Against full residency, the same workload trades a median sampled HBM peak
+from 97\% to 80\% for +261.28\% TTFT and +309.51\% TPOT; the reported TTFT
+reductions therefore characterize capacity-bounded staging rather than a
+universal end-to-end speedup.
 \end{abstract}
 \maketitle
 
@@ -49,10 +47,12 @@ result to one model, device, memory configuration, and low-concurrency workload.
 \input{sections/07_related_work}
 \input{sections/08_conclusion}
 
-\begin{acks}
-OpenAI Codex was used to assist with manuscript structuring, prose drafting
-and editing, citation checking, and generation of figure plotting code.
-\end{acks}
+\section*{Acknowledgments}
+OpenAI Codex was used to inspect and modify code, design and run experiments,
+analyze results, generate figure and table code, check citations, and assist
+with manuscript structuring, drafting, and editing. The authors reviewed the
+resulting code, artifacts, analyses, and text and take responsibility for the
+work.
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}

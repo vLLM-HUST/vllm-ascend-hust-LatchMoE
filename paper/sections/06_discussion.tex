@@ -3,22 +3,18 @@
 
 \subsection{Stable storage is the reusable interface}
 
-LatchMoE's main lesson is that dynamic object identity and graph replay are not
-inherently incompatible. The conflict arises when identity changes are exposed
-as changes to graph-visible allocations or execution structure. A fixed
-storage interface moves that dynamism into contents and metadata that can be
-updated at a controlled boundary. The same principle may apply to other
-captured operators with a bounded, replaceable working set, provided that the
-runtime can identify a legal staging boundary and enforce publication and
-reuse ordering. Our experiments establish this lesson only for the implemented
-MoE path.
+Dynamic identity and graph replay conflict only when identity changes alter
+graph-visible allocation or execution structure. A fixed storage interface
+moves dynamism into contents and metadata updated at a controlled boundary.
+This principle may apply to other bounded working sets with a legal staging
+boundary and enforceable publication/reuse order; our evidence covers only the
+implemented MoE path.
 
-The versioned lease is equally important as the fixed allocation. Stable
-pointers alone do not prevent a transfer completion for an old owner from
-publishing stale contents, nor do they prevent eviction during in-flight
-compute. Address stability supplies replay compatibility; owner/version checks
-and stream dependencies supply temporal correctness. Treating these as one
-contract makes failures observable and testable.
+Address stability does not prevent stale publication or eviction; owner/version
+checks and stream dependencies enforce temporal correctness. Static residency
+sacrifices bounded offload, pointer rebinding requires graph recapture, and
+eager fallback pays dispatch overhead. LatchMoE fixes slots and stages
+replacement; its seam and fused operator are hardware-specific.
 
 \subsection{Control policy is outside the data plane}
 
@@ -32,29 +28,25 @@ and latency measurements on the same data plane.
 
 \subsection{Scope of the current evidence}
 
-The online evidence covers one unquantized model, one Ascend 910B2, tensor
-parallelism one, a 14-GiB offload target, 32 slots, \texttt{max\_num\_seqs=1},
-client concurrency one, and disabled prefix caching. It validates exactness,
-graph replay, lifecycle ordering, bounded residency, and service release in
-that configuration. The matched result further shows lower TTFT for multi-wave
-than full-layer staging under the same narrow contract. It does not show a
-general TPOT improvement.
+The semantic and graph qualification covers three unquantized BF16 models on
+one Ascend 910B2 with tensor parallelism one. It validates native router and
+layer-boundary parity, exact end-to-end tokens, replay-visible addresses,
+overflow composition, lease/release records, and zero eager fallback for the
+three reported capability tuples. Performance experiments are narrower:
+Qwen3-30B-A3B, a 14-GiB host-offload target, serialized requests,
+\texttt{max\_num\_seqs=1}, and disabled prefix caching. The matched result
+shows lower TTFT for multi-wave than full-layer staging under that contract;
+the one-factor campaign isolates an overlap contribution. The full-resident
+anchor also exposes the absolute cost of host-backed replacement. Native
+prefetch and legacy layered offload complete graph-mode requests but fail the
+exact-token comparability gate, so we retain them without using their latency.
+Consequently, the reported performance evidence is an internal mechanism
+comparison against graph-compatible full-layer staging, not a superiority claim
+over published offloading systems.
+The slot sweep has one start per point and is descriptive. None of these
+results establishes a general decode-speedup or multi-request serving claim.
 
-Several dimensions remain open. Higher concurrency changes the union of active
-experts and may alter both slot pressure and transfer--compute overlap. A
-different model can change expert shapes, routing distributions, and the
-number of managed layers. Other slot counts and memory budgets can change wave
-count and KV-cache headroom. Prefix-cache reuse is disabled because the current
-correctness contract does not cover cache hits across the offload staging
-boundary. Multi-device expert parallelism introduces device-to-device
-communication and is not represented by the single-device host-to-device
-path.
-
-Before making a broad serving claim, the evaluation must compare full
-residency, native prefetch offload, the legacy layered path, and LatchMoE under
-the same graph-only manifests. It must also add model, capacity, workload, and
-concurrency sensitivity, retain graph or capacity failures as results, and
-report dispersion across independent starts. Until that matrix is complete,
-the paper's evidence supports a graph-compatible mechanism and the scoped
-multi-wave TTFT result.
-
+Higher concurrency permits overlapping request leases, prefix-cache reuse adds
+hits across the staging seam, multi-device execution adds distributed
+ownership, and quantization changes layouts and operator support. None is
+covered by the qualified single-request host-to-device protocol.

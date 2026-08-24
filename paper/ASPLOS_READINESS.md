@@ -1,34 +1,41 @@
 # ASPLOS 2027 Readiness Audit
 
-Audit date: 2026-08-14. Assumed cycle: September 2026 submission for ASPLOS
+Audit date: 2026-08-24. Assumed cycle: September 2026 submission for ASPLOS
 2027. Official source: <https://www.asplos-conference.org/asplos2027/cfp/>.
+
+The live acceptance state, including stale mandatory semantic audits, is
+tracked in `paper/ACCEPTANCE_STATUS.md`.
 
 ## Verdict
 
 The manuscript is a coherent systems draft, but it is not ready for ASPLOS
-submission. The main risk is research evidence, not prose completeness. Its
-current graph-only qualification and three matched TTFT pairs support a narrow
-mechanism claim, while ASPLOS reviewers will expect convincing comparisons,
-causal attribution, and robustness. The Introduction has been compressed to
-close the complete problem--insight--design--evidence narrative within the
-two-page rapid review window.
+submission. The main risk is research evidence, not prose completeness. A new
+one-request eager-versus-PIECEWISE diagnostic now directly qualifies the graph
+contrast, while the three matched TTFT pairs support a narrow mechanism claim;
+ASPLOS reviewers will still expect repeated-start comparisons, causal
+attribution, and robustness. The Introduction has been compressed to close the
+complete problem--insight--design--evidence narrative within the two-page rapid
+review window.
 
 ## CRITICAL
 
 ### C1. The current evaluation does not establish the full ASPLOS claim
 
-The paper has one matched comparison between multi-wave and graph-compatible
-full-layer staging under one Qwen3-30B-A3B, Ascend 910B2, TP1, 14-GiB,
-32-slot, concurrency-1 configuration. It does not yet compare against the
-strongest credible no-offload, native-prefetch, or legacy layered-offloading
-baselines under one contract. It also lacks mechanism ablations and breadth
-across model, capacity, workload, and concurrency. Until these experiments
-exist, the paper cannot claim broad serving improvement or generality.
+The paper now contains matched baseline, overlap, and capacity campaigns plus
+one matched one-request eager-versus-PIECEWISE qualification diagnostic, but
+the only repeated-start latency comparison is between multi-wave execution and
+an author-built graph-compatible full-layer staging arm under one Qwen3-30B-A3B,
+Ascend 910B2, TP1, 14-GiB, 32-slot, concurrency-1 contract; the performance
+arms manage the same 12 of 48 MoE layers selected by AutoConfig. Native-prefetch
+and legacy layered arms complete requests but fail the exact output-token
+comparability gate (30/96 requests per arm), so their latency is not
+interpretable as a fair baseline. The paper must not claim broad serving
+superiority or generality.
 
-Repair: execute the planned matrix in `benchmark/configs/sew_offload_v1.yaml`
-and `benchmark/scenarios/sew_offload_scenarios.json`, retaining failed cells
-and reporting independent starts, dispersion, exact-token gates, fallback
-counts, memory accounting, and artifact identities.
+Repair: retain the current failed cells and report the internal-mechanism scope
+explicitly; treat the new eager/graph result as qualification evidence only,
+package the raw campaign bundle, and regenerate the required fresh semantic
+audits before submission.
 
 ## MAJOR
 
@@ -43,7 +50,7 @@ Repair: recover the underlying profiling table and regenerate the figure as
 PDF with at least 8 pt, preferably 9 pt, final-size text. Preserve a second
 encoding beyond color.
 
-### M2. The paper needs a stronger ASPLOS-specific lesson
+### M2. The paper needs a stronger ASPLOS-specific lesson (partially addressed)
 
 The strongest durable contribution is not the particular predictor or an
 Ascend-only speedup. It is the separation between replay-visible address
@@ -51,9 +58,11 @@ identity and dynamically changing logical ownership. Design, Discussion, and
 Related Work should consistently explain this as a reusable accelerator
 runtime abstraction and state which aspects are hardware/runtime specific.
 
-Repair: after completing the experiments, add a concrete design-alternative
-comparison covering pointer rebinding, graph recapture/update, static
-residency, and address-stable slot virtualization.
+Repair status: Discussion now compares static residency, pointer
+rebinding/graph recapture, eager fallback, and address-stable slot
+virtualization, and separates the portable slot abstraction from the evaluated
+Ascend-specific seam/operator. A broader hardware/runtime validation would
+still be useful, but is outside the current evidence boundary.
 
 ### M3. Reproducibility details must move into a submission-safe artifact
 
@@ -70,9 +79,9 @@ metrics, and validity threats in the 11-page paper.
 
 ASPLOS requires full, non-abbreviated author names without `et al.`, clickable
 in-text citations, and preferably DOI links in reference entries. The active
-bibliography entries mostly contain full names and many DOI fields, but this
-must be checked from the rendered `ACM-Reference-Format` output. Duplicate
-unused BibTeX entries should not be confused with the active citation set.
+bibliography now contains only the 25 cited keys, with full names and many DOI
+fields, but this must still be checked from the rendered
+`ACM-Reference-Format` output.
 
 Repair: inspect the final `.bbl` and PDF after every bibliography change;
 add verified DOI or document URLs where absent.
@@ -80,10 +89,10 @@ add verified DOI or document URLs where absent.
 ### M5. Mandatory-template line breaking needs a cleanup pass
 
 The first ASPLOS-template build exposed widespread overfull lines that were not
-visible in the previous USENIX layout. A legal emergency line-breaking stretch
-and ordinary prose edits removed the horizontal overflow without changing font
-size, margins, or vertical spacing. One small overfull page box remains for the
-final rendered cleanup after figure replacement.
+visible in the previous USENIX layout. Ordinary prose edits removed all new
+overflows without changing font size, margins, or vertical spacing. Four
+overfull boxes remain in the two frozen sections, along with the frozen Figure
+1 description warning.
 
 Repair: use ordinary prose edits and legal hyphenation/line-breaking controls;
 do not change margins, font sizes, caption spacing, or vertical spacing.
@@ -116,12 +125,12 @@ next cycle specified by the CFP's resubmission rule.
 | Item | ASPLOS 2027 requirement | Draft status |
 |---|---|---|
 | Template | `acmart` with `sigplan,anonymous,review,nonacm` | migrated |
-| Main-paper limit | 11 pages | passes; main content ends on page 9 |
+| Main-paper limit | 11 pages | passes; conclusion is on page 11; references begin after it on page 11 and continue on pages 12--13 |
 | Excluded from limit | references, appendices, AI-only acknowledgment | structurally compliant |
 | Review model | double blind; first round reads pages 1--2 only | passes structural pagination audit |
 | Body font | 10 pt | template controlled |
-| Figure/table text | at least 8 pt, preferably 9 pt | Figure 1 fails |
-| Bibliography | `ACM-Reference-Format`, full names, hyperlinks, DOI preferred | 19 rendered entries; metadata completion pending |
+| Figure/table text | at least 8 pt, preferably 9 pt | New figures pass; frozen Figure 1 remains raster/undersized |
+| Bibliography | `ACM-Reference-Format`, full names, hyperlinks, DOI preferred | 25 rendered entries; 32 non-fatal BibTeX metadata warnings remain |
 | Appendix | unlimited but optional to reviewers | do not place critical evidence there |
 | Generative AI | use must be fully disclosed | disclosure added; authors must verify wording |
 
@@ -136,9 +145,12 @@ page 2.
 
 ## Repair Order
 
-1. Finish the matched baseline, ablation, and robustness experiments.
-2. Rewrite and paginate pages 1--2 around the ASPLOS rapid-review contract.
-3. Rebuild Figure 1 from source data as vector artwork.
-4. Package and anonymize the artifact, then audit references and PDF metadata.
-5. Run a full pre-submission review against the official format checker and
+1. Package the completed matched campaigns and qualification traces as an
+   anonymous artifact, preserving unsupported cells.
+2. Regenerate fresh citation, claim, and adversarial audits after the final
+   manuscript edit.
+3. Rebuild Figure 1 from source data as vector artwork if the frozen section is
+   unlocked by the authors.
+4. Audit references and PDF metadata, then run a full pre-submission review
+   against the official format checker and
    SIGPLAN empirical-evaluation guidelines.

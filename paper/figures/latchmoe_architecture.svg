@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 760" width="1400" height="760">
+<defs><marker id="data" markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0,0 L11,4.5 L0,9 z" fill="#158A7C"/></marker><marker id="control" markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0,0 L11,4.5 L0,9 z" fill="#C97700"/></marker><marker id="sync" markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0,0 L11,4.5 L0,9 z" fill="#B56C12"/></marker><marker id="stable" markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto"><path d="M0,0 L11,4.5 L0,9 z" fill="#165A9B"/></marker></defs>
+<rect x="0" y="0" width="1400" height="760" fill="#fff" stroke="none" stroke-width="1" rx="0"/>
+<text x="700.0" y="31" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="27px" font-weight="bold" text-anchor="middle">LatchMoE system architecture: address-stable, graph-compatible MoE offloading</text>
+<rect x="28" y="53" width="1344" height="210" fill="#F7F8F9" stroke="#7B8792" stroke-width="2.5" rx="9"/>
+<text x="49" y="83" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="25px" font-weight="bold" text-anchor="start">HOST / CPU + DRAM</text>
+<line x1="49" y1="96" x2="1350" y2="96" stroke="#BEC7CF" stroke-width="1.2"/>
+<rect x="60" y="113" width="285" height="122" fill="#fff" stroke="#7B8792" stroke-width="1.5" rx="3"/>
+<rect x="92" y="151" width="34" height="32" fill="#fff" stroke="#20262D" stroke-width="2" rx="2"/><line x1="95" y1="143" x2="95" y2="151" stroke="#20262D" stroke-width="1.8"/><line x1="95" y1="183" x2="95" y2="191" stroke="#20262D" stroke-width="1.8"/><line x1="105" y1="143" x2="105" y2="151" stroke="#20262D" stroke-width="1.8"/><line x1="105" y1="183" x2="105" y2="191" stroke="#20262D" stroke-width="1.8"/><line x1="115" y1="143" x2="115" y2="151" stroke="#20262D" stroke-width="1.8"/><line x1="115" y1="183" x2="115" y2="191" stroke="#20262D" stroke-width="1.8"/><line x1="125" y1="143" x2="125" y2="151" stroke="#20262D" stroke-width="1.8"/><line x1="125" y1="183" x2="125" y2="191" stroke="#20262D" stroke-width="1.8"/><line x1="83" y1="159" x2="92" y2="159" stroke="#20262D" stroke-width="1.8"/><line x1="126" y1="159" x2="135" y2="159" stroke="#20262D" stroke-width="1.8"/><line x1="83" y1="175" x2="92" y2="175" stroke="#20262D" stroke-width="1.8"/><line x1="126" y1="175" x2="135" y2="175" stroke="#20262D" stroke-width="1.8"/>
+<text x="151" y="143" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="21px" font-weight="bold" text-anchor="start">CONTROL</text>
+<text x="151" y="169" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">route + ABI</text><text x="151" y="191" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">wave plan</text>
+<text x="151" y="222" fill="#C97700" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">dynamic owners</text>
+<rect x="388" y="106" width="512" height="148" fill="#fff" stroke="#7B8792" stroke-width="1.5" rx="3"/>
+<text x="412" y="133" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="21px" font-weight="bold" text-anchor="start">PINNED EXPERTS</text>
+<rect x="797" y="136" width="62" height="30" fill="#fff" stroke="#7B8792" stroke-width="1.8" rx="2"/><rect x="805" y="126" width="62" height="30" fill="#fff" stroke="#7B8792" stroke-width="1.8" rx="2"/><rect x="813" y="116" width="62" height="30" fill="#fff" stroke="#7B8792" stroke-width="1.8" rx="2"/><line x1="825" y1="124" x2="825" y2="138" stroke="#7B8792" stroke-width="1.4"/><line x1="839" y1="124" x2="839" y2="138" stroke="#7B8792" stroke-width="1.4"/><line x1="853" y1="124" x2="853" y2="138" stroke="#7B8792" stroke-width="1.4"/>
+<rect x="412" y="163" width="70" height="38" fill="#F7F8F9" stroke="#7B8792" stroke-width="1.5" rx="1"/><text x="447.0" y="188.08" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">E0</text>
+<rect x="490" y="163" width="70" height="38" fill="#F7F8F9" stroke="#7B8792" stroke-width="1.5" rx="1"/><text x="525.0" y="188.08" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">E1</text>
+<rect x="568" y="163" width="70" height="38" fill="#F7F8F9" stroke="#7B8792" stroke-width="1.5" rx="1"/><text x="603.0" y="188.08" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">E2</text>
+<rect x="696" y="163" width="70" height="38" fill="#F7F8F9" stroke="#7B8792" stroke-width="1.5" rx="1"/><text x="731.0" y="188.08" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">En-1</text>
+<rect x="774" y="163" width="70" height="38" fill="#F7F8F9" stroke="#7B8792" stroke-width="1.5" rx="1"/><text x="809.0" y="188.08" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">En</text>
+<text x="656" y="188" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="23px" font-weight="normal" text-anchor="middle">…</text>
+<text x="412" y="227" fill="#158A7C" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">CPU source</text>
+<rect x="943" y="113" width="391" height="122" fill="#fff" stroke="#7B8792" stroke-width="1.5" rx="3"/>
+<line x1="972" y1="172" x2="991" y2="152" stroke="#165A9B" stroke-width="2"/><line x1="991" y1="152" x2="1014" y2="170" stroke="#165A9B" stroke-width="2"/><line x1="991" y1="152" x2="1010" y2="145" stroke="#165A9B" stroke-width="2"/><rect x="967" y="168" width="10" height="10" fill="#fff" stroke="#165A9B" stroke-width="1.8" rx="2"/><rect x="986" y="147" width="10" height="10" fill="#fff" stroke="#165A9B" stroke-width="1.8" rx="2"/><rect x="1009" y="165" width="10" height="10" fill="#fff" stroke="#165A9B" stroke-width="1.8" rx="2"/><rect x="1005" y="140" width="10" height="10" fill="#fff" stroke="#165A9B" stroke-width="1.8" rx="2"/>
+<text x="1033" y="143" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">CAPTURE CONTRACT</text>
+<text x="1033" y="171" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">fixed map · stable ABI</text><text x="1033" y="193" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">captured graph</text>
+<line x1="1253" y1="161" x2="1253" y2="151" stroke="#165A9B" stroke-width="2"/><line x1="1253" y1="151" x2="1263" y2="151" stroke="#165A9B" stroke-width="2"/><line x1="1295" y1="151" x2="1305" y2="151" stroke="#165A9B" stroke-width="2"/><line x1="1305" y1="151" x2="1305" y2="161" stroke="#165A9B" stroke-width="2"/><line x1="1253" y1="182" x2="1253" y2="192" stroke="#165A9B" stroke-width="2"/><line x1="1253" y1="192" x2="1263" y2="192" stroke="#165A9B" stroke-width="2"/><line x1="1295" y1="192" x2="1305" y2="192" stroke="#165A9B" stroke-width="2"/><line x1="1305" y1="182" x2="1305" y2="192" stroke="#165A9B" stroke-width="2"/>
+<rect x="28" y="282" width="1344" height="410" fill="#fff" stroke="#165A9B" stroke-width="2.8" rx="9"/>
+<text x="49" y="313" fill="#165A9B" font-family="Arial, Helvetica, sans-serif" font-size="25px" font-weight="bold" text-anchor="start">ASCEND NPU / HBM</text>
+<path d="M 202 235 L 202 275 L 400 275 L 400 342 L 230 342 L 230 382" fill="none" stroke="#C97700" stroke-width="2.4" stroke-dasharray="8 6" marker-end="url(#control)"/>
+<text x="415" y="300" fill="#C97700" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">control</text>
+<path d="M 640 254 L 640 294 L 910 294 L 910 350 L 515 350" fill="none" stroke="#158A7C" stroke-width="5.2"/>
+<rect x="716" y="274" width="118" height="25" fill="#fff" stroke="none" stroke-width="1" rx="0"/>
+<text x="775" y="293" fill="#158A7C" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">H2D waves</text>
+<rect x="62" y="351" width="338" height="220" fill="#FFF6E7" stroke="#C97700" stroke-width="2" rx="4"/>
+<text x="84" y="379" fill="#C97700" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">STAGING SEAM</text>
+<line x1="91" y1="430" x2="118" y2="430" stroke="#20262D" stroke-width="3"/><line x1="118" y1="430" x2="139" y2="414" stroke="#20262D" stroke-width="3"/><line x1="118" y1="430" x2="139" y2="430" stroke="#20262D" stroke-width="3"/><line x1="118" y1="430" x2="139" y2="446" stroke="#20262D" stroke-width="3"/>
+<rect x="206" y="419" width="38" height="24" fill="#fff" stroke="#158A7C" stroke-width="1.7" rx="2"/><rect x="199" y="414" width="38" height="24" fill="#fff" stroke="#158A7C" stroke-width="1.7" rx="2"/><rect x="192" y="409" width="38" height="24" fill="#fff" stroke="#158A7C" stroke-width="1.7" rx="2"/>
+<rect x="298" y="424" width="13" height="13" fill="#fff" stroke="#C97700" stroke-width="1.5" rx="0"/><rect x="316" y="417" width="13" height="20" fill="#fff" stroke="#C97700" stroke-width="1.5" rx="0"/><rect x="334" y="410" width="13" height="27" fill="#fff" stroke="#C97700" stroke-width="1.5" rx="0"/><line x1="294" y1="442" x2="352" y2="442" stroke="#C97700" stroke-width="1.7" stroke-dasharray="4 3"/>
+<text x="112" y="471" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">route</text>
+<text x="211" y="471" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">stage</text>
+<text x="322" y="471" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">wave</text>
+<line x1="115" y1="488" x2="351" y2="488" stroke="#BEC7CF" stroke-width="1.1"/>
+<text x="84" y="518" fill="#C97700" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">uncaptured</text>
+<text x="84" y="546" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">cache · capacity · H2D</text>
+<path d="M 400 488 L 480 488 L 480 450 L 515 450" fill="none" stroke="#B56C12" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#sync)"/>
+<rect x="444" y="334" width="872" height="253" fill="#F1F7FC" stroke="#165A9B" stroke-width="2" rx="5" stroke-dasharray="10 7"/>
+<text x="466" y="361" fill="#165A9B" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">CAPTURED GRAPH</text>
+<line x1="625" y1="348" x2="625" y2="338" stroke="#165A9B" stroke-width="2"/><line x1="625" y1="338" x2="635" y2="338" stroke="#165A9B" stroke-width="2"/><line x1="667" y1="338" x2="677" y2="338" stroke="#165A9B" stroke-width="2"/><line x1="677" y1="338" x2="677" y2="348" stroke="#165A9B" stroke-width="2"/><line x1="625" y1="369" x2="625" y2="379" stroke="#165A9B" stroke-width="2"/><line x1="625" y1="379" x2="635" y2="379" stroke="#165A9B" stroke-width="2"/><line x1="667" y1="379" x2="677" y2="379" stroke="#165A9B" stroke-width="2"/><line x1="677" y1="369" x2="677" y2="379" stroke="#165A9B" stroke-width="2"/>
+<text x="694" y="361" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">stable addresses</text>
+<rect x="500" y="403" width="391" height="156" fill="#E5F3EF" stroke="#158A7C" stroke-width="2.2" rx="4"/>
+<text x="524" y="431" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="21px" font-weight="bold" text-anchor="start">SLOT BANK</text>
+<text x="524" y="455" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">fixed HBM slots</text>
+<rect x="524" y="475" width="69" height="39" fill="#fff" stroke="#158A7C" stroke-width="1.5" rx="1"/><text x="558.5" y="500.74" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">S0</text>
+<rect x="599" y="475" width="69" height="39" fill="#fff" stroke="#158A7C" stroke-width="1.5" rx="1"/><text x="633.5" y="500.74" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">S1</text>
+<rect x="674" y="475" width="69" height="39" fill="#fff" stroke="#158A7C" stroke-width="1.5" rx="1"/><text x="708.5" y="500.74" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">S2</text>
+<rect x="797" y="475" width="69" height="39" fill="#fff" stroke="#158A7C" stroke-width="1.5" rx="1"/><text x="831.5" y="500.74" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">Sk-1</text>
+<text x="772" y="501" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="23px" font-weight="normal" text-anchor="middle">…</text>
+<text x="524" y="543" fill="#158A7C" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">ID → slot</text>
+<text x="629" y="543" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">e2→S1 · e5→S3 · e8→S0</text>
+<path d="M 640 254 L 640 294 L 910 294 L 910 392 L 515 392 L 515 428" fill="none" stroke="#158A7C" stroke-width="5.2"/>
+<rect x="962" y="403" width="326" height="156" fill="#fff" stroke="#165A9B" stroke-width="2.2" rx="4"/>
+<text x="987" y="431" fill="#165A9B" font-family="Arial, Helvetica, sans-serif" font-size="21px" font-weight="bold" text-anchor="start">CAPTURED MoE</text>
+<text x="987" y="455" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">routed MLP</text>
+<text x="1125" y="511" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="34px" font-weight="bold" text-anchor="middle">Σ ×</text>
+<text x="1125" y="539" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">native combine</text>
+<path d="M 891 482 L 952 482" fill="none" stroke="#165A9B" stroke-width="5" marker-end="url(#stable)"/>
+<text x="922" y="462" fill="#165A9B" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">stable</text>
+<path d="M 500 575 L 1180 575" fill="none" stroke="#5C6670" stroke-width="1.7" stroke-dasharray="6 6" marker-end="url(#stable)"/>
+<text x="522" y="568" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start" font-style="italic">resident shared lane</text>
+<text x="1188" y="568" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start" font-style="italic">one combine</text>
+<line x1="62" y1="608" x2="1317" y2="608" stroke="#BEC7CF" stroke-width="1.2"/>
+<rect x="89" y="646" width="29" height="25" fill="#fff" stroke="#B56C12" stroke-width="2" rx="2"/><path d="M 95 647 V 638 C 95 626, 112 626, 112 638 V 647" fill="none" stroke="#B56C12" stroke-width="2"/>
+<text x="137" y="644" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">LEASE</text>
+<text x="302" y="633" fill="#C97700" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">transfer</text>
+<text x="302" y="674" fill="#165A9B" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">consumer</text>
+<rect x="360" y="619" width="126" height="27" fill="#FFF6E7" stroke="#C97700" stroke-width="1.5" rx="1"/><text x="423.0" y="636.82" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">assign</text>
+<rect x="518" y="619" width="126" height="27" fill="#FFF6E7" stroke="#C97700" stroke-width="1.5" rx="1"/><text x="581.0" y="636.82" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">H2D</text>
+<rect x="676" y="619" width="82" height="27" fill="#E5F3EF" stroke="#158A7C" stroke-width="1.5" rx="1"/><text x="717.0" y="636.82" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">ready</text>
+<line x1="486" y1="632" x2="510" y2="632" stroke="#C97700" stroke-width="2" marker-end="url(#control)"/>
+<line x1="644" y1="632" x2="668" y2="632" stroke="#C97700" stroke-width="2" marker-end="url(#control)"/>
+<text x="782" y="638" fill="#158A7C" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">publish</text>
+<rect x="360" y="660" width="126" height="27" fill="#F1F7FC" stroke="#165A9B" stroke-width="1.5" rx="1"/><text x="423.0" y="677.82" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">replay</text>
+<rect x="518" y="660" width="126" height="27" fill="#F1F7FC" stroke="#165A9B" stroke-width="1.5" rx="1"/><text x="581.0" y="677.82" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">compute</text>
+<rect x="676" y="660" width="82" height="27" fill="#E5F3EF" stroke="#158A7C" stroke-width="1.5" rx="1"/><text x="717.0" y="677.82" fill="#20262D" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="middle">done</text>
+<line x1="486" y1="673" x2="510" y2="673" stroke="#165A9B" stroke-width="2" marker-end="url(#stable)"/>
+<line x1="644" y1="673" x2="668" y2="673" stroke="#165A9B" stroke-width="2" marker-end="url(#stable)"/>
+<text x="782" y="679" fill="#158A7C" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="bold" text-anchor="start">reuse</text>
+<path d="M 717 647 L 717 660" fill="none" stroke="#B56C12" stroke-width="1.7" stroke-dasharray="5 4" marker-end="url(#sync)"/>
+<text x="1075" y="638" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="middle">ready → publish</text>
+<text x="1075" y="678" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="middle">done → reuse</text>
+<line x1="48" y1="729" x2="84" y2="729" stroke="#158A7C" stroke-width="4" marker-end="url(#data)"/>
+<text x="94" y="735" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">data</text>
+<line x1="190" y1="729" x2="226" y2="729" stroke="#C97700" stroke-width="2.2" stroke-dasharray="8 5" marker-end="url(#control)"/>
+<text x="236" y="735" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">control</text>
+<line x1="370" y1="729" x2="406" y2="729" stroke="#B56C12" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#sync)"/>
+<text x="416" y="735" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">sync</text>
+<line x1="524" y1="729" x2="560" y2="729" stroke="#165A9B" stroke-width="4" marker-end="url(#stable)"/>
+<text x="570" y="735" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">stable</text>
+<rect x="700" y="718" width="23" height="18" fill="#F7F8F9" stroke="#7B8792" stroke-width="1.2" rx="0"/>
+<text x="733" y="735" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">host</text>
+<rect x="805" y="718" width="23" height="18" fill="#E5F3EF" stroke="#158A7C" stroke-width="1.2" rx="0"/>
+<text x="838" y="735" fill="#5C6670" font-family="Arial, Helvetica, sans-serif" font-size="20px" font-weight="normal" text-anchor="start">slot bank</text>
+</svg>

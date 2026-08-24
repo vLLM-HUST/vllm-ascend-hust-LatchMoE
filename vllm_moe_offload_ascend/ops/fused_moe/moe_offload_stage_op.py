@@ -455,6 +455,14 @@ def _moe_offload_stage_impl(
         layer_id=layer_id,
         active_experts=active_experts,
         num_logical_experts=total_logical_experts,
+        phase={
+            PHASE_DECODE: "decode",
+            PHASE_PREFILL: "prefill",
+            PHASE_MIXED: "mixed",
+        }.get(phase, "unknown"),
+        num_tokens=int(topk_ids.shape[0]) if topk_ids.ndim > 0 else 0,
+        top_k=int(topk_ids.shape[1]) if topk_ids.ndim > 1 else 1,
+        expert_token_counts=token_counts_by_expert,
     )
     if _probe:
         torch.npu.synchronize()

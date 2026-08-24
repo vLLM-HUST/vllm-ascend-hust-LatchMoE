@@ -273,6 +273,7 @@ def build_client_command(
     output_json: str | Path,
     python_exe: str,
     manifest_path: str | Path | None = None,
+    max_output_tokens: int | None = None,
 ) -> list[str]:
     server = config["server"]
     client = config["client"]
@@ -298,6 +299,8 @@ def build_client_command(
     ]
     if int(workload.get("num_requests", 0)) > 0:
         command.extend(["--max-requests", str(int(workload["num_requests"]))])
+    if max_output_tokens is not None:
+        command.extend(["--max-output-tokens", str(int(max_output_tokens))])
     if client.get("tokenizer_count_output_tokens", True):
         command.extend(["--tokenizer", str(model["tokenizer"])])
     return command
@@ -356,6 +359,8 @@ def prepare_workloads(
     config: dict[str, Any],
     *,
     manifest_path: str | Path | None = None,
+    model_path: str | Path | None = None,
+    dataset_path: str | Path | None = None,
     requests_per_bucket: int | None = None,
     buckets: list[str] | None = None,
 ) -> int:
@@ -364,10 +369,19 @@ def prepare_workloads(
 
     selected = set(buckets or []) or None
     target = repo_relative(manifest_path or config["dataset"]["manifest_path"])
+    manifest_config = config
+    if dataset_path is not None:
+        manifest_config = {
+            **config,
+            "dataset": {
+                **config["dataset"],
+                "local_path": str(Path(dataset_path).resolve()),
+            },
+        }
     return build_sharegpt_manifest(
-        config=config,
+        config=manifest_config,
         manifest_path=target,
-        model_path=config["model"]["tokenizer"],
+        model_path=str(model_path or manifest_config["model"]["tokenizer"]),
         requests_per_bucket=requests_per_bucket,
         buckets=selected,
     )
@@ -446,6 +460,14 @@ def parse_args() -> argparse.Namespace:
 
     prepare = subparsers.add_parser("prepare-workloads", help="Sample ShareGPT JSONL manifest.")
     prepare.add_argument("--manifest")
+    prepare.add_argument(
+        "--model-path",
+        help="Tokenizer/checkpoint path used to measure prompt lengths.",
+    )
+    prepare.add_argument(
+        "--dataset-path",
+        help="ShareGPT JSON path used for manifest construction.",
+    )
     prepare.add_argument("--requests-per-bucket", type=int)
     prepare.add_argument("--bucket", action="append", default=[])
 
@@ -495,6 +517,8 @@ def main() -> int:
         written = prepare_workloads(
             config,
             manifest_path=args.manifest,
+            model_path=args.model_path,
+            dataset_path=args.dataset_path,
             requests_per_bucket=args.requests_per_bucket,
             buckets=args.bucket or None,
         )

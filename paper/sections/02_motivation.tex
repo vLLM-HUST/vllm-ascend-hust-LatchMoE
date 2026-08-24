@@ -1,101 +1,105 @@
-\section{Motivation}
+\section{Motivation and Characterization}
 \label{sec:motivation}
 
-Section~\ref{sec:background} identifies a structural mismatch between
-cache-based expert offloading and ordinary graph replay. We next examine how
-often the underlying conditions arise in a realistic serving workload. Our
-characterization asks two questions: whether a small decode-time active set
-actually produces stable expert residency, and whether a bounded expert cache
-can hold the much larger active set observed during prefill.
+Graph-compatible offloading is necessary only if routing changes residency,
+bounded device storage cannot hold the resulting working set, and exploiting
+transfer--compute overlap makes slot reuse asynchronous. We test these
+conditions on Qwen3-30B-A3B, GLM-4.7-Flash, and
+Qwen3-Next-80B-A3B-Instruct. Runs use one Ascend 910B2, BF16, TP1, disabled
+prefix caching, and serialized requests (both concurrency controls set to one);
+thus, the measured pressure does not
+come from cross-request batching. We profile 12, 11, and 48 managed routed
+layers over 200, 100, and 64 ShareGPT requests, respectively. Qwen3 and GLM
+generate at most 128 output tokens; Qwen3-Next uses 32 to bound collection
+cost. We therefore use cross-model results only to establish whether a
+phenomenon recurs, not to rank its magnitude.
 
-We analyze the retained router and expert-cache profile from a 200-request
-ShareGPT mixed-chat run of Qwen3-30B-A3B in BF16 on one Ascend 910B2. The run
-uses tensor parallelism one, client concurrency one, 12 managed MoE layers,
-and a 32-expert cache for each managed layer. Prefill statistics cover all
-2,400 layer invocations. Decode events are sampled once every eight layer
-invocations and contain 38,098 samples. Table~\ref{tab:motivation-profile}
-summarizes the results. The active-set measurements reflect the model's routing
-decisions, whereas cache misses and device storage assignment updates are
-specific to this cache configuration and residency policy.
+An independent audit reparses each raw event stream, verifies its SHA-256 and
+run manifest, and exactly reproduces all statistics below. It also checks
+balanced full-rate decode sampling, successful requests, and device-release
+acknowledgments. Figure~\ref{fig:motivation-characterization} summarizes the
+two workload properties that determine storage demand.
 
-\begin{table}[t]
+\begin{figure*}[t]
   \centering
-  \small
-  \caption{Routing pressure in a 200-request ShareGPT run with 12 managed
-  layers and a 32-expert cache per layer. Decode statistics use a fixed 1/8
-  sampling rate. Even though decode activates only eight experts per sampled
-  invocation, device storage assignments change frequently; every prefill
-  invocation exceeds the cache capacity.}
-  \label{tab:motivation-profile}
-  \begin{tabular}{@{}lrr@{}}
-    \toprule
-    Metric & Prefill & Decode \\
-    \midrule
-    Profiled layer invocations & 2,400 & 38,098 \\
-    Active experts, p50/p95/max & 99/117/126 & 8/8/8 \\
-    Invocations with $|\mathcal{A}_t| > 32$ & 100.00\% & 0.00\% \\
-    Expert cache miss rate & -- & 20.26\% \\
-    Invocations with a cache miss & -- & 68.25\% \\
-    Invocations with an assignment update & -- & 67.59\% \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+  \includegraphics[width=\textwidth]{figures/motivation_characterization.pdf}
+  \Description{Two-panel characterization. The left panel compares decode
+  cache-miss and mapping-update invocation rates for three MoE models. The
+  right panel shows that median, p95, and maximum prefill active sets exceed a
+  32-slot capacity for all three models.}
+  \caption{Routing-induced storage pressure under serialized execution. (a)
+  Sparse decode frequently requests a nonresident expert and changes the
+  logical-to-physical mapping. (b) The p50, p95, and maximum number of distinct
+  routed experts in a single-request prefill, normalized by a 32-slot bank;
+  every profiled invocation exceeds the dashed capacity line. Traces contain
+  200/100/64 requests and cover 12/11/48 managed layers for Qwen3, GLM, and
+  Qwen3-Next, respectively; Qwen3-Next uses a shorter output limit. All
+  traces use one Ascend 910B2, BF16, tensor parallelism one, disabled prefix
+  caching, and serialized requests.}
+  \label{fig:motivation-characterization}
+\end{figure*}
 
-\subsection{Decode Repeatedly Changes Device Storage Assignments}
+\subsection{Routing-Driven Expert Residency Is Dynamic}
 
-A small instantaneous active set does not imply stable residency. Each sampled
-decode invocation activates eight experts, one quarter of the configured
-cache capacity. Nevertheless, 68.25\% of sampled layer invocations contain at
-least one expert cache miss, and 20.26\% of the requested experts miss in the
-cache. Moreover, 67.59\% of sampled invocations update at least one
-device storage assignment. Thus, capacity sufficient for one decode
-invocation does not stabilize assignments across invocations. Ordinary
-graph replay cannot directly bind logical experts to these changing device
-storage assignments without graph update or recapture.
+Decode activates only 8, 4, and 10 experts per layer in Qwen3, GLM, and
+Qwen3-Next. Yet a 32-slot cache misses on 20.55\%, 14.02\%, and 38.20\% of
+expert accesses. More importantly, 68.71\%, 41.03\%, and 94.22\% of layer
+invocations contain a miss, while 68.09\%, 40.38\%, and 93.90\% update at
+least one mapping entry (Figure~\ref{fig:motivation-characterization}a).
+These are not artifacts of interleaved layers: consecutive invocations are
+compared within each layer. Their median active-set Jaccard similarities are
+only 0.333, 0.143, and 0.250. Hence, sparsity bounds per-token work but does
+not make logical ownership of physical storage stable.
 
-This observation is deliberately scoped to the evaluated model, workload,
-and cache configuration. The exact miss rate depends on routing locality,
-cache capacity, and the residency policy. The important systems property is
-that decode-time routing repeatedly changes the device storage assignment even
-when the active set is much smaller than the cache.
+\noindent\textbf{Implication: replay-stable physical slots.}
+Graph-visible allocations must remain fixed while their logical owners and a
+persistent mapping change between replays. Binding a graph directly to each
+active expert's original tensor cannot satisfy both requirements.
 
-\subsection{Prefill Exceeds the Bounded Expert Cache}
+\subsection{Routed Working Sets Can Exceed Bounded Slot Capacity}
 
-Prefill creates a different form of pressure. Its median invocation activates
-99 distinct experts, while the p95 and maximum reach 117 and 126 experts,
-respectively. All 2,400 profiled layer invocations exceed the 32-expert cache
-capacity. This overflow is independent of the cache replacement policy: the
-experts in one invocation cannot be materialized simultaneously within the
-configured bound. Even an ideal partition would require at least three
-capacity-sized groups for 99.29\% of the profiled invocations.
+Prefill aggregates routing decisions across a prompt. The distinct active
+experts per layer have p50/p95/maximum values of 99/117/126 for Qwen3,
+61/64/64 for GLM, and 252/401/496 for Qwen3-Next. Consequently, all 2,400,
+1,100, and 3,072 profiled prefill invocations overflow 32 slots. Their
+required wave counts at p50/p95/maximum are 4/4/4, 2/2/2, and 8/13/16
+(Figure~\ref{fig:motivation-characterization}b). This occurs with one request
+at a time: increasing the serving batch is not a prerequisite for overflow.
 
-The runtime must therefore support two operating regimes. During decode, it
-must preserve replay while individual cache misses continually change expert
-residency. During prefill, it must execute an active set that can be several
-times larger than the available cache. A bounded implementation must therefore
-stage and compute these groups over time. Staging each group synchronously
-would expose transfer latency, so the execution model should retain
-opportunities to overlap transfer with useful computation.
+The corresponding p50 active-weight footprints are 0.87, 1.07, and
+1.48~GiB, versus 32-slot budgets of 0.28, 0.56, and 0.19~GiB. Nor is 32 a
+special cutoff: 64 slots still overflow 99.29\% of Qwen3 prefills and every
+Qwen3-Next prefill; 128 slots still overflow 99.48\% of Qwen3-Next prefills.
 
-\subsection{Requirements for Graph-Compatible Offloading}
+\noindent\textbf{Implication: wave-based slot reuse.}
+A fixed slot space must be reused within one layer invocation. Each wave may
+materialize at most the slot capacity, while the union of waves must preserve
+every routed token--expert pair and its original combine position.
 
-Straightforward alternatives satisfy only part of this objective. Permanent
-expert residency preserves graph-visible storage bindings but violates the
-bounded-HBM premise. Eager offloading accommodates arbitrary assignment changes
-but gives up the graph-replay savings shown in
-Figure~\ref{fig:graph_breakdown}. Updating or recapturing the graph after
-assignment changes likewise reintroduces host intervention. Finally, exposing
-host-resident weights through stable addresses preserves replay but does not
-provide a dynamically managed HBM expert cache
-~\cite{vllmUVA,nvidiaCudaBestPractices}.
+\subsection{Overlapped Expert Staging Creates Slot-Reuse Hazards}
 
-These observations lead to three requirements. \textbf{First, binding
-stability:} runtime changes in device storage assignment must not change the
-graph-visible storage bindings used by ordinary replay. \textbf{Second,
-capacity-bounded execution:} the runtime must preserve the model's routing
-semantics when the active set exceeds the expert-cache capacity, while
-allowing transfer to overlap with computation. \textbf{Third, safe
-asynchrony:} storage cannot be reassigned until its previous consumer has
-finished, and a new assignment cannot be published before the corresponding
-expert transfer is ready. The next section presents an execution abstraction
-that satisfies these requirements.
+Wave reuse exposes substantial transfer work. Across the scoped prefills,
+Qwen3, GLM, and Qwen3-Next execute 8,571, 2,200, and 26,695 waves and move
+1.58, 0.60, and 4.62~TB from host memory. Later-wave prefetches are issued
+before compute 6,171, 1,100, and 23,623 times; the remaining issue in each
+invocation is its initial wave. Even with this schedule, aggregate staging
+wait is 1,459.9, 391.9, and 4,683.3~ms---20.2\%, 24.0\%, and 17.2\% of the
+corresponding profiled MLP time. These values establish an overlap opportunity,
+not a causal latency benefit; Evaluation tests that claim separately.
+
+Overlap makes transfer readiness, compute completion, and reuse of the same
+bank advance on different streams. Two invalid executions become possible.
+First, staging wave $k+2$ can overwrite a slot whose lease is still consumed
+by wave $k$. Second, publishing wave $k+1$'s mapping before its H2D completes
+can make incomplete weights visible; accepting a completion from an older
+owner creates the same failure. The correct traces contain zero premature
+publication events and install a consumer dependency for every scoped decode
+invocation, demonstrating that these conditions are observable gates rather
+than assumed ordering. The hazard itself is a consequence of asynchronous
+reuse, not an observed model error.
+
+\noindent\textbf{Implication: a versioned lease protocol.}
+Reuse must validate the slot owner and version, publish a mapping only after
+the matching transfer is ready, and block reassignment until the matching
+compute lease releases. Section~\ref{sec:design} turns these three pressures
+into one address-stable execution architecture.

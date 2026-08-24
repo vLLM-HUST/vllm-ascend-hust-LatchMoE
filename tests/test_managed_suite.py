@@ -135,6 +135,7 @@ def test_locked_host_env_pins_custody_and_piecewise_graph(tmp_path: Path) -> Non
 
     assert env["LATCHMOE_HOST_PYTHON"] == str(Path(sys.executable).absolute())
     assert env["LATCHMOE_CUSTODY_STATE"].endswith("custody_state.json")
+    assert env["ASCEND_RT_VISIBLE_DEVICES"] == "5"
     compilation = json.loads(env["VLLM_ENGINE_COMPILATION_CONFIG"])
     assert compilation["cudagraph_mode"] == "PIECEWISE"
     assert "vllm::deepseek_v4_attention" in compilation["splitting_ops"]
@@ -161,6 +162,11 @@ def test_locked_host_manager_rejects_compilation_config_override(monkeypatch) ->
     manager = _load_manager()
     with pytest.raises(ValueError, match="must not override"):
         manager._compilation_config_args(["--compilation-config"])
+
+    selected = _load_run_suite()._selected_env(env)
+    assert selected["VLLM_ENGINE_NPU_DEVICES"] == "5"
+    assert selected["VLLM_ENGINE_ENFORCE_EAGER"] == "0"
+    assert json.loads(selected["VLLM_ENGINE_COMPILATION_CONFIG"]) == compilation
 
 
 def test_locked_host_manager_stops_only_its_process_group(tmp_path: Path) -> None:
@@ -240,6 +246,20 @@ def test_runner_preserves_preflight_failure_before_service_start() -> None:
     source = runner_path.read_text(encoding="utf-8")
 
     assert 'release_status not in {"released", "not-started"}' in source
+
+
+def test_runtime_source_identity_covers_uncommitted_source_bytes(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    source_dir = tmp_path / "benchmark" / "scripts"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "runner.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    module = _load_run_suite()
+    first, first_count = module._runtime_source_identity(tmp_path)
+    source.write_text("value = 2\n", encoding="utf-8")
+    second, second_count = module._runtime_source_identity(tmp_path)
+    assert first_count == second_count == 1
+    assert first != second
 
 
 def test_capability_identity_binds_checkpoint_and_registry_row(tmp_path: Path) -> None:

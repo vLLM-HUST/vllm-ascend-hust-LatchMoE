@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "name": "Qwen3-30B-A3B",
+      "summary": "paper/data/motivation_profile_summary.json",
+      "artifact_dir": "/workspace/latchmoe-motivation-qwen3-fullrate-v2/sew-offload-ascend-v1-20260822T030434Z/sew_14gb_autoslots/mixed_chat",
+      "managed_layers": 12,
+      "requests": 200,
+      "skipped_requests": 1,
+      "expert_bytes": 9437184,
+      "required_argv": ["--client-concurrency", "1", "--max-num-seqs", "1", "--routing-profile"]
+    },
+    {
+      "name": "GLM-4.7-Flash",
+      "summary": "paper/data/motivation_glm_profile_summary.json",
+      "artifact_dir": "/workspace/latchmoe-motivation-glm-fullrate-v2/sew-offload-ascend-v1-20260822T034632Z/sew_14gb_autoslots/mixed_chat",
+      "managed_layers": 11,
+      "requests": 100,
+      "skipped_requests": 1,
+      "expert_bytes": 18874368,
+      "required_argv": ["--client-concurrency", "1", "--max-num-seqs", "1", "--routing-profile"]
+    },
+    {
+      "name": "Qwen3-Next-80B-A3B-Instruct",
+      "summary": "paper/data/motivation_qwen3_next_profile_summary.json",
+      "artifact_dir": "/workspace/latchmoe-motivation-qwen3-next-profile64/sew-offload-ascend-v1-20260822T050040Z/sew_28gb_autoslots/mixed_chat",
+      "managed_layers": 48,
+      "requests": 64,
+      "skipped_requests": 1,
+      "expert_bytes": 6291456,
+      "required_argv": ["--client-concurrency", "1", "--max-num-seqs", "1", "--max-requests", "64", "--request-output-tokens", "32", "--routing-profile"]
+    }
+  ]
+}

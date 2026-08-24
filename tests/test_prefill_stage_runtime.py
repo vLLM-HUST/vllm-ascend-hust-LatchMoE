@@ -1027,6 +1027,43 @@ def test_decode_stage_profile_can_omit_expert_lists(monkeypatch):
     assert payload["mapping_mode"] == "persistent_log2phy"
 
 
+def test_routing_trace_switch_retains_route_metadata_without_legacy_lists(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "0")
+    monkeypatch.setenv("VLLM_ASCEND_MOE_PROFILE_ROUTING_TRACE", "1")
+    runtime = MoeOffloadRuntime(
+        MoeOffloadConfig(
+            enabled=True,
+            num_slots=2,
+            graph_compatible_offload=True,
+            gmm_profile_path="/tmp/test-routing-trace-profile.jsonl",
+        )
+    )
+    layer = TinyLayer()
+    runtime.register_layer_for_fixed_slots(layer, slot_device=torch.device("cpu"))
+    runtime.stage_fixed_slot_plan(
+        layer_id=7,
+        active_experts=(3, 1),
+        num_logical_experts=4,
+        phase="decode",
+        num_tokens=1,
+        top_k=2,
+        expert_token_counts={1: 1, 3: 1},
+    )
+
+    event = [
+        item
+        for item in runtime.profiling_summary()["events"]
+        if item["name"] == "decode_fixed_slot_stage"
+    ][-1]
+    payload = event["payload"]
+    assert payload["phase"] == "decode"
+    assert payload["num_tokens"] == 1
+    assert payload["top_k"] == 2
+    assert payload["active_experts"] == [3, 1]
+    assert payload["expert_token_counts"] == {"1": 1, "3": 1}
+    assert set(payload["resident_experts"]) == {1, 3}
+
+
 def test_decode_stage_profile_can_be_sampled(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE", "2")
     runtime = MoeOffloadRuntime(

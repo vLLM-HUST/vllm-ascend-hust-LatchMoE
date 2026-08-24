@@ -2799,6 +2799,10 @@ def test_stage_op_profile_fit_keeps_single_slot_staging(monkeypatch):
             "layer_id": 7,
             "active_experts": (0, 1),
             "num_logical_experts": 64,
+            "phase": "unknown",
+            "num_tokens": 1,
+            "top_k": 4,
+            "expert_token_counts": {0: 2, 1: 2},
         }
     ]
 

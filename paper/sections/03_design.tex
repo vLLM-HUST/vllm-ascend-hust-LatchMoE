@@ -4,175 +4,194 @@
 \subsection{Overview}
 \label{sec:design-overview}
 
-LatchMoE separates replay-stable storage from routing-dependent state changes.
-Figure~\ref{fig:architecture} shows the resulting execution model. At
-initialization, a CPU-first host store retains expert weights and LatchMoE
-allocates fixed device slot banks and persistent logical-to-slot mapping
-buffers. During inference, a captured router produces the routed expert IDs.
-An eager staging boundary turns those IDs into a placement plan, transfers
-missing weights, and updates mapping values in place. A captured expert MLP
-then consumes the same slot and mapping allocations on every replay.
+\system's central principle is that \emph{logical expert ownership may change,
+while graph-visible storage remains fixed}. For each managed layer, it
+preallocates bounded expert slots and a persistent logical-to-slot map. Their
+allocations survive capture and replay; routing changes only slot contents and
+map values.
+
+Figure~\ref{fig:architecture} shows the resulting captured-router, eager-stage,
+and captured-MLP path. Staging transfers misses and publishes the map before
+the MLP resumes through the same graph-visible interface.
 
 \begin{figure*}[t]
   \centering
-  \begin{tikzpicture}[
-      x=1cm,
-      y=1cm,
-      font=\small,
-      block/.style={draw, rounded corners=1.5pt, align=center,
-                    minimum height=9mm, inner sep=4pt},
-      stable/.style={block, fill=green!12, draw=green!45!black},
-      captured/.style={block, fill=blue!10, draw=blue!55!black},
-      dynamic/.style={block, fill=orange!15, draw=orange!70!black},
-      context/.style={block, fill=black!4, draw=black!45},
-      flow/.style={-{Latex[length=2mm]}, thick},
-      control/.style={-{Latex[length=2mm]}, dashed, thick}
-    ]
-    \node[context, minimum width=22mm] (checkpoint) at (-6.1,2.2) {Model checkpoint};
-    \node[stable, minimum width=22mm] (host) at (-3.5,2.2) {CPU-First\\Host Store};
-    \node[context, minimum width=22mm] (autoconfig) at (-0.7,2.2) {Capacity\\Configuration};
-    \node[stable, minimum width=28mm] (slots) at (2.1,2.2) {Fixed Expert-Slot\\Bank\\stable addresses};
-    \node[stable, minimum width=37mm] (mapping) at (5.8,2.2) {Persistent Logical-to-Slot\\Mapping\\stable address, dynamic values};
-
-    \node[captured, minimum width=27mm] (router) at (-5.6,0) {Captured Router};
-    \node[dynamic, minimum width=35mm] (staging) at (-1.8,0) {Replay-Boundary Staging\\route, place, transfer, publish};
-    \node[captured, minimum width=30mm] (mlp) at (3.4,0) {Captured Expert MLP};
-    \node[dynamic, minimum width=35mm] (waves) at (-1.8,-1.5) {Capacity-Bounded\\Wave Executor};
-    \node[dynamic, minimum width=32mm] (lifecycle) at (3.4,-1.5) {Versioned Slot Lifecycle\\transfer and compute events};
-
-    \draw[flow] (checkpoint) -- (host);
-    \draw[flow] (autoconfig) -- (slots);
-    \draw[flow] (router) -- (staging);
-    \draw[flow] (host) -- (staging);
-    \draw[flow] (staging) -- (mlp);
-    \draw[flow] (staging.north east) -- (slots.south west);
-    \draw[flow] (slots.south) -- (mlp.north west);
-    \draw[flow] (mapping.south) -- (mlp.north east);
-    \draw[control] (waves) -- (staging);
-    \draw[control] (lifecycle) -- (staging);
-    \draw[control] (mlp) -- (lifecycle);
-
-    \node[draw=blue!55!black, dashed, fit=(router)(staging)(mlp)(waves)(lifecycle),
-          inner sep=4mm, label={[font=\small]below:one graph-compatible MoE layer}] {};
-  \end{tikzpicture}
-  \caption{LatchMoE keeps graph-visible slot and mapping addresses fixed while
-  changing their contents and values at an eager replay boundary. Solid arrows
-  carry weights or routing data; dashed arrows carry wave and lifecycle
-  control. Blue blocks are captured, orange blocks execute eagerly, and green
-  blocks are stable allocations.}
+  \includegraphics[width=\textwidth]{figures/latchmoe_architecture.pdf}
+  \Description{LatchMoE system architecture spanning host DRAM and an Ascend
+  NPU. The host control plane and pinned expert store feed an uncaptured,
+  replay-boundary staging seam; asynchronous H2D waves publish a logical to
+  physical slot map into a captured slot bank, which drives a captured fused
+  MoE kernel. A compact versioned-lease timeline orders publication and reuse.}
+  \caption{\system separates dynamic control from graph-visible data. The host
+  control plane computes routing and wave plans while pinned expert weights
+  remain outside the captured region. At the replay boundary, staging checks
+  capacity and transfers misses; the captured NPU region sees only the fixed
+  slot bank, its logical-to-slot map, and stable addresses feeding the fused
+  routed-MoE kernel. The versioned lease at the bottom permits overlap while
+  publishing only after a transfer is ready and reusing a bank only after its
+  consumer lease is done.}
   \label{fig:architecture}
 \end{figure*}
 
-The design has three core mechanisms. Replay-stable slot virtualization
-decouples expert identity from physical allocation. Replay-boundary staging
-publishes a new mapping only after transfer readiness. A versioned lifecycle
-and a capacity-bounded wave executor make reuse correct when transfer and
-compute overlap or when the active set exceeds capacity. The placement-plan
-interface orders routed experts but does not embed a prediction policy in the
-data plane.
+Three mechanisms realize this model: replay-stable slots decouple residency
+from addresses; pipelined waves reuse bounded storage; and versioned leases
+order transfer, publication, computation, and reuse.
 
-\subsection{Replay-stable expert-slot virtualization}
-\label{sec:fixed-slots}
+\subsection{Capability-Driven Semantic Contract}
+\label{sec:capability-contract}
 
-For each managed MoE layer, LatchMoE allocates two contiguous tensors that hold
-the layer's fixed set of physical $W_{13}$ and $W_2$ expert slots. The first
-dimension indexes physical slots; each slice has the shape and layout expected
-by the fused expert kernel. These allocations persist across capture and
-replay. A second persistent tensor maps each logical expert ID to a physical
-slot ID. Captured computation receives the slot tensors and mapping buffer, so
-its graph-visible pointers do not depend on which logical experts are resident.
+\paragraph{Capability descriptor.}
+Before selecting the seam, \system materializes a serializable descriptor for
+each managed layer. The descriptor records (i) the output contract; (ii) the
+shared-expert representation and activation mode; (iii) whether routing logits
+are externally supplied or produced by an internal gate; (iv) all top-$k$,
+grouping, scoring, bias, normalization, and scaling parameters; (v) the owner
+of final combination; and (vi) weight, parallelism, and overlap modes. The
+selection rule uses this tuple rather than a model allowlist. Routed-only and
+externally shared-expert layers select distinct, fixed return schemas, avoiding
+a data-dependent captured type.
 
-Each slot records a logical owner, a monotonically increasing version, a state,
-and its last-use step. Reassigning a slot removes the old logical owner from
-the resident index, installs the new owner, increments the version, and enters
-the loading state. A lease is the tuple of slot ID, logical expert, and version.
-The version distinguishes two ownership intervals that reuse the same physical
-slot and lets asynchronous completions reject stale work.
+\paragraph{Fail-closed selection.}
+The seam is enabled only when every descriptor field belongs to an implemented
+profile. Unknown router adapters, unregistered or mismatched fused
+shared/routed placement, quantized weights, multi-NPU execution, and
+shared-expert overlap are rejected before capture with the full descriptor and
+blocker list; rejection never silently chooses an eager or monolithic path.
+Manifests therefore identify the exact accepted tuple.
 
-The mapping is valid only for ready experts. Before the captured MLP consumes
-routed IDs, LatchMoE remaps them through the persistent logical-to-slot tensor.
-The physical expert count remains the number of allocated slots rather than the
-number of logical experts. Thus replacement changes slot contents and mapping
-values, while the tensors bound into the captured computation remain fixed.
+\subsection{Replay-Stable Dual-Lane Storage}
+\label{sec:dual-lane-storage}
 
-\subsection{Replay-boundary staging and safe publication}
+Routed experts form a dynamic lane. For each managed layer, \system retains
+their $W_{13}$ and $W_2$ weights in a CPU-first
+host store and allocates two contiguous device tensors containing a bounded
+number of physical expert slots. A persistent tensor maps each logical routed
+expert ID to a slot ID. The slot tensors and mapping allocation survive capture
+and replay; replacement changes only slot contents and mapping values.
+
+The shared lane remains device-resident because it contributes to every
+applicable token; caching it would consume capacity without sparsity and repeat
+shared computation in each overflow wave. Its bytes are charged separately in
+the memory ledger, while capacity, victim, and wave decisions cover only routed
+experts.
+
+Each routed slot records a logical owner, a monotonically increasing version,
+a state, and its last-use step. A \emph{lease} is the tuple (slot ID, logical
+expert, version). The version distinguishes ownership intervals that reuse the
+same physical address. The central storage invariant is therefore stronger
+than pointer stability: captured computation may consume a routed slot only
+through a mapping published for a ready lease, while the shared lane retains a
+fixed owner and allocation throughout replay.
+
+\subsection{Semantics-Preserving Router Decomposition}
+\label{sec:router-decomposition}
+
+The staging decision is known only after routing, yet a monolithic fused-MoE
+operation hides expert selection from the graph partitioner. \system therefore
+relocates, rather than reimplements, the selection step into a captured router
+operation. For an external-logit layer, the operation consumes the original
+router logits. For an internal-gate layer, it first invokes the same gate on
+the same hidden states. It then calls the native selector with the layer's
+top-$k$, grouping, scoring function, renormalization flag, correction bias,
+routed scaling factor, and logical expert count.
+
+The router emits the original top-$k$ IDs and weights. The eager boundary uses
+only IDs to plan residency and cannot edit either tensor. Captured expert
+computation injects both into the native apply path, so selection occurs once.
+The seam relocates routing without approximating its mathematical decision.
+
+Output semantics remain native: the routed-only contract returns one tensor,
+whereas the shared-expert contract returns the expected fixed pair. The native
+runner retains shared gating, routed scaling, output transforms, and final
+addition; \system owns only residency and ordering.
+
+\subsection{Replay-Boundary Staging and Safe Publication}
 \label{sec:staging}
 
-The router must run before the runtime knows the active expert set, but the
-expert MLP must run after all selected weights are available. LatchMoE exposes
-the interval between these operations as an eager staging boundary. The
-captured router produces routed expert IDs, the runtime deduplicates that set,
-and a placement plan orders the routed experts. The plan must be a permutation
-of the actual routed set: it may change staging order, but it cannot add an
-unrouted expert or omit a routed expert.
+After the captured router completes, the eager staging boundary deduplicates
+the routed IDs and asks a placement policy for an ordering. The returned plan
+must be a permutation of the actual routed set: it may prioritize a hit,
+predicted reuse, or transfer cost, but it cannot add an unrouted expert or omit
+a routed expert. Hits retain their current leases. For a miss, the transfer
+engine selects a reassignable slot, increments its version, installs the new
+logical owner, copies $W_{13}$ and $W_2$ on a dedicated H2D stream, and records
+a readiness event.
 
-For a cache miss, the transfer engine assigns a slot version, enqueues the
-expert's $W_{13}$ and $W_2$ copies on a dedicated H2D stream, and records a
-readiness event. Publication follows a fixed order. The runtime first validates
-that the slot still matches the lease, installs the readiness event as a
-dependency of the consumer stream, changes the slot to ready, and only then
-publishes the logical-to-slot mapping. This order prevents captured compute
-from observing either incomplete weights or a completion event that belongs to
-an older slot owner.
+Publication follows a strict happens-before order. The runtime first checks
+that the slot still matches the issued lease. It then makes the consumer stream
+wait for the readiness event, transitions the slot to ready, and only afterward
+updates the persistent logical-to-slot mapping. Publishing earlier would allow
+captured compute to observe either partially transferred weights or a
+completion event from an old owner. Hits and misses leave the boundary through
+the same address-stable interface, so the subsequent graph piece does not
+encode how a routed expert became resident.
 
-Hits and misses share the same output interface: ready physical slot IDs plus
-the persistent mapping tensor. The captured MLP therefore does not encode
-whether an expert was already resident, loaded on demand, or prefetched for an
-upcoming wave.
+The stage is an explicit graph split point: capture fixes the router and MLP
+pieces while permitting routing-dependent host work between them. Pointer
+checks cover the slot banks and map; the descriptor fixes the operator schema.
 
-\subsection{Versioned transfer--compute lifecycle}
+\subsection{Versioned Transfer--Compute Lifecycle}
 \label{sec:lifecycle}
 
-The slot state machine contains four externally relevant states: empty,
-loading, ready, and computing. Empty and ready slots may be selected for a new
-owner, while loading and computing slots are not reassignable. Before expert
-compute begins, the runtime acquires leases for the active slots and marks
-them computing. A completion event protects those leases until the consumer
-stream has finished. Release validates that owner and version still match the
-recorded lease before returning a slot to the ready state.
+Address stability alone does not make asynchronous reuse safe. A slot moves
+through four externally visible states: \emph{empty}, \emph{loading},
+\emph{ready}, and \emph{computing}. Only empty or ready slots may be selected
+for a new owner. Before routed computation begins, the runtime acquires leases
+for all referenced slots and marks them computing. A compute event protects
+those leases until the consumer stream finishes; release again verifies owner
+and version before returning each slot to ready.
 
-This protocol enforces two safety properties. First, transfer completion cannot
-make a stale owner ready because readiness checks the version created when the
-copy was issued. Second, eviction cannot overwrite an in-flight expert because
-a computing slot is excluded from reassignment. Violations raise an error
-instead of redirecting execution to eager mode. The fail-closed behavior makes
-graph compatibility part of the runtime contract rather than an unobserved
-best effort.
+Two temporal invariants follow: version validation prevents a stale transfer
+from publishing, and excluding computing slots prevents in-flight overwrite.
+The same lease protocol protects transient prefill stage banks:
+bank $b$ cannot receive wave $k+2$ until the compute event for wave $k$ has
+released its leases. Lifecycle violations are surfaced as run failures rather
+than being hidden by fallback.
 
-\subsection{Capacity-bounded multi-wave execution}
+More precisely, for lease $\ell=(s,e,v)$, replay requires the address of slot
+$s$ to remain constant. Publishing $\ell$ requires
+$\operatorname{ready}(s,e,v)$; reassigning $s$ at version $v+1$ requires
+$\operatorname{done}(s,e,v)$. Owner/version validation binds both events to the
+same ownership interval, so unrelated completions cannot authorize publication
+or reuse.
+
+\subsection{Shared-Aware Capacity-Bounded Composition}
 \label{sec:waves}
 
-Decode commonly activates a small expert set, but a prefill request aggregates
-routing decisions over many tokens. The union of routed experts can exceed the
-slot capacity even though each token selects only a few experts. LatchMoE
-handles this overflow by partitioning routed token--expert pairs into waves.
-Each wave contains no more distinct missing experts than its staging bank can
-hold. Hit-only work may be scheduled separately so that a ready main-slot
-expert need not be copied into a temporary wave buffer.
+Prefill can route a batch of tokens to more distinct routed experts than fit in
+the slot budget. Let $P$ be the flattened set of routed token--expert pairs,
+including each pair's original top-$k$ position and weight. \system partitions
+$P$ into waves $P_1,\ldots,P_m$ such that each wave requires no more routed
+experts than a stage bank can hold. Pair membership and routing weights are
+immutable. Hit-only work may execute from persistent slots, while miss waves
+use transient banks governed by the same lease rules.
 
-LatchMoE executes waves without changing router assignments. It retains every
-routed pair's original flattened top-$k$ position, computes wave-local expert
-outputs, concatenates those outputs, reconstructs one global native unpermute
-index, and invokes the ordinary token-combine operation once with the original
-top-$k$ weights and output shape. It rejects incomplete or duplicate pair
-coverage. The single final combine avoids the numerical reordering introduced
-by independently combining and accumulating each wave.
+Each wave computes routed outputs while preserving pair positions. After all
+waves, \system constructs one global native unpermute index and invokes routed
+combine once with the original weights and shape. Coverage validation rejects
+missing or duplicate pairs; single recombination preserves reduction and
+model-specific postprocessing semantics.
 
-Multiple stage banks form a software pipeline. While the current wave computes,
-the transfer stream may populate another bank for the next wave. The scheduler
-can order waves by their required transfer bytes, but it cannot change pair
-membership or final combination semantics. A stage bank is reused only after
-its compute lease completes, so the same versioned lifecycle protects both the
-persistent decode slots and transient prefill slots.
+Shared work remains outside the partition and is combined once with the fully
+reconstructed routed contribution. With multiple transient banks, transfer may
+populate wave $k+1$ while wave $k$ computes without changing routing or final
+combination. The storage cost is bounded; Section~\ref{sec:evaluation} measures
+whether compute hides transfer.
 
-\subsection{Policy-neutral placement}
+\subsection{Policy Boundary and Qualification Scope}
 \label{sec:policy-neutral}
 
-LatchMoE defines the data-plane constraints for a placement plan: target layer,
-complete routed set, and a valid ordering. The default behavior preserves the
-router's first-seen order. An external controller may instead prioritize
-predicted reuse or transfer cost, but it must return a permutation of the
-routed experts and obey the same capacity and lifecycle checks. Separating
-this interface from slot management allows placement policies to share one
-graph-compatible execution substrate and keeps policy quality outside the
-correctness argument of this paper.
+The data plane exposes only a constrained placement-plan interface: layer ID,
+complete routed set, and a valid ordering. The default policy preserves
+first-seen order; another policy may reorder staging but must obey the same
+capacity, publication, and lifecycle invariants. This boundary lets policy
+studies reuse one execution substrate without making prediction quality part
+of the correctness argument.
+
+The design covers single-NPU unquantized BF16 execution, with either no shared
+expert, an externally represented resident shared lane, or a registered fused
+shared suffix, and supported external-logit or internal-gate selectors. This
+ABI alone does not establish correctness or performance for every accepted
+model; each tuple still requires router/boundary parity, exact outputs, replay
+evidence, and matched runs.
+Section~\ref{sec:evaluation} reports the qualified boundary.

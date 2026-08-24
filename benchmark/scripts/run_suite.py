@@ -112,6 +112,46 @@ def _package_versions() -> dict[str, str | None]:
     return versions
 
 
+def _runtime_source_identity(repo_root: Path) -> tuple[str, int]:
+    """Hash the exact tracked and untracked source bytes used by a run."""
+    scoped_paths = (
+        "vllm_moe_offload_ascend",
+        "benchmark/configs",
+        "benchmark/registry",
+        "benchmark/scripts",
+        "pyproject.toml",
+    )
+    completed = subprocess.run(
+        [
+            "git", "ls-files", "-z", "--cached", "--others",
+            "--exclude-standard", "--", *scoped_paths,
+        ],
+        cwd=repo_root,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    relative_paths = sorted(
+        value.decode("utf-8")
+        for value in completed.stdout.split(b"\0")
+        if value
+    )
+    digest = hashlib.sha256()
+    count = 0
+    for relative in relative_paths:
+        path = repo_root / relative
+        if not path.is_file():
+            continue
+        payload = path.read_bytes()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(payload)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(payload)
+        digest.update(b"\0")
+        count += 1
+    return digest.hexdigest(), count
+
+
 def _provenance(
     config: dict[str, Any],
     args: argparse.Namespace,
@@ -127,6 +167,7 @@ def _provenance(
             key, separator, value = raw_line.partition("=")
             if separator and key.strip().endswith(("commit", "abi")):
                 dependency_shas[key.strip()] = value.strip()
+    runtime_source_sha256, runtime_source_files = _runtime_source_identity(repo_root)
     return {
         "repository_head_sha": _git_revision(repo_root),
         "repository_parent_sha": _git_revision(repo_root, "HEAD^"),
@@ -148,6 +189,8 @@ def _provenance(
                 cwd=repo_root,
             )
         ),
+        "runtime_source_sha256": runtime_source_sha256,
+        "runtime_source_files": runtime_source_files,
         "dev_hub_submodule_sha": _git_revision(
             repo_root / "third_party" / "vllm-hust-dev-hub"
         ),
@@ -301,9 +344,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Capture and fail closed on bounded eager router parity artifacts.",
     )
+    parser.add_argument(
+        "--routing-profile",
+        action="store_true",
+        help=(
+            "Retain logical active-expert IDs and token counts in MoE profiles "
+            "for routing characterization."
+        ),
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--manifest")
     parser.add_argument("--model-path")
+    parser.add_argument(
+        "--served-model-name",
+        help="Override the served/client model identifier when --model-path changes models.",
+    )
+    parser.add_argument(
+        "--offload-gb",
+        type=float,
+        help="Override the case's MoE host-offload target for model-specific feasibility runs.",
+    )
     parser.add_argument("--dataset-path")
     parser.add_argument("--startup-timeout-s", type=float)
     parser.add_argument(
@@ -311,6 +371,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Override workload num_requests without resampling the manifest.",
+    )
+    parser.add_argument(
+        "--request-output-tokens",
+        type=int,
+        default=0,
+        help="Override each selected manifest request's max output-token budget.",
     )
     parser.add_argument(
         "--client-concurrency",
@@ -436,6 +502,8 @@ def _managed_env(
     args: argparse.Namespace,
     *,
     router_parity: bool = False,
+    routing_profile: bool = False,
+    offload_gb: float | None = None,
 ) -> dict[str, str]:
     managed_backend = getattr(args, "managed_backend", "container")
     if args.device not in {5, 6}:
@@ -454,9 +522,16 @@ def _managed_env(
     shape = config["serving_shape"]
     model = config["model"]
     image = str(args.runtime_image or "").split("@", 1)[0]
-    env = _unit_env(case, unit_dir, router_parity=router_parity)
+    env = _unit_env(
+        case,
+        unit_dir,
+        router_parity=router_parity,
+        routing_profile=routing_profile,
+        offload_gb=offload_gb,
+    )
     env.update(
         {
+            "ASCEND_RT_VISIBLE_DEVICES": str(args.device),
             "VLLM_ENGINE_SYSTEMD_UNIT": unit_name,
             "VLLM_ENGINE_CONTAINER": str(args.container_name or ""),
             "VLLM_ENGINE_IMAGE": (
@@ -542,6 +617,8 @@ def _unit_env(
     unit_dir: Path,
     *,
     router_parity: bool = False,
+    routing_profile: bool = False,
+    offload_gb: float | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ)
     profile_path = unit_dir / "moe_profile.jsonl"
@@ -552,6 +629,12 @@ def _unit_env(
     env.setdefault("VLLM_ASCEND_MOE_PROFILE_EXPERT_LISTS", "0")
     env.setdefault("VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE", "8")
     env.setdefault("VLLM_ASCEND_MOE_B2_PROFILE_DETAILS", "0")
+    if routing_profile:
+        env["VLLM_ASCEND_MOE_PROFILE_ROUTING_TRACE"] = "1"
+        # Motivation characterization needs every decode invocation so that
+        # consecutive same-layer routing sets can be compared without a
+        # sampling-induced gap.
+        env["VLLM_ASCEND_MOE_DECODE_PROFILE_SAMPLE_RATE"] = "1"
     if router_parity:
         env["VLLM_ASCEND_MOE_ROUTER_PARITY_PATH"] = str(
             unit_dir / "moe_router_parity.jsonl"
@@ -562,6 +645,8 @@ def _unit_env(
             env.pop(str(key), None)
         else:
             env[str(key)] = str(value)
+    if offload_gb is not None:
+        env["VLLM_ASCEND_MOE_OFFLOAD_GB"] = str(float(offload_gb))
     return env
 
 
@@ -571,7 +656,15 @@ def _selected_env(env: dict[str, str]) -> dict[str, str]:
         for key in sorted(env)
         if key.startswith("VLLM_ASCEND_MOE")
         or key.startswith("LATCHMOE_")
-        or key in {"ASCEND_RT_VISIBLE_DEVICES", "PYTHONPATH"}
+        or key
+        in {
+            "ASCEND_RT_VISIBLE_DEVICES",
+            "PYTHONPATH",
+            "VLLM_ENGINE_COMPILATION_CONFIG",
+            "VLLM_ENGINE_ENABLE_PREFIX_CACHING",
+            "VLLM_ENGINE_ENFORCE_EAGER",
+            "VLLM_ENGINE_NPU_DEVICES",
+        }
     }
 
 
@@ -614,9 +707,16 @@ def run_unit(
     unit_dir = suite_dir / str(case["name"]) / str(workload["name"])
     unit_dir.mkdir(parents=True, exist_ok=True)
     router_parity_enabled = bool(getattr(args, "router_parity", False))
+    routing_profile_enabled = bool(getattr(args, "routing_profile", False))
     router_parity_path = unit_dir / "moe_router_parity.jsonl"
     router_parity_report = unit_dir / "router_parity_report.json"
-    env = _unit_env(case, unit_dir, router_parity=router_parity_enabled)
+    env = _unit_env(
+        case,
+        unit_dir,
+        router_parity=router_parity_enabled,
+        routing_profile=routing_profile_enabled,
+        offload_gb=getattr(args, "offload_gb", None),
+    )
     server_cmd = build_server_command(config, case)
     benchmark_json = unit_dir / "benchmark.json"
     client_cmd = build_client_command(
@@ -624,22 +724,37 @@ def run_unit(
         workload,
         output_json=benchmark_json,
         python_exe=args.python,
+        max_output_tokens=(
+            int(args.request_output_tokens)
+            if int(args.request_output_tokens) > 0
+            else None
+        ),
     )
     managed_env_for_manifest = None
-    if not args.dry_run and not args.no_start_server:
+    # An explicit managed dry-run must materialize the same graph/custody
+    # payload as a real launch.  Otherwise a successful dry-run can conceal a
+    # stale device, missing PIECEWISE split, or invalid locked-host coordinate.
+    # The legacy argument-free dry-run remains a lightweight render-only mode.
+    materialize_managed_payload = (
+        not args.no_start_server
+        and (not args.dry_run or args.device in {5, 6})
+    )
+    if materialize_managed_payload:
         managed_env_for_manifest = _managed_env(
             config,
             case,
             unit_dir,
             args,
             router_parity=router_parity_enabled,
+            routing_profile=routing_profile_enabled,
+            offload_gb=getattr(args, "offload_gb", None),
         )
     manifest = {
         "case": case,
         "workload": workload,
         "server_command": server_cmd,
         "client_command": client_cmd,
-        "selected_env": _selected_env(env),
+        "selected_env": _selected_env(managed_env_for_manifest or env),
         "profile_jsonl": str(unit_dir / "moe_profile.jsonl"),
         "trace_jsonl": str(unit_dir / "moe_trace.jsonl"),
         "router_parity": {
@@ -690,6 +805,8 @@ def run_unit(
                 unit_dir,
                 args,
                 router_parity=router_parity_enabled,
+                routing_profile=routing_profile_enabled,
+                offload_gb=getattr(args, "offload_gb", None),
             )
             status = _manager_call(manager, "status", managed_env, lifecycle_log_path, check=False)
             if status.returncode == 0:
@@ -908,6 +1025,9 @@ def main() -> int:
     if args.model_path:
         config["model"]["path"] = str(Path(args.model_path).resolve())
         config["model"]["tokenizer"] = str(Path(args.model_path).resolve())
+    if args.served_model_name:
+        config["model"]["name"] = str(args.served_model_name)
+        config["model"]["served_model_name"] = str(args.served_model_name)
     if args.dataset_path:
         config["dataset"]["local_path"] = str(Path(args.dataset_path).resolve())
     if args.manifest:
@@ -922,8 +1042,12 @@ def main() -> int:
             print(f"ERROR {issue}", file=sys.stderr)
         return 1
 
-    if not args.dry_run and not args.no_start_server:
-        if not args.release_ack_dir:
+    materialize_managed_payload = (
+        not args.no_start_server
+        and (not args.dry_run or args.device in {5, 6})
+    )
+    if materialize_managed_payload:
+        if not args.dry_run and not args.release_ack_dir:
             print("ERROR --release-ack-dir is required for managed runs", file=sys.stderr)
             return 1
         try:

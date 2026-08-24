@@ -42,7 +42,31 @@
     "profile_sample_rates": [
       1
     ],
-    "sampled_layer_invocations": 304800
+    "sampled_layer_invocations": 304800,
+    "temporal_dynamics": {
+      "adjacent_same_layer_pairs": 304788,
+      "available": true,
+      "changed_expert_count": {
+        "max": 8,
+        "min": 0,
+        "p50_nearest_rank": 4,
+        "p95_nearest_rank": 8
+      },
+      "events_with_active_expert_ids": 304800,
+      "jaccard": {
+        "max": 1.0,
+        "min": 0.0,
+        "p50_nearest_rank": 0.333333,
+        "p95_nearest_rank": 0.6
+      },
+      "layers_with_active_expert_ids": 12,
+      "new_expert_ratio": {
+        "max": 1.0,
+        "min": 0.0,
+        "p50_nearest_rank": 0.5,
+        "p95_nearest_rank": 1.0
+      }
+    }
   },
   "prefill": {
     "active_experts": {
@@ -56,6 +80,84 @@
       "overflow_invocations": 2400,
       "overflow_rate_pct": 100.0
     },
+    "capacity_sweep": [
+      {
+        "active_hbm_bytes": {
+          "max": 1189085184,
+          "p50_nearest_rank": 934281216,
+          "p95_nearest_rank": 1104150528
+        },
+        "capacity_experts": 8,
+        "capacity_fraction_of_max": 0.063492,
+        "expert_bytes": 9437184,
+        "overflow_invocations": 2400,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 16,
+          "min": 8,
+          "p50_nearest_rank": 13,
+          "p95_nearest_rank": 15
+        },
+        "slot_budget_bytes": 75497472
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 1189085184,
+          "p50_nearest_rank": 934281216,
+          "p95_nearest_rank": 1104150528
+        },
+        "capacity_experts": 16,
+        "capacity_fraction_of_max": 0.126984,
+        "expert_bytes": 9437184,
+        "overflow_invocations": 2400,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 8,
+          "min": 4,
+          "p50_nearest_rank": 7,
+          "p95_nearest_rank": 8
+        },
+        "slot_budget_bytes": 150994944
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 1189085184,
+          "p50_nearest_rank": 934281216,
+          "p95_nearest_rank": 1104150528
+        },
+        "capacity_experts": 32,
+        "capacity_fraction_of_max": 0.253968,
+        "expert_bytes": 9437184,
+        "overflow_invocations": 2400,
+        "overflow_rate_pct": 100.0,
+        "required_waves": {
+          "max": 4,
+          "min": 2,
+          "p50_nearest_rank": 4,
+          "p95_nearest_rank": 4
+        },
+        "slot_budget_bytes": 301989888
+      },
+      {
+        "active_hbm_bytes": {
+          "max": 1189085184,
+          "p50_nearest_rank": 934281216,
+          "p95_nearest_rank": 1104150528
+        },
+        "capacity_experts": 64,
+        "capacity_fraction_of_max": 0.507937,
+        "expert_bytes": 9437184,
+        "overflow_invocations": 2383,
+        "overflow_rate_pct": 99.2917,
+        "required_waves": {
+          "max": 2,
+          "min": 1,
+          "p50_nearest_rank": 2,
+          "p95_nearest_rank": 2
+        },
+        "slot_budget_bytes": 603979776
+      }
+    ],
     "layer_invocations": 2400,
     "required_capacity_groups": {
       "counts": {
@@ -65,6 +167,30 @@
       },
       "three_or_more_invocations": 2383,
       "three_or_more_rate_pct": 99.2917
+    },
+    "temporal_dynamics": {
+      "adjacent_same_layer_pairs": 2388,
+      "available": true,
+      "changed_expert_count": {
+        "max": 50,
+        "min": 0,
+        "p50_nearest_rank": 13,
+        "p95_nearest_rank": 30
+      },
+      "events_with_active_expert_ids": 2400,
+      "jaccard": {
+        "max": 0.983607,
+        "min": 0.4,
+        "p50_nearest_rank": 0.764706,
+        "p95_nearest_rank": 0.897436
+      },
+      "layers_with_active_expert_ids": 12,
+      "new_expert_ratio": {
+        "max": 0.5,
+        "min": 0.0,
+        "p50_nearest_rank": 0.126316,
+        "p95_nearest_rank": 0.317308
+      }
     }
   },
   "schema_version": 1,
@@ -76,7 +202,7 @@
     "skipped_prefill_requests": 1
   },
   "source": {
-    "profile": "benchmark/artifacts/motivation-fullrate-20260818/sew-offload-ascend-v1-20260818T145649Z/sew_14gb_autoslots/mixed_chat/moe_profile.jsonl",
-    "sha256": "74f15c23d5342d0bfe6035e2f3323a5e2b27d479ecb91a4929800318d3c1c279"
+    "profile": "/workspace/latchmoe-motivation-qwen3-fullrate-v2/sew-offload-ascend-v1-20260822T030434Z/sew_14gb_autoslots/mixed_chat/moe_profile.jsonl",
+    "sha256": "79e0ca2333c2a84a870ae9226d43c05f92a1ad2794784474ef378ef868f4607e"
   }
 }

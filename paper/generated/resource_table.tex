@@ -1,0 +1,16 @@
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Audited resources in each model's graph-qualified LatchMoE run. Device storage sums the 32-slot bank, prefill stage banks, and resident shared-expert weights; H2D is the profiled transfer volume for that qualification workload. Original managed expert banks are released in every row.}
+  \label{tab:resources}
+  \begin{tabular}{lrrrr}
+    \toprule
+    Model & Host & Device & H2D & Replays \\
+          & (GiB) & (GiB) & (GiB) & \\
+    \midrule
+    Qwen3-30B-A3B & 54.0 & 14.1 & 65.5 & 97 \\
+    GLM-4.7-Flash & 51.8 & 26.7 & 22.3 & 94 \\
+    Qwen3-Next-80B-A3B & 144.0 & 9.7 & 152.6 & 97 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

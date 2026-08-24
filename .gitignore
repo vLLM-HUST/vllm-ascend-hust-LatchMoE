@@ -11,3 +11,33 @@ build/
 # Benchmark outputs (see benchmark/artifacts/.gitignore for placeholders)
 benchmark/artifacts/runs/
 benchmark/artifacts/reports/
+
+# Local Codex/ARIS traces and workspace-specific research state
+.aris/
+paper/.aris/
+
+# Local paper packaging and generated build metadata
+paper/artifact_bundle/
+paper/main.fdb_latexmk
+paper/main.fls
+paper/main.synctex.gz
+paper/main_round0_original.pdf
+paper/figures/*.audit.md
+paper/figures/.*.raw.pdf
+
+# Internal paper-review and planning snapshots
+/MANIFEST.md
+/PAPER_ACCEPTANCE_CONTRACT*.md
+/PAPER_PLAN*.md
+paper/CITATION_AUDIT.json
+paper/CITATION_AUDIT.md
+paper/EXPERIMENT_AUDIT.json
+paper/FROZEN_SECTION_SUGGESTIONS.md
+paper/KILL_ARGUMENT.json
+paper/KILL_ARGUMENT.md
+paper/MOTIVATION_EXPERIMENT_PLAN.md
+paper/PAPER_CLAIM_AUDIT.json
+paper/PAPER_CLAIM_AUDIT.md
+paper/PAPER_IMPROVEMENT_LOG.md
+paper/PROOF_AUDIT.json
+paper/PROOF_AUDIT.md

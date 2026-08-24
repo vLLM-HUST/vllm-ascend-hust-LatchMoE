@@ -3388,7 +3388,23 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             or _os.getenv("VLLM_ASCEND_MOE_GMM_PROFILE_PATH")
             or _os.getenv("VLLM_ASCEND_MOE_OFFLOAD_PROFILE_PATH")
         ):
+            offload_step_id = getattr(offload, "step_id", -1)
             payload = {
+                "phase": str(forward_phase),
+                "step_id": (
+                    -1 if offload_step_id is None else int(offload_step_id)
+                ),
+                "num_tokens": int(fused_experts_input.topk_ids.shape[0]),
+                "top_k": int(
+                    fused_experts_input.topk_ids.shape[1]
+                    if fused_experts_input.topk_ids.ndim > 1
+                    else 1
+                ),
+                "active_experts": [int(expert_id) for expert_id in unique_active],
+                "expert_token_counts": {
+                    str(int(expert_id)): int(count)
+                    for expert_id, count in sorted(token_counts.items())
+                },
                 "n_tokens": int(fused_experts_input.hidden_states.shape[0]),
                 "n_active": int(len(unique_active)),
                 "n_pairs": int(
