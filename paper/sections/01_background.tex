@@ -49,12 +49,14 @@ Such placement changes are natural under a bounded expert cache, whose contents 
 
 If captured expert computation directly binds $e$ to its current HBM location, a change in $\pi_t(e)$ also changes the graph-visible binding $\mathcal{B}$. 
 Dynamic expert caching may therefore require the resident set $\mathcal{H}_t$ and placement mapping $\pi_t$ to evolve, while conventional graph replay expects its graph-visible bindings $\mathcal{B}$ to remain reusable. 
-The desired execution abstraction must decouple these two requirements: 
+Cache-based expert offloading and graph replay therefore impose different requirements on storage state:
 \[ 
  (\mathcal{H}_t, \pi_t) \;\text{may evolve}, 
  \qquad 
  \mathcal{B} \;\text{remains replay-stable}. 
 \]
+
+The desired abstraction must allow changes in expert residency and placement without propagating those changes to the storage bindings observed by captured computation.
 
 Several straightforward alternatives avoid one side of this conflict only by sacrificing another system objective. 
 Keeping all experts permanently resident would stabilize their physical bindings but defeats offloading under a bounded HBM budget. 
