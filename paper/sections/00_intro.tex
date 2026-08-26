@@ -53,20 +53,29 @@ Staging all required experts at once violates the memory budget, whereas fetchin
 \textit{Challenge 3.} \textbf{Slot reuse must remain correct under asynchronous transfer and computation.}
 Reassigning a slot before its previous consumer finishes can overwrite weights still in use, while exposing a new assignment before transfer completion can make computation observe incomplete contents.
 
-We present \system, a graph-compatible MoE offloading system that maps changing logical experts onto a fixed set of device slots.
-\system performs routing-dependent expert staging outside the replayed computation, allowing replayed kernels to access the same slots even as their expert occupants change.
-To handle routed expert working sets larger than the available slot capacity, \system partitions expert execution into multiple waves and pipelines the staging of subsequent waves with ongoing computation.
-Finally, \system uses versioned slot leases to coordinate asynchronous transfer, computation, and slot reassignment. A slot can be reassigned only after its previous use has completed, and a new expert-to-slot mapping becomes visible only after the corresponding weights are ready.
-Together, these mechanisms enable routing-driven expert replacement over bounded, replay-stable HBM slots.
+We present \system, a graph-compatible MoE offloading runtime that virtualizes routing-dependent expert ownership over a fixed set of replay-stable HBM slots.
+\system places expert staging and ownership transitions at explicit replay boundaries, allowing captured expert computation to remain bound to the same slots while their logical owners change.
+When the routed working set exceeds slot capacity, \system partitions expert execution into multiple waves and pipelines the staging of subsequent waves with ongoing computation.
+Finally, versioned slot leases coordinate transfer readiness, computation completion, and ownership reassignment, preventing a slot from being reused before its previous lifetime ends or exposed before its new contents are ready.
 
 In summary, this paper makes the following contributions:
 
 \begin{itemize}
 
-\item We identify a fundamental tension between expert-granular offloading and graph replay for MoE inference with tight memory budgets: exploiting sparse activation requires routing-driven expert replacement, while replayed expert computation requires stable graph-visible storage bindings. From this tension, we derive the key insight that replayability requires stable storage bindings rather than static expert residency.
+\item We identify that the conflict between dynamic expert offloading and graph replay arises when changing expert placement also changes the storage bindings referenced by captured computation. We show that graph replay requires stable storage bindings, not static expert residency, enabling dynamic experts to be virtualized over a fixed storage interface.
 
-\item We design \system, a graph-compatible MoE offloading runtime that virtualizes routing-dependent logical experts over HBM slots whose bindings remain stable during replay. It separates expert staging from replayed expert computation and supports working sets larger than the slot capacity through multiple execution waves. It pipelines weight transfers with computation and uses versioned slot leases to ensure safe asynchronous slot reuse.
+\item We design \system, a graph-compatible MoE offloading runtime that
+virtualizes routing-dependent logical ownership over replay-stable HBM slots.
+\system manages expert staging and ownership transitions at explicit replay
+boundaries, supports working sets larger than slot capacity through multi-wave
+execution, and uses versioned slot leases to safely coordinate asynchronous
+transfer, computation, and slot reuse.
 
-\item We implement \system on vLLM-Ascend and evaluate it under constrained HBM. On Qwen3-30B-A3B, \system preserves exact model outputs while maintaining graph replay under expert offloading. Compared with graph-compatible full-layer staging, its multi-wave prefill execution reduces the median TTFT p50 across repeated runs by 35.21%.
+\item We implement \system on vLLM-Ascend and validate its execution semantics
+across three MoE architectures, preserving exact outputs and graph replay while
+exercising dynamic residency, overflow, and asynchronous slot lifecycles.
+Performance claims remain scoped to a matched single-NPU Qwen3-30B-A3B
+configuration, where multi-wave execution reduces prefill TTFT relative to
+graph-compatible full-layer staging.
 
 \end{itemize}
