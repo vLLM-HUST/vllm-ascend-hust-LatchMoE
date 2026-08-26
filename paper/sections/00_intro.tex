@@ -38,15 +38,14 @@ On CUDA platforms, UVA provides stable access to host-resident weights, but does
 Prefetch-based offloading can preserve graph replay by staging weights into preallocated device buffers~\cite{vllmPrefetch}. Applied to MoE, however, layer-wise staging must move the entire expert layer despite sparse expert activation, incurring unnecessary HBM capacity and transfer costs. Exploiting this sparsity requires expert-granular staging, where the required experts become routing-dependent and may exceed the available device slots.
 Existing approaches therefore do not directly support routing-driven expert replacement over bounded, replay-stable HBM slots.
 
-
-Our key insight is that \textbf{runtime dynamism need not propagate into graph-visible execution state}.
-Graph replay requires stable graph-visible storage bindings, not static logical ownership of the data behind them.
-We therefore decouple logical expert identity from replay-visible device storage: a fixed set of HBM slots remains bound to captured computation, while routing-dependent experts dynamically acquire and release ownership of those slots.
-This abstraction allows expert residency to evolve without changing the storage interface observed by graph replay.
+Our key insight is that \textbf{runtime dynamism need not change the execution state captured by the graph}.
+Graph replay requires stable storage bindings, not static expert residency.
+We therefore decouple logical expert identity from device storage: a fixed set of HBM slots remains bound to captured computation, while routing-dependent experts can dynamically occupy and leave those slots.
+This abstraction allows expert residency to evolve without changing the storage interface used by graph replay.
 
 
 Realizing this abstraction raises three systems challenges.
-\textit{Challenge 1.} \textbf{Routing-dependent expert residency must coexist with replay-stable execution.}
+\textit{Challenge 1.} \textbf{Routing-dependent expert placement must not change the storage bindings used by captured computation.}
 The experts required by a layer are revealed only after routing, yet routing-dependent residency decisions must not change the storage bindings or execution structure observed by captured expert computation.
 \textit{Challenge 2.} \textbf{The routed expert working set can exceed the available HBM capacity.}
 Staging all required experts at once violates the memory budget, whereas fetching them sequentially exposes repeated weight-transfer latency on the inference critical path.
