@@ -15,7 +15,8 @@
       "integration_contracts": [
         "vllm.operator.v1",
         "vllm.platform.v1"
-      ]
+      ],
+      "integration_surfaces": ["vllm.operator.moe"]
     }
   ],
   "system_boundaries": {
