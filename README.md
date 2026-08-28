@@ -6,6 +6,17 @@
 
 ---
 
+## Ecosystem classification
+
+LatchMoE is an Ascend MoE operator and runtime component. It coordinates
+address-stable expert slots, host/device transfers, graph replay boundaries,
+and platform hooks in worker, native, and device planes. It is not an external
+KV system, scheduler policy, or control plane; its platform entry point is only
+the current discovery and delivery shim.
+
+See [`.vllm-hust/repository-profile.json`](./.vllm-hust/repository-profile.json)
+for the machine-readable boundary and validation declaration.
+
 ## What LatchMoE Does
 
 Serving a MoE model whose expert weights exceed single-NPU HBM requires

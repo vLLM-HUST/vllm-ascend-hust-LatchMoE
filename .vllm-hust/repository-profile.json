@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "canonical_registry": "https://github.com/vLLM-HUST/vllm-hust-docs/tree/codex/ecosystem-architecture-reorganization/registry",
+  "repository": "https://github.com/vLLM-HUST/vllm-ascend-hust-LatchMoE",
+  "repository_role": "runtime_component",
+  "relation_to_runtime": "extends_runtime_behavior",
+  "lifecycle": "incubating",
+  "artifacts": [
+    {
+      "id": "latchmoe-operator-runtime",
+      "artifact_type": "runtime_component",
+      "system_role": "operator_runtime",
+      "delivery_model": "plugin_bundle",
+      "execution_planes": ["worker", "native", "device"],
+      "integration_contracts": [
+        "vllm.operator.v1",
+        "vllm.platform.v1"
+      ]
+    }
+  ],
+  "system_boundaries": {
+    "is": [
+      "an Ascend MoE operator and expert-offload runtime component",
+      "a worker, native, and device integration using platform hooks"
+    ],
+    "is_not": [
+      "an external KV state system or connector",
+      "a scheduler policy",
+      "a cluster control plane"
+    ]
+  },
+  "validation": [
+    "python3 -m pytest tests/ -q",
+    "ruff check .",
+    "run graph correctness and matched performance suites on supported Ascend hardware"
+  ],
+  "compatibility_document": "README.md#architecture"
+}
