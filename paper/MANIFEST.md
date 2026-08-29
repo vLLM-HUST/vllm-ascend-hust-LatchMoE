@@ -2,7 +2,8 @@
 
 - Status: existing formal manuscript with an advisor-authored research-contract closure; implementation and experiments remain student-owned.
 - Source base: `3b96421a898541a5410892700bace3236c17d751` (`main`).
-- Artifact commit: `PENDING_ARTIFACT_COMMIT`.
+- Artifact commit: `e91496e1fe04ff0fe043b45f14a0f055edd09e54`.
+- Binding rule: this metadata-only commit immediately follows the artifact commit above; the TeX, bibliography, PDF, and transcript hashes bind the reviewed bytes without a self-referential commit hash.
 - TeX entrypoint: `paper/main.tex`.
 - Bibliography: `paper/references.bib`.
 - Seven-question mapping: `paper/RESEARCH_CONTRACT.md`.
