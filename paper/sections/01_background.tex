@@ -20,21 +20,23 @@ If the cache is full, admitting a missing expert requires evicting or replacing 
 
 Cache-based offloading therefore makes expert residency and placement runtime-managed state. 
 For each resident expert $e \in \mathcal{H}_t$, let $\pi_t(e)$ denote the device storage location assigned to its weight tensors at step $t$.
-As routing decisions trigger admission, eviction, and replacement, both the resident set $\mathcal{H}_t$ and the placement mapping $\pi_t$ may evolve over time. 
-Thus, a logical expert has a fixed model identity, while its HBM residency and physical placement are dynamic.
+As routing decisions trigger admission, eviction, and replacement, both the resident set $\mathcal{H}_t$ and the placement mapping $\pi_t$ may change across inference steps.
+Thus, a logical expert has a fixed model identity, while its HBM residency and device storage location are determined dynamically at runtime.
 
-\subsection{Graph Replay and Replay-Stable Execution State}
+\subsection{Graph Replay and Stable Storage Bindings}
 \label{sec:background_graph}
 
 Graph replay reduces repeated host-side scheduling and kernel-launch overhead by capturing a recurring accelerator execution sequence and replaying it as a unit~\cite{kwon2020nimble,ye2025flashinfer}.
-Ordinary graph replay reuses the captured operation structure and graph-visible storage bindings.
-Updating or recapturing this state can accommodate binding changes, but requires additional host intervention~\cite{nvidiaCudaGraph}. 
-We refer to the state required for ordinary replay as the \emph{replay-stable execution state}, and denote its storage bindings by $\mathcal{B}$.
 
-Replay stability does not require runtime data to remain unchanged. 
-Values stored in preallocated graph-visible buffers may be updated between replays as long as the captured computation continues to access the same storage. 
-For example, FlashInfer stores request-dependent scheduling metadata in preallocated device workspaces and updates its contents while preserving the workspace addresses referenced by captured kernels~\cite{ye2025flashinfer}.
-This example shows that graph replay can accommodate dynamic values behind stable storage bindings, whereas binding changes require graph update or recapture.
+Captured computation reuses both its operation structure and the storage bindings referenced by those operations.
+We denote these storage bindings by $\mathcal{B}$.
+
+Graph replay does not require the contents of this storage to remain unchanged.
+Values in preallocated buffers may be updated between replays as long as the captured computation continues to access the same storage locations.
+For example, FlashInfer updates request-dependent scheduling metadata in preallocated device workspaces while preserving the workspace locations referenced by captured kernels~\cite{ye2025flashinfer}.
+
+Thus, graph replay can accommodate dynamic data behind stable storage bindings.
+It is a change to the bindings themselves that may require graph update or recapture~\cite{nvidiaCudaGraph}.
 
 \subsection{Dynamic Expert Placement Meets Graph Replay}
 \label{sec:background_conflict}
@@ -46,6 +48,9 @@ If $e$ is evicted after step $t$ and later reloaded, it may occupy a different H
   \pi_t(e) \neq \pi_{t'}(e). 
 \] 
 Such placement changes are natural under a bounded expert cache, whose contents evolve with routing decisions.
+
+Dynamic expert placement does not inherently conflict with graph replay.
+The conflict occurs when captured computation directly references the current storage location of a logical expert.
 
 If captured expert computation directly binds $e$ to its current HBM location, a change in $\pi_t(e)$ also changes the graph-visible binding $\mathcal{B}$. 
 Dynamic expert caching may therefore require the resident set $\mathcal{H}_t$ and placement mapping $\pi_t$ to evolve, while conventional graph replay expects its graph-visible bindings $\mathcal{B}$ to remain reusable. 
@@ -63,4 +68,4 @@ Keeping all experts permanently resident would stabilize their physical bindings
 Falling back to eager execution accommodates arbitrary placement changes but forfeits the host-overhead savings of graph replay. 
 Updating or recapturing the graph after each placement change similarly reintroduces host intervention into the repeated inference path.
 
-Therefore, our goal is to support dynamic expert residency and storage assignment within a bounded HBM cache while preserving the graph-visible storage bindings required by ordinary replay.
+Therefore, our goal is to support dynamic expert replacement within a bounded HBM cache while preserving the graph-visible storage bindings required by graph replay. 

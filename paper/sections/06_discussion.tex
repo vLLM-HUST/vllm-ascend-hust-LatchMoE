@@ -43,6 +43,11 @@ exact-token comparability gate, so we retain them without using their latency.
 Consequently, the reported performance evidence is an internal mechanism
 comparison against graph-compatible full-layer staging, not a superiority claim
 over published offloading systems.
+The full-resident cost anchor is therefore central to the deployment story:
+the measured 17-percentage-point reduction in sampled peak HBM is purchased
+with a 261.28\% TTFT-p50 and 309.51\% TPOT-p50 penalty in this scope. We state
+this as a latency cost for single-card deployability, not as a universal
+speedup.
 The slot sweep has one start per point and is descriptive. None of these
 results establishes a general decode-speedup or multi-request serving claim.
 

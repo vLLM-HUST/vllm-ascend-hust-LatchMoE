@@ -13,7 +13,8 @@ FIGURES := \
 GENERATED_TABLES := \
 	generated/formal_results_macros.tex \
 	generated/qualification_table.tex \
-	generated/resource_table.tex
+	generated/resource_table.tex \
+	generated/cost_anchor_table.tex
 
 figures: $(FIGURES)
 

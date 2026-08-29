@@ -84,6 +84,19 @@ graph-versus-eager evidence for the qualified path, but it is one request and
 therefore is not a repeated-start variance estimate, throughput result, or
 concurrency claim.
 
+We also established \texttt{Slot+Eager} as the primary causal baseline for this
+graph question and \texttt{Slot+PIECEWISE} as its only matched treatment. Across
+the frozen standard workload, we completed 24 fresh units: three counterordered
+starts for each of LongBench (200 requests), ShareGPT (200), HumanEval (164),
+and GSM8K (200), with identical model, slot, offload, KV-cache, prefix-cache,
+request-order, and sampling controls. This was a four-token qualification
+rather than a performance campaign. The audit records paired exact-token
+exceptions in ShareGPT, HumanEval, and GSM8K, while all LongBench requests
+exceed the current context boundary. Thus the baseline choice is fixed, but
+this campaign supports neither a four-dataset exact-equivalence claim nor a
+Graph latency superiority claim; its failed gates remain visible in the
+evidence ledger.
+
 \subsection{Q2: What baselines are feasible, and what does offloading cost?}
 
 We run three counterordered starts of four ACLGraph arms with an explicit
@@ -108,6 +121,16 @@ repeat-median TTFT p50 and TPOT p50 are \FullResidentTTFTMedian~ms and
 host-backed expert replacement in the evaluated implementation. In return,
 the median sampled HBM peak falls from \FullResidentHBMPeak\% to
 \LatchHBMPeak\%, while exact output and graph replay remain qualified.
+
+Table~\ref{tab:cost-anchor} makes the deployment trade-off explicit under the
+same matched Qwen3 contract. LatchMoE stores 13.50~GiB in the host expert
+store and 3.38~GiB in persistent slots, plus a 0.56~GiB prefill stage bank;
+the profile records 292.05~GiB of H2D traffic. The median sampled peak HBM
+falls by 17 percentage points, but TTFT p50 and TPOT p50 increase by 261.28\%
+and 309.51\%, respectively. Thus the result is a latency cost paid for
+single-card deployability, not a universal performance improvement.
+
+\input{generated/cost_anchor_table}
 
 \begin{figure*}[t]
   \centering

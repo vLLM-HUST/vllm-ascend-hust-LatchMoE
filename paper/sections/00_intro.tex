@@ -45,11 +45,11 @@ This abstraction allows expert residency to evolve without changing the storage 
 
 
 Realizing this abstraction raises three systems challenges.
-\textit{Challenge 1.} \textbf{Routing-dependent expert placement must not change the storage bindings used by captured computation.}
+\textit{Challenge 1}: \textbf{Routing-dependent expert placement must not change the storage bindings used by captured computation.}
 The experts required by a layer are revealed only after routing, yet routing-dependent residency decisions must not change the storage bindings or execution structure observed by captured expert computation.
-\textit{Challenge 2.} \textbf{The routed expert working set can exceed the available HBM capacity.}
+\textit{Challenge 2}: \textbf{The routed expert working set can exceed the available HBM capacity.}
 Staging all required experts at once violates the memory budget, whereas fetching them sequentially exposes repeated weight-transfer latency on the inference critical path.
-\textit{Challenge 3.} \textbf{Slot reuse must remain correct under asynchronous transfer and computation.}
+\textit{Challenge 3}: \textbf{Slot reuse must remain correct under asynchronous transfer and computation.}
 Reassigning a slot before its previous consumer finishes can overwrite weights still in use, while exposing a new assignment before transfer completion can make computation observe incomplete contents.
 
 We present \system, a graph-compatible MoE offloading runtime that virtualizes routing-dependent expert ownership over a fixed set of replay-stable HBM slots.
