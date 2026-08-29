@@ -1,0 +1,24 @@
+# LatchMoE paper artifact manifest
+
+- Status: existing formal manuscript with an advisor-authored research-contract closure; implementation and experiments remain student-owned.
+- Source base: `3b96421a898541a5410892700bace3236c17d751` (`main`).
+- Artifact commit: `PENDING_ARTIFACT_COMMIT`.
+- TeX entrypoint: `paper/main.tex`.
+- Bibliography: `paper/references.bib`.
+- Seven-question mapping: `paper/RESEARCH_CONTRACT.md`.
+- Evidence sources: `paper/CLAIMS.md`, `paper/CLAIM_LEDGER.md`, `paper/EVIDENCE_MAP.md`, and `paper/data/`.
+- Build command: `make -C paper review` (`TECTONIC` may override the executable).
+- Build runner: Tectonic `0.17.0`; exit code `0`.
+- PDF: `paper/build/main.pdf`.
+- Full transcript: `paper/build/tectonic.log`.
+- PDF pages: `13` (the main paper concludes on page 11; references continue through page 13).
+- Visual inspection: all 13 pages rendered with `pdftoppm -png -r 110` and inspected individually; no clipping, overlap, accidental blank page, or unreadable figure/table was found.
+- Build-log disclosure: 78 existing overfull boxes and 30 existing underfull boxes remain under the acmart/XeTeX build, alongside font and bibliography metadata warnings; no undefined references or missing characters were found. The transcript is authoritative and this manifest does not claim a warning-free build.
+- `main.tex` SHA256: `005ac15f807554033843cc1d67cab1b601ff5b13ba25a7452b239e3f792a01e1`.
+- `references.bib` SHA256: `821a08c0c32b85e626541d6ce8302e6227c1bae9d43a218ffc707debeaf851ea`.
+- `main.pdf` SHA256: `ab50fb8c3de51ce0377dfa14b363bef8841e5f3646228c8ba699d8fefc32bf2d`.
+- `tectonic.log` SHA256: `1768b7e9ddccaca8bcd86b9dab7ba99c1b8b5accbc1fff7c20c531ca8876a321`.
+- Host-only validation: 59 dependency-independent tests passed; source diff check passed (the verbatim generated Tectonic transcript is excluded because it retains engine-emitted trailing spaces).
+- Unavailable checks: the full host suite stops at collection because the current non-runtime environment lacks `vllm`/`vllm_ascend`; the submission-contract checker lacks the existing `fitz` dependency. A broader reduced collection produced 91 passes and 26 dependency-caused failures. No package or runtime environment was installed for this paper-only change.
+- Highest current evidence: matched real-online Ascend serving evidence within the frozen single-device Qwen3 boundary.
+- Open evidence gates: fresh semantic/citation audits, regenerable custody for the historical graph-breakdown figure, fair oracle-closed external baselines, second-model matched performance, and broader concurrency/multi-NPU qualification.

@@ -1,6 +1,6 @@
 TECTONIC ?= tectonic
 
-.PHONY: all figures clean
+.PHONY: all figures review clean
 
 all: main.pdf
 
@@ -17,8 +17,15 @@ GENERATED_TABLES := \
 
 figures: $(FIGURES)
 
+# Reproducible review build.  The default target remains unchanged for authors;
+# this target retains the complete Tectonic transcript beside the rendered PDF.
+review:
+	mkdir -p build
+	$(TECTONIC) --keep-logs --keep-intermediates --outdir build main.tex > build/tectonic.log 2>&1
+
 main.pdf: main.tex $(SECTIONS) references.bib $(FIGURES) $(GENERATED_TABLES)
 	$(TECTONIC) --keep-logs --keep-intermediates main.tex
 
 clean:
 	$(RM) main.aux main.bbl main.blg main.log main.out main.pdf
+	$(RM) -r build
