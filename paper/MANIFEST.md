@@ -2,7 +2,7 @@
 
 - Status: existing formal manuscript with an advisor-authored research-contract closure; implementation and experiments remain student-owned.
 - Source base: `3b96421a898541a5410892700bace3236c17d751` (`main`).
-- Artifact commit: `e91496e1fe04ff0fe043b45f14a0f055edd09e54`.
+- Artifact commit: `c8f6711219758017f9632c768f2693a2dc458d21`.
 - Binding rule: this metadata-only commit immediately follows the artifact commit above; the TeX, bibliography, PDF, and transcript hashes bind the reviewed bytes without a self-referential commit hash.
 - TeX entrypoint: `paper/main.tex`.
 - Bibliography: `paper/references.bib`.
@@ -13,12 +13,13 @@
 - PDF: `paper/build/main.pdf`.
 - Full transcript: `paper/build/tectonic.log`.
 - PDF pages: `13` (the main paper concludes on page 11; references continue through page 13).
-- Visual inspection: all 13 pages rendered with `pdftoppm -png -r 110` and inspected individually; no clipping, overlap, accidental blank page, or unreadable figure/table was found.
-- Build-log disclosure: 78 existing overfull boxes and 30 existing underfull boxes remain under the acmart/XeTeX build, alongside font and bibliography metadata warnings; no undefined references or missing characters were found. The transcript is authoritative and this manifest does not claim a warning-free build.
-- `main.tex` SHA256: `005ac15f807554033843cc1d67cab1b601ff5b13ba25a7452b239e3f792a01e1`.
+- Visual inspection: all 13 pages rendered with `pdftoppm -png -r 65` and inspected individually; no clipping, overlap, accidental blank page, or unreadable figure/table was found.
+- Build-log disclosure: the previous substantive horizontal overflow is removed. The retained acmart/XeTeX transcript has ordinary underfull/font warnings and a `1.90399pt` final-page vertical overflow repeated across engine passes; no overfull hbox, undefined citation/reference, or missing character was found. The transcript is authoritative and this manifest does not claim a warning-free build.
+- Manual semantic audit: `paper/main.tex` is the formal entrypoint (not a generated fragment); it inputs the introduction, problem/background, motivation, design, implementation, evaluation, discussion, related-work, and conclusion sections. The included prose answers all seven research questions and actually cites the 26-entry bibliography.
+- `main.tex` SHA256: `203322271c03525212c890b0acea40e9f55f020f16ecf6e7ffb7f20eb8ad95e9`.
 - `references.bib` SHA256: `821a08c0c32b85e626541d6ce8302e6227c1bae9d43a218ffc707debeaf851ea`.
-- `main.pdf` SHA256: `ab50fb8c3de51ce0377dfa14b363bef8841e5f3646228c8ba699d8fefc32bf2d`.
-- `tectonic.log` SHA256: `1768b7e9ddccaca8bcd86b9dab7ba99c1b8b5accbc1fff7c20c531ca8876a321`.
+- `main.pdf` SHA256: `4079da644a530d925d60bd06181ecbc89939dd521fc185b713dab27b1e3dd729`.
+- `tectonic.log` SHA256: `6973fa5e0c1b80913b7acbfa0c8364f1724f76c736f1bc4263d8aa0cda875785`.
 - Host-only validation: 59 dependency-independent tests passed; source diff check passed (the verbatim generated Tectonic transcript is excluded because it retains engine-emitted trailing spaces).
 - Unavailable checks: the full host suite stops at collection because the current non-runtime environment lacks `vllm`/`vllm_ascend`; the submission-contract checker lacks the existing `fitz` dependency. A broader reduced collection produced 91 passes and 26 dependency-caused failures. No package or runtime environment was installed for this paper-only change.
 - Highest current evidence: matched real-online Ascend serving evidence within the frozen single-device Qwen3 boundary.
