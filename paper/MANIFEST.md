@@ -1,0 +1,26 @@
+# LatchMoE paper artifact manifest
+
+- Status: existing formal manuscript with an advisor-authored research-contract closure; implementation and experiments remain student-owned.
+- Source base: `905cf96fd80cd84039e340db957f925fb2d159e5` (`main`).
+- Artifact commit: `6cc6bbb5c2838695be5bf6dd49792094eb2b806a`.
+- Binding rule: this metadata-only commit immediately follows the artifact commit above; the TeX, bibliography, PDF, and transcript hashes bind the reviewed bytes without a self-referential commit hash.
+- TeX entrypoint: `paper/main.tex`.
+- Bibliography: `paper/references.bib`.
+- Seven-question mapping: `paper/RESEARCH_CONTRACT.md`.
+- Evidence sources: `paper/CLAIMS.md`, `paper/CLAIM_LEDGER.md`, `paper/EVIDENCE_MAP.md`, and `paper/data/`.
+- Build command: `make -C paper review` (`TECTONIC` may override the executable).
+- Build runner: Tectonic `0.17.0`; exit code `0`.
+- PDF: `paper/build/main.pdf`.
+- Full transcript: `paper/build/tectonic.log`.
+- PDF pages: `15` (the main paper concludes on page 14; references continue through page 15).
+- Visual inspection: all 15 pages were rendered with `pdftoppm -png -r 80` and inspected individually; no clipping, overlap, accidental blank page, or unreadable figure/table was found.
+- Build-log disclosure: the retained acmart/XeTeX transcript has ordinary underfull/font warnings and a `1.78pt` vertical overflow; no overfull hbox, undefined citation/reference, missing citation key, or missing character was found. The transcript is authoritative and this manifest does not claim a warning-free build.
+- Manual semantic audit: `paper/main.tex` is the formal entrypoint (not a generated fragment); it inputs the introduction, problem/background, motivation, design, implementation, evaluation, discussion, related-work, and conclusion sections. The included prose answers all seven research questions and actually cites the 26-entry bibliography.
+- `main.tex` SHA256: `abd71129e4bf8318bc5e0ae2fe5c16f61dcd1282ca3345eeae65e8532a5372f6`.
+- `references.bib` SHA256: `821a08c0c32b85e626541d6ce8302e6227c1bae9d43a218ffc707debeaf851ea`.
+- `main.pdf` SHA256: `fe1c6be587a046c9a25d16167c035b0303250bfb45707aa03349767cf8244297`.
+- `tectonic.log` SHA256: `17781eaa1dc7a0e59224ebb1718ee6c12cc09f937d86def9843508aa227981ef`.
+- Validation: Tectonic exited 0; all 26 cited keys resolve in the 26-entry bibliography; source diff check passed (the verbatim generated Tectonic transcript is excluded because it retains engine-emitted trailing spaces).
+- Unavailable checks: the full host suite stops at collection because the current non-runtime environment lacks `vllm`/`vllm_ascend`; the submission-contract checker lacks the existing `fitz` dependency. A broader reduced collection produced 91 passes and 26 dependency-caused failures. No package or runtime environment was installed for this paper-only change.
+- Highest current evidence: matched real-online Ascend serving evidence within the frozen single-device Qwen3 boundary.
+- Open evidence gates: fresh semantic/citation audits, regenerable custody for the historical graph-breakdown figure, fair oracle-closed external baselines, second-model matched performance, and broader concurrency/multi-NPU qualification.
