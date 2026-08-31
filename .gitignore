@@ -3,10 +3,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-!paper/build/
-paper/build/*
-!paper/build/main.pdf
-!paper/build/tectonic.log
 .eggs/
 *.so
 *.jsonl

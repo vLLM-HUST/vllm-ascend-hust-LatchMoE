@@ -33,8 +33,9 @@ physical-page management while exposing a continuous virtual address
 ~\cite{vtensor2024}, while ECHO makes dynamic KV-cache eviction and recall
 graph-friendly~\cite{echo2026}. LatchMoE instead
 manages executable weights selected by a captured router and ordered against
-transfer and MLP computation. An eager seam exposes a fixed slot/map ABI to the
-downstream graph.
+transfer and MLP computation. At an eager seam, capacity-fitting work exposes a
+fixed slot/map ABI to the downstream captured MLP; oversized prefills instead
+select exact eager waves rather than rebinding that graph.
 
 \paragraph{Positioning.}
 LatchMoE joins dynamic placement with graph replay by separating logical

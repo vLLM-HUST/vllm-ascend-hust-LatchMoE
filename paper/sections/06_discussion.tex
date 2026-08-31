@@ -13,8 +13,9 @@ implemented MoE path.
 Address stability does not prevent stale publication or eviction; owner/version
 checks and stream dependencies enforce temporal correctness. Static residency
 sacrifices bounded offload, pointer rebinding requires graph recapture, and
-eager fallback pays dispatch overhead. LatchMoE fixes slots and stages
-replacement; its seam and fused operator are hardware-specific.
+falling a graph-designated piece back to eager pays dispatch overhead. LatchMoE
+fixes slots and stages replacement; its seam and fused operator are
+hardware-specific.
 
 \subsection{Control policy is outside the data plane}
 
@@ -31,8 +32,9 @@ and latency measurements on the same data plane.
 The semantic and graph qualification covers three unquantized BF16 models on
 one Ascend 910B2 with tensor parallelism one. It validates native router and
 layer-boundary parity, exact end-to-end tokens, replay-visible addresses,
-overflow composition, lease/release records, and zero eager fallback for the
-three reported capability tuples. Performance experiments are narrower:
+overflow composition, lease/release records, and zero unintended eager
+fallback of graph-designated pieces for the three reported capability tuples.
+Performance experiments are narrower:
 Qwen3-30B-A3B, a 14-GiB host-offload target, serialized requests,
 \texttt{max\_num\_seqs=1}, and disabled prefix caching. The matched result
 shows lower TTFT for multi-wave than full-layer staging under that contract;
@@ -43,10 +45,20 @@ exact-token comparability gate, so we retain them without using their latency.
 Consequently, the reported performance evidence is an internal mechanism
 comparison against graph-compatible full-layer staging, not a superiority claim
 over published offloading systems.
+The full-resident cost anchor is therefore central to the deployment story:
+the measured 17-percentage-point reduction in sampled peak HBM is purchased
+with a 261.28\% TTFT-p50 and 309.51\% TPOT-p50 penalty in this scope. We state
+this as a latency cost for single-card deployability, not as a universal
+speedup.
 The slot sweep has one start per point and is descriptive. None of these
 results establishes a general decode-speedup or multi-request serving claim.
+A separate bounded c2/c4 stress test exercises real slot reuse, monotonic
+generations, H2D readiness, and balanced compute leases with exact outputs; it
+is lifecycle evidence rather than a throughput or tail-latency result.
+At c8, the broader frozen workload exposes paired exact-token exceptions, so
+we do not admit its latency measurements or claim high-load correctness.
 
-Higher concurrency permits overlapping request leases, prefix-cache reuse adds
-hits across the staging seam, multi-device execution adds distributed
-ownership, and quantization changes layouts and operator support. None is
-covered by the qualified single-request host-to-device protocol.
+Higher concurrency permits more overlapping request leases, prefix-cache reuse
+adds hits across the staging seam, multi-device execution adds distributed
+ownership, and quantization changes layouts and operator support. Their
+performance effects remain outside the qualified single-request campaigns.

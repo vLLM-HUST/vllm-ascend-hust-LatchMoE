@@ -1,17 +1,19 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-LatchMoE makes routing-driven expert replacement compatible with graph replay
-by virtualizing dynamic logical owners over address-stable physical slots and
-ordering each ownership interval with a versioned lease. Its captured-router,
-eager-staging, captured-MLP seam and capacity-bounded waves pass semantic,
-graph, and lifecycle qualification across three materially different MoE
-models. On the scoped single-NPU, concurrency-one Qwen3 workload, bounded waves
+LatchMoE combines two capacity-selected expert paths: fitting routed work
+replays captured expert computation from persistent, address-stable slots,
+whereas oversized prefills execute exact eager waves from bounded transient
+banks. Both paths order each ownership interval with a versioned lease. This
+piecewise contract passes semantic, graph, and lifecycle qualification across
+three materially different MoE models without unintended fallback of
+graph-designated pieces. On the scoped single-NPU, concurrency-one Qwen3
+workload, bounded waves
 change paired TTFT by \BoundedTTFTEffect\% in the matched full-layer
 comparison, and isolated overlap changes it by \OverlapTTFTEffect\%; broader
 concurrency, quantization, and multi-NPU claims remain outside the qualified
 boundary. These reductions are a
 capacity--latency tradeoff rather than a universal speedup: against full
-residency in Q2, the same workload lowers median sampled HBM peak from 97\%
+residency in Q1, the same workload lowers median sampled HBM peak from 97\%
 to 80\% while
 increasing TTFT and TPOT by 261.28\% and 309.51\%, respectively.
