@@ -1,0 +1,24 @@
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Same-scope full-resident cost anchor for Qwen3-30B-A3B: three fresh starts, 32 requests per arm, 512-MiB KV cache, and disabled prefix caching. HBM reclamation is the difference in median sampled peak utilization; stage wait is reported from the profile, not substituted for end-to-end latency.}
+  \label{tab:cost-anchor}
+  \begin{tabular}{lrr}
+    \toprule
+    Metric & Full resident & LatchMoE \\
+    \midrule
+    TTFT p50 (ms) & 179.13 & 662.22 \\
+    TPOT p50 (ms/token) & 13.19 & 54.50 \\
+    Output throughput (tok/s) & 52.94 & 13.23 \\
+    Sampled peak HBM (\%) & 97 & 80 \\
+    Host store (GiB) & 0 & 13.50 \\
+    Slot HBM (GiB) & 0 & 3.38 \\
+    Prefill stage HBM (GiB) & 0 & 0.56 \\
+    H2D traffic (GiB) & 0 & 292.05 \\
+    Prefill stage wait (ms) & 0 & 257.11 \\
+    Decode ready wait (ms) & 0 & 95.05 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{2pt}
+  \parbox{0.94\linewidth}{\footnotesize\emph{Derived cost:} LatchMoE reclaims 17 percentage points of sampled peak HBM, while adding +261.28\% TTFT-p50 and +309.51\% TPOT-p50 relative to full residency.}
+\end{table}

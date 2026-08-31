@@ -7,6 +7,7 @@ all: main.pdf
 SECTIONS := $(wildcard sections/*.tex)
 FIGURES := \
 	figures/latchmoe_architecture.pdf \
+	figures/latchmoe_lifecycle.pdf \
 	figures/motivation_characterization.pdf \
 	figures/baseline_mechanisms.pdf \
 	figures/capacity_sensitivity.pdf

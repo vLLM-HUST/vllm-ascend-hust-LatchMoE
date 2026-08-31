@@ -2,6 +2,7 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{xspace}
+\usepackage{enumitem}
 
 \newcommand{\system}{LatchMoE\xspace}
 
@@ -17,10 +18,13 @@ parameter footprint. Expert offloading addresses this footprint, yet a bounded
 expert cache changes weight placement as routing changes, conflicting with the
 stable storage bindings expected by graph replay. Our key insight is that
 replay requires stable graph-visible storage, not static logical expert
-residency. We present \system, which stages routed experts across an eager seam
-into fixed device slots, executes oversized working sets in capacity-bounded
-waves, and uses versioned leases to order transfer readiness, mapping
-publication, computation, and reuse. A vLLM-Ascend implementation evaluates
+residency. We present \system, a capacity-adaptive piecewise runtime:
+capacity-fitting routed work replays captured expert computation from fixed
+persistent slots, whereas oversized prefills execute exact eager waves from
+fixed transient banks. The overflow path is selected deliberately rather than
+entered after failed replay. Both paths use versioned leases to order transfer
+readiness, binding publication, computation, and reuse. A vLLM-Ascend
+implementation evaluates
 the three target models under 11 semantic, graph, and lifecycle gates;
 Qwen3-Next's native full-resident end-to-end subcheck is capacity-limited on
 this device. On Qwen3-30B-A3B, bounded waves

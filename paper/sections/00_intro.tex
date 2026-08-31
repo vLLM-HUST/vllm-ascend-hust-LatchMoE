@@ -26,6 +26,7 @@ This result indicates that most of the improvement comes from eliminating host-i
   \label{fig:graph_breakdown} 
 \end{figure} 
 
+
 However, graph replay requires the storage bindings referenced by captured computation to remain replay-stable.
 A dynamically managed expert cache can violate this requirement when routing-driven expert admission and eviction reassign logical experts to different device storage locations that are directly referenced by captured kernels.
 If such reassignment changes the storage bindings observed by the captured computation, the runtime must either repair or recapture the graph to reflect the new bindings, or bypass replay and fall back to eager execution.
@@ -35,26 +36,37 @@ The resulting systems problem is to \textbf{support routing-driven expert replac
 
 Existing graph-compatible offloading mechanisms solve only parts of this problem.
 On CUDA platforms, UVA provides stable access to host-resident weights, but does not support selective expert replacement within a bounded HBM cache~\cite{vllmUVA,nvidiaCudaBestPractices}.
-Prefetch-based offloading can preserve graph replay by staging weights into preallocated device buffers~\cite{vllmPrefetch}. Applied to MoE, however, layer-wise staging must move the entire expert layer despite sparse expert activation, incurring unnecessary HBM capacity and transfer costs. Exploiting this sparsity requires expert-granular staging, where the required experts become routing-dependent and may exceed the available device slots.
+Prefetch-based offloading can preserve replay with preallocated device buffers~\cite{vllmPrefetch}.
+Applied to MoE, however, layer-wise staging must move the entire expert layer despite sparse expert activation, incurring unnecessary HBM capacity and transfer costs.
+Exploiting this sparsity requires expert-granular staging, where the required experts become routing-dependent and may exceed the available device slots.
 Existing approaches therefore do not directly support routing-driven expert replacement over bounded, replay-stable HBM slots.
 
 Our key insight is that \textbf{runtime dynamism need not change the execution state captured by the graph}.
 Graph replay requires stable storage bindings, not static expert residency.
-We therefore decouple logical expert identity from device storage: a fixed set of HBM slots remains bound to captured computation, while routing-dependent experts can dynamically occupy and leave those slots.
+We therefore decouple logical expert identity from device storage.
+For each MoE layer whose experts are offloaded, fixed HBM slots remain bound to captured computation while routing-dependent experts dynamically occupy and leave them.
 This abstraction allows expert residency to evolve without changing the storage interface used by graph replay.
+When routed demand exceeds that replay capacity, \system preserves exact
+semantics through a separate bounded overflow path rather than rebinding the
+captured graph.
 
 
 Realizing this abstraction raises three systems challenges.
 \textit{Challenge 1}: \textbf{Routing-dependent expert placement must not change the storage bindings used by captured computation.}
 The experts required by a layer are revealed only after routing, yet routing-dependent residency decisions must not change the storage bindings or execution structure observed by captured expert computation.
-\textit{Challenge 2}: \textbf{The routed expert working set can exceed the available HBM capacity.}
+\textit{Challenge 2}: \textbf{The routed expert working set can exceed the available execution-bank capacity.}
 Staging all required experts at once violates the memory budget, whereas fetching them sequentially exposes repeated weight-transfer latency on the inference critical path.
 \textit{Challenge 3}: \textbf{Slot reuse must remain correct under asynchronous transfer and computation.}
 Reassigning a slot before its previous consumer finishes can overwrite weights still in use, while exposing a new assignment before transfer completion can make computation observe incomplete contents.
 
-We present \system, a graph-compatible MoE offloading runtime that virtualizes routing-dependent expert ownership over a fixed set of replay-stable HBM slots.
-\system places expert staging and ownership transitions at explicit replay boundaries, allowing captured expert computation to remain bound to the same slots while their logical owners change.
-When the routed working set exceeds slot capacity, \system partitions expert execution into multiple waves and pipelines the staging of subsequent waves with ongoing computation.
+We present \system, a capacity-adaptive piecewise MoE offloading runtime.
+It routes once and then selects one of two expert paths. Capacity-fitting work
+uses replay-stable persistent slots, allowing captured expert computation to
+retain its storage bindings while logical owners change. An oversized prefill
+instead executes exact eager waves from fixed transient banks and reassembles
+their outputs before native composition. This planned overflow mode is not a
+fallback from failed graph replay. \system pipelines staging of subsequent
+waves with ongoing computation.
 Finally, versioned slot leases coordinate transfer readiness, computation completion, and ownership reassignment, preventing a slot from being reused before its previous lifetime ends or exposed before its new contents are ready.
 
 In summary, this paper makes the following contributions:
@@ -63,16 +75,17 @@ In summary, this paper makes the following contributions:
 
 \item We identify that the conflict between dynamic expert offloading and graph replay arises when changing expert placement also changes the storage bindings referenced by captured computation. We show that graph replay requires stable storage bindings, not static expert residency, enabling dynamic experts to be virtualized over a fixed storage interface.
 
-\item We design \system, a graph-compatible MoE offloading runtime that
-virtualizes routing-dependent logical ownership over replay-stable HBM slots.
-\system manages expert staging and ownership transitions at explicit replay
-boundaries, supports working sets larger than slot capacity through multi-wave
-execution, and uses versioned slot leases to safely coordinate asynchronous
-transfer, computation, and slot reuse.
+\item We design \system, a capacity-adaptive piecewise MoE offloading runtime.
+Its replay path virtualizes routing-dependent logical ownership over persistent,
+replay-stable HBM slots; its overflow path executes oversized prefills as exact
+eager waves from bounded transient banks. Versioned slot leases coordinate
+asynchronous transfer, computation, and storage reuse on both paths.
 
 \item We implement \system on vLLM-Ascend and validate its execution semantics
-across three MoE architectures, preserving exact outputs and graph replay while
-exercising dynamic residency, overflow, and asynchronous slot lifecycles.
+across three MoE architectures. The evaluated units preserve exact outputs and
+their configured piecewise contract: graph-designated pieces replay as required,
+while overflow expert waves use the explicit eager path without unintended
+fallback or lifecycle violations.
 Performance claims remain scoped to a matched single-NPU Qwen3-30B-A3B
 configuration, where multi-wave execution reduces prefill TTFT relative to
 graph-compatible full-layer staging.

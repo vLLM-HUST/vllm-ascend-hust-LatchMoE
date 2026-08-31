@@ -1,197 +1,272 @@
 \section{Design}
 \label{sec:design}
 
-\subsection{Overview}
-\label{sec:design-overview}
+\system uses a capacity-adaptive piecewise architecture to reconcile dynamic
+expert placement with graph replay. It routes once and then selects between two
+expert-execution paths. When the routed set fits the persistent bank, \system
+replays captured expert computation against fixed storage bindings. When a
+prefill working set exceeds that capacity, it executes exact eager waves from
+fixed transient banks and reassembles their outputs before native composition.
+Both paths preserve the same routing semantics and versioned storage-lifecycle
+rules. The eager overflow path is an explicit execution mode, not a fallback
+from failed graph replay. The design must therefore preserve stable replay
+bindings, execute routed expert sets that exceed the available execution-bank
+capacity, and safely coordinate asynchronous storage reuse.
 
-\system's central principle is that \emph{logical expert ownership may change,
-while graph-visible storage remains fixed}. For each managed layer, it
-preallocates bounded expert slots and a persistent logical-to-slot map. Their
-allocations survive capture and replay; routing changes only slot contents and
-map values.
+\subsection{Execution Model and Invariants}
+\label{sec:design-model}
 
-Figure~\ref{fig:architecture} shows the resulting captured-router, eager-stage,
-and captured-MLP path. Staging transfers misses and publishes the map before
-the MLP resumes through the same graph-visible interface.
+Consider one managed MoE layer. Its native router produces a set of routed
+token--expert pairs
+$P=\{(i,e,j,w)\}$, where $i$ is a token, $e$ is a layer-local logical expert,
+$j$ is its top-$k$ position, and $w$ is its routing weight. Let $E(P)$ denote
+the distinct experts in $P$. An execution bank has capacity $C$ and a fixed
+set of device buffers $\mathcal{S}$ for expert-weight groups. Its bank-local
+addressing contract maps active logical experts to local slots. Let
+$\beta_r(e)=s$ denote the active bank-local binding consumed for expert $e$ in
+wave $r$. The persistent replay path realizes $\beta_r$ through a fixed
+indirection buffer $\mathcal{M}$; an overflow wave encodes bank-local slot IDs
+in its wave plan. In the evaluated layouts, the weight groups are $W_{13}$ and
+$W_2$. The addresses, shapes, and types of the persistent buffers form the
+storage binding visible to captured expert computation.
 
-\begin{figure*}[t]
+A managed invocation follows the same logical path regardless of whether
+$E(P)$ fits in one bank; capacity determines the number and execution mode of
+its waves. First, a captured routing piece produces $P$ once. The runtime
+inspects the complete $E(P)$, determines whether it fits, and constructs a
+capacity-bounded plan. A fitting invocation uses the persistent bank and its
+prebound captured expert piece. An overflowing prefill invocation instead
+materializes each $E_r$ as a complete wave in one fixed transient bank and
+executes the wave through the eager expert path. Staging and expert execution
+repeat until every routed pair has executed; their outputs are then restored
+to the original pair positions and passed to the native composition path.
+With multiple transient banks, staging wave $r+1$ may overlap computation of
+wave $r$.
+
+Figure~\ref{fig:architecture} separates these two expert paths. An expert
+execution instance is associated with one pre-established bank binding; the
+runtime never retargets one captured graph to a different allocation. The
+persistent expert piece therefore continues to reference its capture-time
+binding, while overflow execution selects among fixed transient banks in the
+eager wave path. In both cases the seam may change slot contents and the active
+binding $\beta_r$, but it does not reallocate the selected bank.
+
+\begin{figure*}[!t]
   \centering
   \includegraphics[width=\textwidth]{figures/latchmoe_architecture.pdf}
-  \Description{LatchMoE system architecture spanning host DRAM and an Ascend
-  NPU. The host control plane and pinned expert store feed an uncaptured,
-  replay-boundary staging seam; asynchronous H2D waves publish a logical to
-  physical slot map into a captured slot bank, which drives a captured fused
-  MoE kernel. A compact versioned-lease timeline orders publication and reuse.}
-  \caption{\system separates dynamic control from graph-visible data. The host
-  control plane computes routing and wave plans while pinned expert weights
-  remain outside the captured region. At the replay boundary, staging checks
-  capacity and transfers misses; the captured NPU region sees only the fixed
-  slot bank, its logical-to-slot map, and stable addresses feeding the fused
-  routed-MoE kernel. The versioned lease at the bottom permits overlap while
-  publishing only after a transfer is ready and reusing a bank only after its
-  consumer lease is done.}
+  \Description{LatchMoE routes once and plans the complete routed expert set.
+  A fitting invocation stages into a persistent bank consumed by its captured
+  expert piece. An overflowing invocation executes complete waves from fixed
+  transient banks, then restores all wave outputs before native composition.}
+  \caption{\system's route--plan--execute model. The persistent replay path is
+  bound to one capture-time bank allocation. Overflow prefill uses complete
+  waves in fixed transient banks rather than rebinding that captured piece.
+  Both paths preserve the original routed pairs for one native composition.}
   \label{fig:architecture}
 \end{figure*}
 
-Three mechanisms realize this model: replay-stable slots decouple residency
-from addresses; pipelined waves reuse bounded storage; and versioned leases
-order transfer, publication, computation, and reuse.
+Correct execution rests on four invariants.
 
-\subsection{Capability-Driven Semantic Contract}
-\label{sec:capability-contract}
+\begin{enumerate}[leftmargin=*, nosep]
+\item \textbf{Stable replay bindings.} The persistent bank's weight buffers
+  $\mathcal{S}$ and indirection buffer $\mathcal{M}$ retain the same
+  allocations across capture and replay. Once allocated, transient banks are
+  reused in place, but are not rebound into the captured expert path.
+\item \textbf{Publish after readiness.} An active binding
+  $\beta_r(e)=s$ becomes consumable only after the weights of expert $e$ are
+  ready in slot $s$ for the current ownership version.
+\item \textbf{Reuse after completion.} A slot cannot start its next ownership version until
+  computation using its current version has completed.
+\item \textbf{Exact routed semantics.} Every pair in $P$ executes exactly once
+  with its original expert ID, top-$k$ position, and routing weight, even when
+  $P$ is divided across waves.
+\end{enumerate}
 
-\paragraph{Capability descriptor.}
-Before selecting the seam, \system materializes a serializable descriptor for
-each managed layer. The descriptor records (i) the output contract; (ii) the
-shared-expert representation and activation mode; (iii) whether routing logits
-are externally supplied or produced by an internal gate; (iv) all top-$k$,
-grouping, scoring, bias, normalization, and scaling parameters; (v) the owner
-of final combination; and (vi) weight, parallelism, and overlap modes. The
-selection rule uses this tuple rather than a model allowlist. Routed-only and
-externally shared-expert layers select distinct, fixed return schemas, avoiding
-a data-dependent captured type.
+Together, the first invariant makes persistent placement changes compatible
+with replay; the next two make asynchronous storage reuse safe on both paths;
+the last preserves native MoE computation under capacity pressure.
 
-\paragraph{Fail-closed selection.}
-The seam is enabled only when every descriptor field belongs to an implemented
-profile. Unknown router adapters, unregistered or mismatched fused
-shared/routed placement, quantized weights, multi-NPU execution, and
-shared-expert overlap are rejected before capture with the full descriptor and
-blocker list; rejection never silently chooses an eager or monolithic path.
-Manifests therefore identify the exact accepted tuple.
+\subsection{Stable Replay Bindings and Bounded Storage}
+\label{sec:design-interface}
 
-\subsection{Replay-Stable Dual-Lane Storage}
-\label{sec:dual-lane-storage}
+\paragraph{Expose routing without changing it.}
+Staging cannot start until the active logical experts are known, but a
+monolithic fused MoE operation hides selection inside the captured operation.
+\system therefore relocates native selection into the first captured piece
+rather than predicting or reimplementing it. This piece invokes the model's
+native router with its configured parameters and emits the selected IDs and
+weights. The seam may inspect IDs to plan waves and residency, but it cannot
+add, drop, or rewrite routed entries. Both tensors continue unchanged to expert
+execution, so routing is evaluated once and retains the model's native
+decision.
 
-Routed experts form a dynamic lane. For each managed layer, \system retains
-their $W_{13}$ and $W_2$ weights in a CPU-first
-host store and allocates two contiguous device tensors containing a bounded
-number of physical expert slots. A persistent tensor maps each logical routed
-expert ID to a slot ID. The slot tensors and mapping allocation survive capture
-and replay; replacement changes only slot contents and mapping values.
+\paragraph{Storage roles.}
+Routed weights remain available in a host expert store. Each managed layer has
+a layer-private persistent bank that preserves expert residency across
+invocations, especially during decode. Overflow waves use transient banks as
+bounded scratch storage, so staging a large prefill working set need not evict
+the persistent working set. Compatible layers may share the transient-bank
+pool because their executions are serial, whereas persistent banks remain
+layer-private to retain temporal reuse.
 
-The shared lane remains device-resident because it contributes to every
-applicable token; caching it would consume capacity without sparsity and repeat
-shared computation in each overflow wave. Its bytes are charged separately in
-the memory ledger, while capacity, victim, and wave decisions cover only routed
-experts.
+The banks do not form one global slot namespace. The persistent bank and each
+transient bank expose separate fixed weight buffers and bank-local addressing;
+a plan selects one such pre-established binding and uses slot IDs local to that
+bank. The captured expert piece is bound only to the persistent bank selected
+at capture; choosing transient Bank A or B selects the eager wave path against
+that fixed bank rather than rebinding the captured piece. Reassignment changes
+buffer contents, ownership metadata, and active indirection values, but not
+bank allocations. Logical IDs are also layer-local: equal numeric IDs in
+different layers do not imply shared weights or residency.
 
-Each routed slot records a logical owner, a monotonically increasing version,
-a state, and its last-use step. A \emph{lease} is the tuple (slot ID, logical
-expert, version). The version distinguishes ownership intervals that reuse the
-same physical address. The central storage invariant is therefore stronger
-than pointer stability: captured computation may consume a routed slot only
-through a mapping published for a ready lease, while the shared lane retains a
-fixed owner and allocation throughout replay.
+The shared expert, when present, follows a separate lane. Because it is used by
+every applicable token, \system leaves it device-resident and executes it once
+per invocation. It neither consumes routed-slot capacity nor participates in
+victim selection or wave partitioning.
 
-\subsection{Semantics-Preserving Router Decomposition}
-\label{sec:router-decomposition}
+\paragraph{Stage, then publish.}
+After the router piece completes, the runtime first inspects the complete
+routed set $E(P)$ to determine persistent hits, detect overflow, partition
+waves, and select their execution banks. Materialization is then local to the
+current route or wave rather than to all of $E(P)$. On the fitting replay path,
+a ready hit retains its persistent slot; for a miss, the runtime selects a
+reassignable persistent slot, removes its previous owner from the authoritative
+residency metadata, advances its ownership version, and starts the H2D weight
+transfer.
 
-The staging decision is known only after routing, yet a monolithic fused-MoE
-operation hides expert selection from the graph partitioner. \system therefore
-relocates, rather than reimplements, the selection step into a captured router
-operation. For an external-logit layer, the operation consumes the original
-router logits. For an internal-gate layer, it first invokes the same gate on
-the same hidden states. It then calls the native selector with the layer's
-top-$k$, grouping, scoring function, renormalization flag, correction bias,
-routed scaling factor, and logical expert count.
+On the overflow path, every expert in $E_r$ is assigned a bank-local transient
+slot so that one bank supplies the complete wave. A persistent hit is copied
+device-to-device into that slot, whereas a miss is copied from the host store.
+The transient slot's ownership version advances in either case. Only after all
+required transfer dependencies are satisfied and each slot still matches its
+issued owner and version does the runtime mark the binding ready and publish
+$\beta_r$, making its bank-local slot IDs consumable by expert execution.
 
-The router emits the original top-$k$ IDs and weights. The eager boundary uses
-only IDs to plan residency and cannot edit either tensor. Captured expert
-computation injects both into the native apply path, so selection occurs once.
-The seam relocates routing without approximating its mathematical decision.
+On the replay path, the device indirection buffer is a consumption interface,
+not the authoritative residency directory. Its entries outside the active
+route are unspecified and may retain values from an earlier invocation because
+captured computation cannot reach them. On the overflow path, $\beta_r$ is
+instead encoded by the current wave's bank-local slot IDs. Thus, for either
+interface, only bindings reachable by the current expert operation must be
+valid; inactive entries are semantically irrelevant. Before execution, every
+active $\beta_r(e)=s$ must name a ready slot with a matching owner and version.
+Publishing an active binding before readiness could expose partially
+transferred weights; accepting completion for another ownership interval could
+publish the wrong expert. Hits and misses nevertheless leave the seam through
+the same bank-local storage contract.
 
-Output semantics remain native: the routed-only contract returns one tensor,
-whereas the shared-expert contract returns the expected fixed pair. The native
-runner retains shared gating, routed scaling, output transforms, and final
-addition; \system owns only residency and ordering.
+\subsection{Exact Execution beyond Slot Capacity}
+\label{sec:design-waves}
 
-\subsection{Replay-Boundary Staging and Safe Publication}
-\label{sec:staging}
+Stable bindings alone do not handle an invocation whose routed working set
+exceeds $C$. Let $E=E(P)$. When $|E|>C$, \system partitions the expert set into
+$E_1,\ldots,E_m$ and derives each wave's routed pairs:
+\begin{equation}
+\begin{aligned}
+  &\bigcup_{r=1}^{m} E_r=E, \qquad
+  E_r\cap E_q=\varnothing\ (r\ne q), \qquad |E_r|\le C,\\
+  &P_r=\{(i,e,j,w)\in P\mid e\in E_r\}.
+\end{aligned}
+\end{equation}
+Thus, all pairs for one expert remain in the same wave, and every pair in $P$
+belongs to exactly one $P_r$. The partitioner may change expert execution
+order, but not pair membership, top-$k$ positions, or routing weights. This is
+tiling the expert dimension rather than approximating routing semantics.
 
-After the captured router completes, the eager staging boundary deduplicates
-the routed IDs and asks a placement policy for an ordering. The returned plan
-must be a permutation of the actual routed set: it may prioritize a hit,
-predicted reuse, or transfer cost, but it cannot add an unrouted expert or omit
-a routed expert. Hits retain their current leases. For a miss, the transfer
-engine selects a reassignable slot, increments its version, installs the new
-logical owner, copies $W_{13}$ and $W_2$ on a dedicated H2D stream, and records
-a readiness event.
+Once overflow selects multi-wave execution, each $E_r$ is materialized in full
+in one transient bank. Ready experts are copied from the persistent bank and
+misses from the host store; expert computation never mixes weights from both
+banks within one wave. This deliberate D2D copy preserves one coherent
+bank-local binding and leaves persistent cache residency undisturbed. Since
+each wave contains at most $C$ experts, bounded scratch storage can be reused
+to cover the larger routed set.
 
-Publication follows a strict happens-before order. The runtime first checks
-that the slot still matches the issued lease. It then makes the consumer stream
-wait for the readiness event, transitions the slot to ready, and only afterward
-updates the persistent logical-to-slot mapping. Publishing earlier would allow
-captured compute to observe either partially transferred weights or a
-completion event from an old owner. Hits and misses leave the boundary through
-the same address-stable interface, so the subsequent graph piece does not
-encode how a routed expert became resident.
+Each wave computes only its assigned pairs and records their original pair
+positions. After all waves finish, \system reassembles the routed contributions
+at those positions and invokes the model's native composition path with the
+original weights and output shape. The shared lane, if present, is computed
+once and combined only after the routed contribution is complete. Consequently,
+wave boundaries do not duplicate shared work or change model-specific routed
+scaling, reduction, or postprocessing. Coverage validation treats a missing or
+duplicate pair as an execution error.
 
-The stage is an explicit graph split point: capture fixes the router and MLP
-pieces while permitting routing-dependent host work between them. Pointer
-checks cover the slot banks and map; the descriptor fixes the operator schema.
+For example, with $C=2$, the routed set $\{e_2,e_5,e_8\}$ requires at least
+two waves. Every expert's routed pairs remain intact within one wave and are
+restored to their original positions before native composition.
 
-\subsection{Versioned Transfer--Compute Lifecycle}
-\label{sec:lifecycle}
+\subsection{Safe Transfer--Compute Overlap}
+\label{sec:design-lifecycle}
 
-Address stability alone does not make asynchronous reuse safe. A slot moves
-through four externally visible states: \emph{empty}, \emph{loading},
-\emph{ready}, and \emph{computing}. Only empty or ready slots may be selected
-for a new owner. Before routed computation begins, the runtime acquires leases
-for all referenced slots and marks them computing. A compute event protects
-those leases until the consumer stream finishes; release again verifies owner
-and version before returning each slot to ready.
+Serially staging every wave would expose transfer latency. \system overlaps
+the transfer of wave $k+1$ into Bank B with computation of wave $k$ from Bank
+A, as shown in Figure~\ref{fig:lifecycle}(a). Bank A can then receive wave
+$k+2$, but only after wave $k$ has stopped reading it. The same rule applies to
+individual persistent slots and to whole transient banks.
 
-Two temporal invariants follow: version validation prevents a stale transfer
-from publishing, and excluding computing slots prevents in-flight overwrite.
-The same lease protocol protects transient prefill stage banks:
-bank $b$ cannot receive wave $k+2$ until the compute event for wave $k$ has
-released its leases. Lifecycle violations are surfaced as run failures rather
-than being hidden by fallback.
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/latchmoe_lifecycle.pdf}
+  \Description{The upper panel shows transfer of wave k plus one into Bank B
+  overlapping computation of wave k from Bank A. Bank A is reused for wave k
+  plus two only after wave k completes. The lower panel orders assignment,
+  loading, readiness, publication, computation, completion, and reassignment.}
+  \caption{Versioned leases order asynchronous staging and bounded reuse.
+  (a) Two banks pipeline consecutive waves; a bank's next transfer waits for
+  its previous compute completion. (b) The active binding is published only
+  after transfer readiness and consumed only after publication; reassignment
+  waits until no computation holds the current lease.}
+  \label{fig:lifecycle}
+\end{figure*}
 
-More precisely, for lease $\ell=(s,e,v)$, replay requires the address of slot
-$s$ to remain constant. Publishing $\ell$ requires
-$\operatorname{ready}(s,e,v)$; reassigning $s$ at version $v+1$ requires
-$\operatorname{done}(s,e,v)$. Owner/version validation binds both events to the
-same ownership interval, so unrelated completions cannot authorize publication
-or reuse.
+Each slot carries a fixed device-buffer address and mutable
+$(\mathit{owner},\mathit{version},\mathit{state})$ metadata. Its state is one
+of \emph{empty}, \emph{loading}, \emph{ready}, or \emph{computing}. Assignment
+of expert $e$ to slot $s$ advances the version to $g$, enters loading, and
+returns a readiness event for the lease
+$\lambda=(s,e,g)$. A loading slot is never selected for another assignment.
+When the transfer-completion dependency is satisfied, the runtime validates
+$\lambda$, enters ready, and may publish the active binding. Expert
+computation starts only after that publication, acquires the ready lease, and
+moves it to computing. Here,
+\emph{computing} denotes one outstanding expert-operation lease for the current
+slot version; that operation may contain routed pairs from several batched
+requests. A subsequent operation cannot acquire or reassign the slot until the
+completion event returns it to ready. The slot does not become empty merely
+because one use completes, since retaining its owner enables a future cache
+hit.
 
-\subsection{Shared-Aware Capacity-Bounded Composition}
-\label{sec:waves}
+The protocol imposes the following happens-before relations:
+\begin{equation}
+\begin{aligned}
+  \operatorname{ready}(s,e,g) &\prec
+  \operatorname{publish}(\beta_r(e)=s)
+  \prec \operatorname{compute}(s,e,g), \\
+  \operatorname{done}(s,e,g) &\prec
+  \operatorname{assign}(s,e',g+1).
+\end{aligned}
+\end{equation}
+The first chain prevents incomplete or unpublished weights from being
+consumed. The second prevents a new transfer from overwriting weights still
+consumed by a kernel.
+Normal scheduling therefore reassigns neither loading nor computing storage.
+Owner/version checks additionally reject a delayed event from an earlier
+ownership interval instead of allowing it to authorize publication or reuse.
 
-Prefill can route a batch of tokens to more distinct routed experts than fit in
-the slot budget. Let $P$ be the flattened set of routed token--expert pairs,
-including each pair's original top-$k$ position and weight. \system partitions
-$P$ into waves $P_1,\ldots,P_m$ such that each wave requires no more routed
-experts than a stage bank can hold. Pair membership and routing weights are
-immutable. Hit-only work may execute from persistent slots, while miss waves
-use transient banks governed by the same lease rules.
+At bank granularity, the same lease rule gives a simple pipeline. Transfer
+into Bank B may proceed while Bank A is computing because the banks are
+disjoint. Reusing Bank A for wave $k+2$ waits specifically for the completion
+event of wave $k$; it need not serialize on unrelated work in Bank B. This
+coordination exposes exactly the dependencies needed for safety while leaving
+independent transfer and compute eligible to overlap.
 
-Each wave computes routed outputs while preserving pair positions. After all
-waves, \system constructs one global native unpermute index and invokes routed
-combine once with the original weights and shape. Coverage validation rejects
-missing or duplicate pairs; single recombination preserves reduction and
-model-specific postprocessing semantics.
+\subsection{Design Boundary}
+\label{sec:design-boundary}
 
-Shared work remains outside the partition and is combined once with the fully
-reconstructed routed contribution. With multiple transient banks, transfer may
-populate wave $k+1$ while wave $k$ computes without changing routing or final
-combination. The storage cost is bounded; Section~\ref{sec:evaluation} measures
-whether compute hides transfer.
-
-\subsection{Policy Boundary and Qualification Scope}
-\label{sec:policy-neutral}
-
-The data plane exposes only a constrained placement-plan interface: layer ID,
-complete routed set, and a valid ordering. The default policy preserves
-first-seen order; another policy may reorder staging but must obey the same
-capacity, publication, and lifecycle invariants. This boundary lets policy
-studies reuse one execution substrate without making prediction quality part
-of the correctness argument.
-
-The design covers single-NPU unquantized BF16 execution, with either no shared
-expert, an externally represented resident shared lane, or a registered fused
-shared suffix, and supported external-logit or internal-gate selectors. This
-ABI alone does not establish correctness or performance for every accepted
-model; each tuple still requires router/boundary parity, exact outputs, replay
-evidence, and matched runs.
-Section~\ref{sec:evaluation} reports the qualified boundary.
+\system separates execution correctness from placement quality. A placement
+policy may choose residency, wave membership, and execution order only over the
+complete routed expert set; it cannot add or remove routed experts or alter
+capacity constraints, publication, or lease rules. The split interface is
+enabled only for supported router, shared-expert, and output contracts, while
+unsupported contracts are rejected rather than approximated. Concrete
+combinations of model and runtime still require semantic and replay
+qualification, which Section~\ref{sec:evaluation} reports.
