@@ -1,29 +1,60 @@
 from __future__ import annotations
 
 import json
+from importlib import resources
 from pathlib import Path
+
+import tomllib
 
 import vllm_moe_offload_ascend as plugin
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_general_plugin_entry_point_is_declared() -> None:
     config = (REPO_ROOT / "pyproject.toml").read_text()
 
-    assert '[project.scripts]' in config
+    assert "[project.scripts]" in config
     assert 'latchmoe = "vllm_moe_offload_ascend.launcher:main"' in config
     assert '[project.entry-points."vllm.general_plugins"]' in config
     assert '[project.entry-points."vllm.platform_plugins"]' not in config
-    assert (
-        'moe_offload_ascend = "vllm_moe_offload_ascend:register"' in config
+    assert 'moe_offload_ascend = "vllm_moe_offload_ascend:register"' in config
+
+
+def test_extension_manager_registration_is_static_and_project_owned() -> None:
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+
+    registrations = config["project"]["entry-points"]["vllm_hust.extension_bundles"]
+    assert registrations == {"org.vllm-hust.latchmoe": "vllm_moe_offload_ascend"}
+
+
+def test_extension_manager_manifest_preserves_runtime_boundary() -> None:
+    path = resources.files("vllm_moe_offload_ascend").joinpath(
+        "vllm-hust-extension-v0.2.json"
     )
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+
+    assert manifest["schema_version"] == "0.2-experimental"
+    assert manifest["extension_id"] == "org.vllm-hust.latchmoe"
+    assert manifest["kind"] == "in_process_plugin"
+    assert manifest["host"] == {
+        "provider": "vllm",
+        "name": "vllm",
+        "version_range": "==0.21.0",
+    }
+    assert manifest["runtime"]["process_scope"] == "vllm-ascend-worker"
+    assert manifest["lifecycle_owner"] == "vllm"
+    assert manifest["requires_services"] == []
+    assert manifest["protocols"] == [
+        {
+            "name": "vllm.ascend.moe-offload-seam",
+            "version_range": ">=1,<2",
+        }
+    ]
 
 
 def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
-    manifest = json.loads(
-        (REPO_ROOT / ".vllm-hust" / "optimization.json").read_text()
-    )
+    manifest = json.loads((REPO_ROOT / ".vllm-hust" / "optimization.json").read_text())
 
     assert manifest["schema_version"] == 1
     assert manifest["id"] == "latchmoe"

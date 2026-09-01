@@ -1,0 +1,64 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.latchmoe",
+  "extension_version": "0.1.0",
+  "kind": "in_process_plugin",
+  "host": {
+    "provider": "vllm",
+    "name": "vllm",
+    "version_range": "==0.21.0"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-ascend-worker",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {
+      "name": "vllm.ascend.moe-offload-seam",
+      "version_range": ">=1,<2"
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_entry_point",
+      "group": "vllm.general_plugins",
+      "name": "moe_offload_ascend"
+    }
+  ],
+  "requires_services": [],
+  "components": [
+    {
+      "component_id": "moe-offload-runtime",
+      "contracts": [
+        "vllm.ascend.moe-offload.v1"
+      ],
+      "execution_planes": [
+        "worker",
+        "device"
+      ],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm_moe_offload_ascend:register",
+      "permissions": [
+        "device_access",
+        "filesystem_read",
+        "filesystem_write"
+      ]
+    }
+  ],
+  "activation": {
+    "entry_points": [
+      {
+        "group": "vllm.general_plugins",
+        "name": "moe_offload_ascend"
+      }
+    ],
+    "environment": {
+      "VLLM_ASCEND_MOE_OFFLOAD_GB": "14",
+      "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
+      "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1"
+    },
+    "additional_config": {}
+  }
+}

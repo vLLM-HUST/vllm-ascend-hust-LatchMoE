@@ -73,6 +73,23 @@ does not alias plugin modules into the `vllm_ascend.*` namespace. The target
 model, OpenAI-compatible API, and scheduler semantics are untouched;
 uninstalling the plugin restores stock behavior.
 
+LatchMoE also publishes a static Extension Manager manifest under the
+project-owned `vllm_hust.extension_bundles` namespace. Discovery reads package
+metadata only and does not import or activate the runtime. The Manager records
+LatchMoE as a trusted in-process vLLM-Ascend worker extension; vLLM remains the
+lifecycle owner and the `latchmoe` launcher remains responsible for the strict
+environment check and for rejecting prefix caching.
+
+```bash
+pip install vllm-hust-ext vllm-moe-offload-ascend
+vllm-hust-ext extension check org.vllm-hust.latchmoe
+vllm-hust-ext extension enable org.vllm-hust.latchmoe
+vllm-hust-ext run -- latchmoe serve /path/to/model
+```
+
+The check must be supplied with evidence for MoE offload seam ABI 1. A matching
+vLLM version alone does not prove that the required vLLM-Ascend seam is present.
+
 ---
 
 ## Qualified Graph Result
