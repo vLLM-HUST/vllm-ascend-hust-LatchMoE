@@ -29,9 +29,15 @@ latchmoe = "vllm_moe_offload_ascend.launcher:main"
 [project.entry-points."vllm.general_plugins"]
 moe_offload_ascend = "vllm_moe_offload_ascend:register"
 
+[project.entry-points."vllm_hust.extension_bundles"]
+"org.vllm-hust.latchmoe" = "vllm_moe_offload_ascend"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_moe_offload_ascend*"]
 
 [tool.setuptools.package-data]
-vllm_moe_offload_ascend = ["compatibility.lock"]
+vllm_moe_offload_ascend = [
+    "compatibility.lock",
+    "vllm-hust-extension-v0.2.json",
+]
