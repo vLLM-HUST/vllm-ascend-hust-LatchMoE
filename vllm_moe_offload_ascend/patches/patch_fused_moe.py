@@ -4966,21 +4966,32 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         if not runtime.config.offload_stage_seam:
             return original_select_forward(self)
         if self._seam_config_guards_pass():
-            decision = self._resolve_seam_per_layer_guards()
-            self._seam_active = decision
-            if decision:
-                return self._seam_forward_entry
-            support = getattr(self, "_seam_capability_support", None)
-            blockers = getattr(support, "blockers", ())
-            blocker_text = ",".join(str(blocker) for blocker in blockers)
-            raise RuntimeError(
-                "LatchMoE offload-stage seam rejected the materialized layer "
-                f"capability (blockers={blocker_text or 'unresolved'}); refusing "
-                "native/eager fallback"
-            )
+            self._seam_active = None
+            return self._seam_forward_entry
         raise RuntimeError(
             "LatchMoE offload-stage seam was requested with an unsupported "
             "global configuration; refusing native/eager fallback"
+        )
+
+    def _finalize_seam_after_registration(self) -> None:
+        """Resolve layer capabilities after core publishes the runner lookup.
+
+        ``MoERunner.__init__`` selects its forward before calling
+        ``register_layer_for_moe_forward_op``.  Resolving any earlier therefore
+        produces an unresolvable layer; resolving on the first forward instead
+        leaks Python capability and error construction into the compiled graph.
+        """
+        decision = self._resolve_seam_per_layer_guards()
+        self._seam_active = decision
+        if decision:
+            return
+        support = getattr(self, "_seam_capability_support", None)
+        blockers = getattr(support, "blockers", ())
+        blocker_text = ",".join(str(blocker) for blocker in blockers)
+        raise RuntimeError(
+            "LatchMoE offload-stage seam rejected the materialized layer "
+            f"capability (blockers={blocker_text or 'unresolved'}); refusing "
+            "native/eager fallback"
         )
 
     def _seam_forward_entry(
@@ -5335,8 +5346,34 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
     cls._seam_config_guards_pass = _seam_config_guards_pass
     cls._select_forward = _select_forward
     cls._seam_forward_entry = _seam_forward_entry
+    cls._finalize_seam_after_registration = _finalize_seam_after_registration
     cls._resolve_seam_per_layer_guards = _resolve_seam_per_layer_guards
     cls._ascend_moe_offload_seam_patch = True
+
+    try:
+        moe_runner_module = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
+        )
+        register_layer = moe_runner_module.register_layer_for_moe_forward_op
+    except Exception:
+        return
+    if getattr(register_layer, "_latchmoe_post_registration_patch", False):
+        return
+
+    def _register_layer_then_finalize(vllm_config, runner):
+        result = register_layer(vllm_config, runner)
+        if isinstance(runner, cls):
+            from vllm_moe_offload_ascend.moe_offload.runtime import (
+                get_moe_offload_runtime,
+            )
+
+            if get_moe_offload_runtime().config.offload_stage_seam:
+                runner._finalize_seam_after_registration()
+        return result
+
+    _register_layer_then_finalize._latchmoe_post_registration_patch = True
+    _register_layer_then_finalize.__wrapped__ = register_layer
+    moe_runner_module.register_layer_for_moe_forward_op = _register_layer_then_finalize
 
 
 def _patch_platform_autoconfig() -> None:

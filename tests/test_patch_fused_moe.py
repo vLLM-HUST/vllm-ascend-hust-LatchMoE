@@ -3252,8 +3252,8 @@ def test_seam_v2_unquantized_patch_does_not_require_legacy_selector():
     assert not hasattr(module, "select_experts")
 
 
-def test_seam_selection_resolves_capability_before_graph_forward(monkeypatch):
-    """Capability discovery must not execute inside the compiled model graph."""
+def test_seam_selection_finalizes_capability_before_graph_forward(monkeypatch):
+    """Capability discovery is finalized after registration, outside the graph."""
     from vllm_moe_offload_ascend.patches import patch_fused_moe
     import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
 
@@ -3277,12 +3277,19 @@ def test_seam_selection_resolves_capability_before_graph_forward(monkeypatch):
     )
     runner = FakeRunner()
     runner._seam_config_guards_pass = lambda: True
-    runner._resolve_seam_per_layer_guards = lambda: True
+    resolve_calls = []
+    runner._resolve_seam_per_layer_guards = lambda: resolve_calls.append(True) or True
 
     selected = runner._select_forward()
 
     assert selected == runner._seam_forward_entry
+    assert runner._seam_active is None
+    assert resolve_calls == []
+
+    runner._finalize_seam_after_registration()
+
     assert runner._seam_active is True
+    assert resolve_calls == [True]
 
 # ---------------------------------------------------------------------------
 # L3: seam guard returns False when layer_id is missing
