@@ -3253,7 +3253,7 @@ def test_seam_v2_unquantized_patch_does_not_require_legacy_selector():
 
 
 def test_seam_selection_finalizes_capability_before_graph_forward(monkeypatch):
-    """Capability discovery is finalized after registration, outside the graph."""
+    """Capability discovery is finalized after weights, outside the graph."""
     from vllm_moe_offload_ascend.patches import patch_fused_moe
     import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
 
@@ -3286,7 +3286,7 @@ def test_seam_selection_finalizes_capability_before_graph_forward(monkeypatch):
     assert runner._seam_active is None
     assert resolve_calls == []
 
-    runner._finalize_seam_after_registration()
+    runner._finalize_seam_before_compile()
 
     assert runner._seam_active is True
     assert resolve_calls == [True]

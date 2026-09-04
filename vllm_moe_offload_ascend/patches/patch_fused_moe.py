@@ -910,6 +910,27 @@ def _patch_model_runner_profile_context() -> None:
             if not is_profile:
                 return _original(self, *args, **kwargs)
 
+            # Weight loading has completed and compilation has not started at
+            # this boundary.  Freeze every MoE seam here: constructor-time
+            # lookup lacks both the serving ForwardContext and routed-expert
+            # layer IDs, while first-forward lookup is already inside Dynamo.
+            vllm_config = getattr(self, "vllm_config", None)
+            compilation_config = getattr(vllm_config, "compilation_config", None)
+            static_context = getattr(
+                compilation_config,
+                "static_forward_context",
+                {},
+            )
+            for runner in tuple(static_context.values()):
+                finalize = getattr(runner, "_finalize_seam_before_compile", None)
+                if not callable(finalize) or getattr(runner, "_seam_active", None) is not None:
+                    continue
+                routed_experts = getattr(runner, "routed_experts", None)
+                layer_id = int(getattr(routed_experts, "layer_id", -1))
+                if layer_id >= 0:
+                    runner.layer_id = layer_id
+                finalize()
+
             from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
                 reset_moe_offload_profile_run_active,
                 set_moe_offload_profile_run_active,
@@ -4973,13 +4994,14 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             "global configuration; refusing native/eager fallback"
         )
 
-    def _finalize_seam_after_registration(self) -> None:
-        """Resolve layer capabilities after core publishes the runner lookup.
+    def _finalize_seam_before_compile(self) -> None:
+        """Resolve layer capabilities after weights and before compilation.
 
         ``MoERunner.__init__`` selects its forward before calling
-        ``register_layer_for_moe_forward_op``.  Resolving any earlier therefore
-        produces an unresolvable layer; resolving on the first forward instead
-        leaks Python capability and error construction into the compiled graph.
+        ``register_layer_for_moe_forward_op``.  That registration still cannot
+        be queried without a serving ForwardContext, and routed-expert layer IDs
+        are assigned during weight processing.  The profile boundary supplies
+        both while remaining outside Dynamo.
         """
         decision = self._resolve_seam_per_layer_guards()
         self._seam_active = decision
@@ -5254,7 +5276,10 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         try:
             layer = get_layer_from_name(self.layer_name)
         except Exception:
-            return False
+            # Pre-compile qualification intentionally runs without a serving
+            # ForwardContext.  At that point ``self`` is the same registered
+            # MoERunner that get_layer_from_name returns during a real forward.
+            layer = self
         self._seam_layer_id = int(getattr(layer, "layer_id", -1))
         if self._seam_layer_id < 0:
             # Layer lacks a layer_id attribute; the seam cannot safely key its
@@ -5346,34 +5371,9 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
     cls._seam_config_guards_pass = _seam_config_guards_pass
     cls._select_forward = _select_forward
     cls._seam_forward_entry = _seam_forward_entry
-    cls._finalize_seam_after_registration = _finalize_seam_after_registration
+    cls._finalize_seam_before_compile = _finalize_seam_before_compile
     cls._resolve_seam_per_layer_guards = _resolve_seam_per_layer_guards
     cls._ascend_moe_offload_seam_patch = True
-
-    try:
-        moe_runner_module = importlib.import_module(
-            "vllm.model_executor.layers.fused_moe.runner.moe_runner"
-        )
-        register_layer = moe_runner_module.register_layer_for_moe_forward_op
-    except Exception:
-        return
-    if getattr(register_layer, "_latchmoe_post_registration_patch", False):
-        return
-
-    def _register_layer_then_finalize(vllm_config, runner):
-        result = register_layer(vllm_config, runner)
-        if isinstance(runner, cls):
-            from vllm_moe_offload_ascend.moe_offload.runtime import (
-                get_moe_offload_runtime,
-            )
-
-            if get_moe_offload_runtime().config.offload_stage_seam:
-                runner._finalize_seam_after_registration()
-        return result
-
-    _register_layer_then_finalize._latchmoe_post_registration_patch = True
-    _register_layer_then_finalize.__wrapped__ = register_layer
-    moe_runner_module.register_layer_for_moe_forward_op = _register_layer_then_finalize
 
 
 def _patch_platform_autoconfig() -> None:
