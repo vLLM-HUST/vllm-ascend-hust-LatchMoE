@@ -200,6 +200,14 @@ def _moe_router_indirect_impl(
     from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 
     layer = get_layer_from_name(layer_name)
+    # Seam ABI 2 returns the MoERunner itself and makes its router the sole
+    # owner of selection. ABI 1 returned a layer facade with scalar routing
+    # fields and an optional ``runner`` back-link.
+    runner = layer if getattr(layer, "router", None) is not None else getattr(
+        layer, "runner", None
+    )
+    router = getattr(runner, "router", None)
+    selection_source = router if router is not None else layer
 
     if os.environ.get("SEW_DECODE_PROBE"):
         _PROBE_CALLS["router_indirect"] += 1
@@ -212,7 +220,7 @@ def _moe_router_indirect_impl(
 
     # custom_routing_function is a Callable and cannot cross an op boundary; the
     # seam path is only selected when it is None (guarded in _select_forward).
-    assert getattr(layer, "custom_routing_function", None) is None, (
+    assert getattr(selection_source, "custom_routing_function", None) is None, (
         "moe_router seam requires custom_routing_function=None"
     )
 
@@ -225,13 +233,19 @@ def _moe_router_indirect_impl(
     # gate module, same input) into the captured router piece -- NOT a router-
     # semantics change. _forward_impl recomputes the identical logits later; the
     # B1 topk injection makes that recompute dead weight on the seam path.
-    runner = getattr(layer, "runner", None)
     gate = getattr(runner, "gate", None)
     if gate is not None:
         router_logits, _ = gate(hidden_states)
 
-    num_shared_experts = getattr(layer, "n_shared_experts", 0) or 0
-    mix_placement = bool(getattr(layer, "mix_placement", False))
+    routed_experts = getattr(runner, "routed_experts", None)
+    num_shared_experts = (
+        getattr(routed_experts, "n_shared_experts", None)
+        or getattr(layer, "n_shared_experts", 0)
+        or 0
+    )
+    mix_placement = bool(
+        getattr(routed_experts, "mix_placement", getattr(layer, "mix_placement", False))
+    )
     num_logical_experts = get_moe_num_logical_experts(
         layer,
         layer.moe_config.num_experts,
@@ -244,25 +258,28 @@ def _moe_router_indirect_impl(
     # output.  The native apply path uses this preserved value, so the seam
     # must use it as well to keep router weights bit-for-bit aligned.
     routed_scaling_factor = getattr(
-        layer,
+        selection_source,
         "_original_routed_scaling_factor",
-        getattr(layer, "routed_scaling_factor", 1.0),
+        getattr(selection_source, "routed_scaling_factor", 1.0),
     )
-    topk_weights, topk_ids = _moe_router_impl(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        top_k=layer.top_k,
-        use_grouped_topk=layer.use_grouped_topk,
-        renormalize=layer.renormalize,
-        topk_group=layer.topk_group,
-        num_expert_group=layer.num_expert_group,
-        scoring_func=layer.scoring_func,
-        routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=layer.e_score_correction_bias,
-        num_experts=num_logical_experts,
-        mix_placement=mix_placement,
-        num_shared_experts=num_shared_experts,
-    )
+    if router is not None:
+        topk_weights, topk_ids = router.select_experts(hidden_states, router_logits)
+    else:
+        topk_weights, topk_ids = _moe_router_impl(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=selection_source.top_k,
+            use_grouped_topk=selection_source.use_grouped_topk,
+            renormalize=selection_source.renormalize,
+            topk_group=selection_source.topk_group,
+            num_expert_group=selection_source.num_expert_group,
+            scoring_func=selection_source.scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=selection_source.e_score_correction_bias,
+            num_experts=num_logical_experts,
+            mix_placement=mix_placement,
+            num_shared_experts=num_shared_experts,
+        )
     if os.getenv("VLLM_ASCEND_MOE_ROUTER_PARITY_PATH") and _capture_state() != "True":
         from vllm_moe_offload_ascend.moe_offload.router_parity import (
             record_router_snapshot,
@@ -288,21 +305,25 @@ def _moe_router_indirect_fake(
     )
 
     layer = get_layer_from_name(layer_name)
+    runner = layer if getattr(layer, "router", None) is not None else getattr(
+        layer, "runner", None
+    )
+    selection_source = getattr(runner, "router", None) or layer
     return _moe_router_fake(
         hidden_states=hidden_states,
         router_logits=router_logits,
-        top_k=layer.top_k,
-        use_grouped_topk=layer.use_grouped_topk,
-        renormalize=layer.renormalize,
-        topk_group=layer.topk_group,
-        num_expert_group=layer.num_expert_group,
-        scoring_func=layer.scoring_func,
+        top_k=selection_source.top_k,
+        use_grouped_topk=selection_source.use_grouped_topk,
+        renormalize=selection_source.renormalize,
+        topk_group=selection_source.topk_group,
+        num_expert_group=selection_source.num_expert_group,
+        scoring_func=selection_source.scoring_func,
         routed_scaling_factor=getattr(
-            layer,
+            selection_source,
             "_original_routed_scaling_factor",
-            getattr(layer, "routed_scaling_factor", 1.0),
+            getattr(selection_source, "routed_scaling_factor", 1.0),
         ),
-        e_score_correction_bias=layer.e_score_correction_bias,
+        e_score_correction_bias=selection_source.e_score_correction_bias,
         num_experts=layer.moe_config.num_experts,
         mix_placement=bool(getattr(layer, "mix_placement", False)),
         num_shared_experts=int(getattr(layer, "n_shared_experts", 0) or 0),

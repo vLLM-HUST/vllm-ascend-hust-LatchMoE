@@ -3230,6 +3230,67 @@ def test_moe_router_indirect_forwards_fused_shared_suffix_arguments(monkeypatch)
     assert calls[0]["num_shared_experts"] == 2
 
 
+def test_moe_router_indirect_delegates_to_seam_v2_router(monkeypatch):
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_router_op
+
+    calls = []
+
+    class Router:
+        top_k = 2
+        use_grouped_topk = False
+        renormalize = True
+        topk_group = None
+        num_expert_group = None
+        scoring_func = "softmax"
+        routed_scaling_factor = 1.0
+        e_score_correction_bias = None
+        custom_routing_function = None
+
+        def select_experts(self, hidden_states, router_logits):
+            calls.append((hidden_states, router_logits))
+            return (
+                torch.ones((4, 2), dtype=torch.bfloat16),
+                torch.zeros((4, 2), dtype=torch.int32),
+            )
+
+    runner = SimpleNamespace(
+        layer_id=7,
+        router=Router(),
+        gate=None,
+        routed_experts=SimpleNamespace(
+            n_shared_experts=0,
+            mix_placement=False,
+        ),
+        n_shared_experts=0,
+        mix_placement=False,
+        global_redundant_expert_num=0,
+        moe_config=SimpleNamespace(num_experts=64),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.runner.moe_runner.get_layer_from_name",
+        lambda _name: runner,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.quantization.methods.base.get_moe_num_logical_experts",
+        lambda *_args, **_kwargs: 64,
+    )
+    hidden = torch.zeros((4, 16), dtype=torch.bfloat16)
+    logits = torch.zeros((4, 64), dtype=torch.float32)
+
+    weights, ids = moe_router_op._moe_router_indirect_impl(
+        hidden,
+        logits,
+        "fixture.layer.experts",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is hidden
+    assert calls[0][1] is logits
+    assert weights.shape == ids.shape == (4, 2)
+
+
 def test_seam_v2_unquantized_patch_does_not_require_legacy_selector():
     """ABI 2 routes before apply; its weight/offload hook must install alone."""
     from vllm_moe_offload_ascend.patches import patch_fused_moe
