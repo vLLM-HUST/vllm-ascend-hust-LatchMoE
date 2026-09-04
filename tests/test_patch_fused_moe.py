@@ -679,10 +679,6 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
             return fake_layernorm
         return original_import_module(name, package)
 
-    fake_torch = ModuleType("torch")
-    fake_torch.ops = SimpleNamespace(
-        vllm=SimpleNamespace(maybe_chunk_residual=lambda _x, residual: residual)
-    )
     fake_torch_npu = ModuleType("torch_npu")
     fake_torch_npu.npu_add_rms_norm = lambda x, residual, weight, eps: (
         ("normalized", x, residual, weight, eps),
@@ -696,7 +692,6 @@ def test_cann_rmsnorm_fallback_avoids_missing_custom_op(monkeypatch):
 
     monkeypatch.setattr(importlib, "import_module", import_module)
     monkeypatch.setattr(patch_fused_moe, "_opapi_supports_add_rms_norm_bias", lambda: False)
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
 
     patch_fused_moe._patch_rms_norm_bias_cann_compat()

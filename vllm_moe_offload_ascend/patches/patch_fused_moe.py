@@ -534,10 +534,8 @@ def _patch_rms_norm_bias_cann_compat() -> None:
             if residual is None:
                 return _original(self, x, residual)
 
-            import torch
             import torch_npu
 
-            residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
             weight = 1.0 + self.weight if _is_gemma else self.weight
             x, _, residual = torch_npu.npu_add_rms_norm(
                 x,
