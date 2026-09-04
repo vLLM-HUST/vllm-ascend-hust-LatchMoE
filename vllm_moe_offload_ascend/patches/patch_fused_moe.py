@@ -674,6 +674,7 @@ def _patch_moe_init_routing_cann_compat() -> bool:
         expert_tokens_num_flag=True,
         active_expert_range=None,
         quant_mode=-1,
+        act_quant_type=None,
     ):
         if quant_mode not in (-1, 1):
             raise RuntimeError(
@@ -683,6 +684,8 @@ def _patch_moe_init_routing_cann_compat() -> bool:
             active_num = int(hidden_states.shape[0] * topk_ids.shape[1])
         if active_expert_range is None:
             active_expert_range = [0, int(expert_num)]
+        input_dtype = act_quant_type or hidden_states.dtype
+        quant_dtypes = getattr(device_op, "QUANT_DTYPES", ())
         return torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             topk_ids,
@@ -696,6 +699,7 @@ def _patch_moe_init_routing_cann_compat() -> bool:
             quant_mode=quant_mode,
             active_expert_range=active_expert_range,
             row_idx_type=0,
+            x_dtype=input_dtype if input_dtype in quant_dtypes else None,
         )
 
     _native_moe_init_routing._latchmoe_cann_moe_init_routing_compat = True

@@ -585,6 +585,7 @@ def test_cann_moe_init_routing_falls_back_to_native_op(monkeypatch):
 
     device_op = types.ModuleType("vllm_ascend.device.device_op")
     device_op.BaseDeviceAdaptor = BaseDeviceAdaptor
+    device_op.QUANT_DTYPES = (torch.int8,)
     device_package = types.ModuleType("vllm_ascend.device")
     device_package.device_op = device_op
     monkeypatch.setitem(sys.modules, "vllm_ascend.device", device_package)
@@ -598,6 +599,7 @@ def test_cann_moe_init_routing_falls_back_to_native_op(monkeypatch):
         topk_ids,
         active_num=-1,
         expert_num=4,
+        act_quant_type=torch.int8,
     )
 
     assert result == ("sorted", "row_idx", "expert_tokens", "scale")
@@ -612,6 +614,7 @@ def test_cann_moe_init_routing_falls_back_to_native_op(monkeypatch):
         "quant_mode": -1,
         "active_expert_range": [0, 4],
         "row_idx_type": 0,
+        "x_dtype": torch.int8,
     }
     assert patch_fused_moe._patch_moe_init_routing_cann_compat() is False
 
