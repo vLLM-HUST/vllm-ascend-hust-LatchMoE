@@ -925,10 +925,6 @@ def _patch_model_runner_profile_context() -> None:
                 finalize = getattr(runner, "_finalize_seam_before_compile", None)
                 if not callable(finalize) or getattr(runner, "_seam_active", None) is not None:
                     continue
-                routed_experts = getattr(runner, "routed_experts", None)
-                layer_id = int(getattr(routed_experts, "layer_id", -1))
-                if layer_id >= 0:
-                    runner.layer_id = layer_id
                 finalize()
 
             from vllm_moe_offload_ascend.ops.fused_moe.moe_offload_stage_op import (
