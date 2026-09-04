@@ -43,6 +43,15 @@ _SKIP_SINGLE_LOCAL_EXPERT_DEVICE_SYNC: ContextVar[bool] = ContextVar(
 )
 
 
+def _mlp_builder_config_kwargs(comm_method: Any) -> dict[str, Any]:
+    """Bridge the current ``moe_config`` and legacy fusion-flag ABIs."""
+
+    moe_config = getattr(comm_method, "moe_config", None)
+    if moe_config is not None:
+        return {"moe_config": moe_config}
+    return {"use_fusion_ops": getattr(comm_method, "use_fusion_ops", None)}
+
+
 def _summarize_fused_shared_ids(shared_ids: Any) -> list[int]:
     """Return a bounded eager-only summary for a fused router suffix."""
 
@@ -3819,7 +3828,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             mlp_compute_input = build_mlp_compute_input(
                 fused_experts_input=wave_input,
                 token_dispatch_output=token_dispatch_output,
-                use_fusion_ops=self.use_fusion_ops,
+                **_mlp_builder_config_kwargs(self),
             )
             build_mlp_input_ms = (perf_counter() - build_mlp_input_start) * 1000.0
             gmm_start = perf_counter()
@@ -3975,7 +3984,7 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
             mlp_compute_input = build_mlp_compute_input(
                 fused_experts_input=wave_input,
                 token_dispatch_output=token_dispatch_output,
-                use_fusion_ops=self.use_fusion_ops,
+                **_mlp_builder_config_kwargs(self),
             )
             mlp_output, before_gmm2_evt = _unpack_mlp_apply_result(
                 self._apply_mlp(mlp_compute_input)

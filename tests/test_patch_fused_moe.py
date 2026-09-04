@@ -11,11 +11,25 @@ from vllm_moe_offload_ascend.patches.patch_fused_moe import (
     _ensure_moe_offload_splitting_op,
     _install_cann_compat_when_ready,
     _install_runtime_patches_when_ready,
+    _mlp_builder_config_kwargs,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
     _patch_kv_cache_capacity_backstop,
     _unpack_mlp_apply_result,
 )
+
+
+def test_mlp_builder_uses_current_comm_method_config_without_legacy_field():
+    moe_config = object()
+    assert _mlp_builder_config_kwargs(SimpleNamespace(moe_config=moe_config)) == {
+        "moe_config": moe_config
+    }
+
+
+def test_mlp_builder_preserves_legacy_fusion_flag_fallback():
+    assert _mlp_builder_config_kwargs(SimpleNamespace(use_fusion_ops=True)) == {
+        "use_fusion_ops": True
+    }
 
 
 def test_register_compat_only_skips_moe_runtime_patches(monkeypatch):
