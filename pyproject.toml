@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-moe-offload-ascend"
-version = "0.1.0"
+version = "0.2.0"
 description = "Graph-compatible MoE expert offloading plugin for vLLM Ascend (LatchMoE)"
 readme = "README.md"
 license = { file = "LICENSE" }

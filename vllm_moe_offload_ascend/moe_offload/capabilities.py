@@ -262,7 +262,7 @@ def evaluate_support(descriptor: MoeCapabilityDescriptor) -> CapabilitySupport:
         blockers.append(f"unsupported_scoring:{descriptor.selection.scoring_function}")
     if descriptor.weight_mode != "bf16_unquantized":
         blockers.append(f"unsupported_weight_mode:{descriptor.weight_mode}")
-    if descriptor.parallel_mode != "single_npu":
+    if descriptor.parallel_mode not in {"single_npu", "tp4"}:
         blockers.append(f"unsupported_parallel_mode:{descriptor.parallel_mode}")
     # The pinned Ascend backend owns the stream/event schedule for external
     # resident shared experts.  Admit only that narrowly-defined mode here;
@@ -311,9 +311,14 @@ def _weight_mode(layer: Any, runner: Any) -> str:
 def _parallel_mode(moe_config: Any) -> str:
     if moe_config is None:
         return "single_npu"
-    for name in ("dp_size", "ep_size", "tp_size", "pcp_size"):
-        if _positive_int(getattr(moe_config, name, 1), 1) > 1:
-            return "multi_npu"
+    sizes = {
+        name: _positive_int(getattr(moe_config, name, 1), 1)
+        for name in ("dp_size", "ep_size", "tp_size", "pcp_size")
+    }
+    if sizes == {"dp_size": 1, "ep_size": 1, "tp_size": 4, "pcp_size": 1}:
+        return "tp4"
+    if any(size > 1 for size in sizes.values()):
+        return "multi_npu"
     return "single_npu"
 
 

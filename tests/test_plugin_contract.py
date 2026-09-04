@@ -40,7 +40,7 @@ def test_extension_manager_manifest_preserves_runtime_boundary() -> None:
     assert manifest["host"] == {
         "provider": "vllm",
         "name": "vllm",
-        "version_range": "==0.21.0",
+        "version_range": ">=0.28.1rc1.dev319,<0.29",
     }
     assert manifest["runtime"]["process_scope"] == "vllm-ascend-worker"
     assert manifest["lifecycle_owner"] == "vllm"
@@ -48,7 +48,7 @@ def test_extension_manager_manifest_preserves_runtime_boundary() -> None:
     assert manifest["protocols"] == [
         {
             "name": "vllm.ascend.moe-offload-seam",
-            "version_range": ">=1,<2",
+            "version_range": ">=2,<3",
         }
     ]
 
@@ -69,6 +69,10 @@ def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
     ]
     environment = manifest["activation"]["environment"]
     assert environment["VLLM_ASCEND_MOE_OFFLOAD_GB"] == "${offload_gb}"
+    assert manifest["activation"]["extra_args"] == [
+        "--tensor-parallel-size",
+        "4",
+    ]
 
 
 def test_register_retries_idempotent_patch_path(monkeypatch) -> None:

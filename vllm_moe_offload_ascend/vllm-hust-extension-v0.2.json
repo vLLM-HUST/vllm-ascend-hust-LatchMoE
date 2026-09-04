@@ -1,12 +1,12 @@
 {
   "schema_version": "0.2-experimental",
   "extension_id": "org.vllm-hust.latchmoe",
-  "extension_version": "0.1.0",
+  "extension_version": "0.2.0",
   "kind": "in_process_plugin",
   "host": {
     "provider": "vllm",
     "name": "vllm",
-    "version_range": "==0.21.0"
+    "version_range": ">=0.28.1rc1.dev319,<0.29"
   },
   "runtime": {
     "type": "python",
@@ -17,7 +17,7 @@
   "protocols": [
     {
       "name": "vllm.ascend.moe-offload-seam",
-      "version_range": ">=1,<2"
+      "version_range": ">=2,<3"
     }
   ],
   "implementation": [
@@ -59,6 +59,13 @@
       "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
       "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1"
     },
-    "additional_config": {}
+    "additional_config": {
+      "_manager_runtime_qualification": {
+        "accelerator": "ascend",
+        "execution_mode": "graph",
+        "model": "Qwen3-30B-A3B",
+        "tensor_parallel_size": 4
+      }
+    }
   }
 }

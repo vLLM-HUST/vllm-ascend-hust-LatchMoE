@@ -233,16 +233,13 @@ def test_bundled_compatibility_lock_declares_current_seam_contract():
 
     lock = launcher._read_key_value_file(lock_path)
 
-    assert lock["seam_commit"] == "4806367eeeb7d62b32078ae90cd929cc06d825fe"
-    assert lock["seam_abi"] == "1"
-    assert lock["vllm_commit"] == "ad7125a431e176d4161099480a66f0169609a690"
-    assert lock["vllm_tag"] == "v0.21.0"
-    assert lock["vllm_version"] == "0.21.0"
-    assert lock["runtime_profile.issue7"].startswith(
-        "2.10.0|2.10.0.post2|9.0.1|"
-    )
-    assert lock["runtime_profile.cann9_legacy"].startswith(
-        "2.10.0|2.10.0|9.0.0|"
+    assert lock["seam_commit"] == "2c8c722107a54127999a64c4eb0ec86139df8c26"
+    assert lock["seam_abi"] == "2"
+    assert lock["vllm_commit"] == "762f85b311fbab0bcf8921dd216f5093cd58b9b8"
+    assert lock["vllm_tag"] == "v0.28.1rc0"
+    assert lock["vllm_version"] == "0.28.1rc1.dev319"
+    assert lock["runtime_profile.sage_mate"].startswith(
+        "2.13.0|2.13.0rc1|9.1.0|"
     )
 
 

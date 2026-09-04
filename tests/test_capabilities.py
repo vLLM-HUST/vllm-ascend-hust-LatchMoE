@@ -163,7 +163,7 @@ def test_fused_mix_placement_derives_routed_count_from_materialized_suffix():
     assert descriptor.routed_expert_count == 64
 
 
-def test_python_router_callable_and_multicard_are_fail_closed():
+def test_python_router_callable_is_fail_closed_while_tp4_is_described():
     descriptor = describe_layer_capability(
         _layer(
             custom_routing_function=lambda *_args: None,
@@ -175,7 +175,22 @@ def test_python_router_callable_and_multicard_are_fail_closed():
 
     assert support.state == "unsupported"
     assert "unsupported_router_owner:unknown" in support.blockers
-    assert "unsupported_parallel_mode:multi_npu" in support.blockers
+    assert descriptor.parallel_mode == "multi_npu"
+
+    tp4 = describe_layer_capability(
+        _layer(
+            moe_config=SimpleNamespace(
+                num_experts=64,
+                dp_size=1,
+                ep_size=1,
+                tp_size=4,
+                pcp_size=1,
+            )
+        ),
+        _runner(),
+    )
+    assert tp4.parallel_mode == "tp4"
+    assert evaluate_support(tp4).state == "implemented"
 
 
 def test_checkpoint_config_describes_glm_without_a_model_name_rule():

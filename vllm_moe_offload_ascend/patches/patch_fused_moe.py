@@ -1590,6 +1590,15 @@ def _install_runtime_module_patches() -> None:
             print(f"SEW_PATCH fused_hook_failed: {exc!r}", flush=True)
 
     try:
+        import vllm_ascend.ops.fused_moe.routed_experts as _routed_experts
+
+        _routed_experts.get_moe_offload_runtime = get_moe_offload_runtime
+        _patch_unquantized_moe_method(_routed_experts)
+    except Exception as exc:
+        if _to_bool_env("SEW_PATCH_PROBE", "0"):
+            print(f"SEW_PATCH routed_experts_hook_failed: {exc!r}", flush=True)
+
+    try:
         import vllm_ascend.ops.fused_moe.token_dispatcher as _td
         _td.get_moe_pipeline_profiler = get_moe_pipeline_profiler
     except Exception as exc:
@@ -2004,10 +2013,20 @@ def _patch_moe_comm_method_runtime_hooks(_comm: Any) -> None:
         # no longer re-exports every contract from moe_comm_method.
         import importlib
 
-        moe_runtime_args = importlib.import_module(
-            "vllm_ascend.ops.fused_moe.moe_runtime_args"
-        )
-
+        try:
+            moe_runtime_args = importlib.import_module(
+                "vllm_ascend.ops.fused_moe.moe_runtime_args"
+            )
+        except ImportError:
+            fused_contracts = importlib.import_module(
+                "vllm_ascend.ops.fused_moe.dataclass.fused_experts"
+            )
+            if name == "MoERoutingParams":
+                router_contracts = importlib.import_module(
+                    "vllm_ascend.ops.fused_moe.dataclass.router_input"
+                )
+                return router_contracts.MoeRouterInput
+            return getattr(fused_contracts, name)
         return getattr(moe_runtime_args, name)
 
     MoEFusedExpertsInput = _resolve_runtime_contract("MoEFusedExpertsInput")
@@ -4914,17 +4933,20 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
             _probe("FAIL:offload_stage_seam_off")
             return False
         moe_config = self.moe_config
-        if (
-            getattr(moe_config, "dp_size", 1) > 1
-            or getattr(moe_config, "ep_size", 1) > 1
-            or getattr(moe_config, "tp_size", 1) > 1
-            or getattr(moe_config, "pcp_size", 1) > 1
-        ):
+        parallel_sizes = {
+            "dp": int(getattr(moe_config, "dp_size", 1) or 1),
+            "ep": int(getattr(moe_config, "ep_size", 1) or 1),
+            "tp": int(getattr(moe_config, "tp_size", 1) or 1),
+            "pcp": int(getattr(moe_config, "pcp_size", 1) or 1),
+        }
+        supported_parallel = parallel_sizes in (
+            {"dp": 1, "ep": 1, "tp": 1, "pcp": 1},
+            {"dp": 1, "ep": 1, "tp": 4, "pcp": 1},
+        )
+        if not supported_parallel:
             _probe(
-                f"FAIL:multicard dp={getattr(moe_config, 'dp_size', 1)} "
-                f"ep={getattr(moe_config, 'ep_size', 1)} "
-                f"tp={getattr(moe_config, 'tp_size', 1)} "
-                f"pcp={getattr(moe_config, 'pcp_size', 1)}"
+                "FAIL:parallel "
+                + " ".join(f"{name}={size}" for name, size in parallel_sizes.items())
             )
             return False
         _probe("PASS")

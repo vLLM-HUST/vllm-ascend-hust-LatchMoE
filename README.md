@@ -87,7 +87,7 @@ vllm-hust-ext extension enable org.vllm-hust.latchmoe
 vllm-hust-ext run -- latchmoe serve /path/to/model
 ```
 
-The check must be supplied with evidence for MoE offload seam ABI 1. A matching
+The check must be supplied with evidence for MoE offload seam ABI 2. A matching
 vLLM version alone does not prove that the required vLLM-Ascend seam is present.
 
 ---
@@ -120,6 +120,18 @@ without the repeated raw bundle required for a main claim.
 
 ## Capability Status
 
+The Sage Mate dense `Qwen3.8-27B` target contains no routed experts, so
+LatchMoE is **Not Applicable** for that model. This is not an incompatibility
+workaround and no dense-model speedup or compatibility claim is made.
+
+The separate adaptation target is unquantized `Qwen3-30B-A3B`, BF16, TP4,
+PP1, Ascend graph mode. Source support for a per-rank tensor-parallel expert
+shard and stable local slot mapping is implemented against vLLM-HUST
+`762f85b3` and vLLM-Ascend-HUST `4e57439e` plus MoE seam ABI 2. Independent
+TP4 graph qualification has not run, so this lane remains **unverified**, not
+compatible. The TP1 Issue #7 bundle below is historical mechanism evidence
+only and cannot qualify the new lane.
+
 LatchMoE selects its graph seam from a serialized, model-name-independent
 capability descriptor. The descriptor fixes the output ABI, shared-expert
 representation, router ownership and selection semantics, weight lifecycle,
@@ -133,7 +145,8 @@ native/eager fallback can be presented as an enabled LatchMoE run.
 | Gated external shared expert with grouped/sigmoid/correction/routed-scale semantics | Implemented | Host guard and router-parity artifact tests; no NPU qualification claim yet |
 | Fused or mix-placement shared experts | Unsupported | Reserved for Issue #25 after a backend-qualified fixed shared lane |
 | Shared compute/H2D/MLP overlap | Unsupported | Reserved for Issue #26; current shared path is correctness-first no-overlap |
-| Quantized weights or multi-NPU execution | Unsupported | Rejected by the capability guard |
+| TP4 tensor-parallel, routed-only BF16 | Implemented | Host capability/mapping tests; independent NPU graph qualification pending |
+| Quantized weights, EP/DP/PCP multi-NPU | Unsupported | Rejected by the capability guard |
 
 `implemented` means the model-generic seam and host tests exist. It does not
 mean a checkpoint has completed native oracle, PIECEWISE capture/replay,
@@ -198,8 +211,9 @@ tests/              host-side unit tests
 - Ascend 910B-class NPU with a working CANN / torch-npu environment
 - Python ≥ 3.10
 - The exact host stack in the compatibility table below
-- Validated configuration: Qwen3-30B-A3B (unquantized MoE), BF16, TP1,
-  single NPU, low-concurrency serving (`max_num_seqs=1`)
+- Adaptation configuration: Qwen3-30B-A3B (unquantized MoE), BF16, TP4,
+  graph mode, low-concurrency serving (`max_num_seqs=1`). This remains
+  unverified until the independent NPU gate passes.
 - Do **not** combine with vLLM's native weight-offload flags
   (`--cpu-offload-gb`, `--offload-backend prefetch`, `--offload-group-size`);
   the plugin manages expert offload through its own dataplane
@@ -213,10 +227,10 @@ LatchMoE 只维护一组宿主源码 commit，并对两套成对的 Ascend 基�
 
 | Component | Repository / branch | Locked commit | Version |
 |---|---|---|---|
-| vLLM | `vLLM-HUST/vllm-hust` | `ad7125a431e176d4161099480a66f0169609a690` | `0.21.0` |
-| Ascend hook seam | `vLLM-HUST/vllm-ascend-hust`, `feature/latchmoe-offload-seam-v1-v021` | `4806367eeeb7d62b32078ae90cd929cc06d825fe` | seam ABI 1 |
+| vLLM | `vLLM-HUST/vllm-hust` | `762f85b311fbab0bcf8921dd216f5093cd58b9b8` | `0.28.1rc1.dev319` |
+| Ascend hook seam | `vLLM-HUST/vllm-ascend-hust`, `feature/moe-offload-seam-v2-tp` | `2c8c722107a54127999a64c4eb0ec86139df8c26` | seam ABI 2, source-tested only |
 
-`feature/latchmoe-offload-seam-v1-v021` 是唯一的 LatchMoE seam 分支。
+`feature/moe-offload-seam-v2-tp` 是目标基线的 LatchMoE seam 分支。
 
 完整机器可读锁位于
 [`vllm_moe_offload_ascend/compatibility.lock`](vllm_moe_offload_ascend/compatibility.lock)。
@@ -234,7 +248,7 @@ Torch-NPU 和 CANN 版本。推荐在镜像 Python 上创建 overlay venv，这�
 
 推荐先 clone 本仓库，再用机器可读 lock 驱动安装。自动安装与后面的手工安装是
 两条**二选一**的路径，不能顺序执行。脚本会把两个宿主 checkout 到固定 commit、
-补充 vLLM `v0.21.0` tag、始终调用当前 `sys.executable -m pip`、跳过与 LatchMoE
+补充 vLLM `v0.28.1rc0` tag、始终调用当前 `sys.executable -m pip`、跳过与 LatchMoE
 seam 无关的自定义算子编译，并在最后执行环境检查：
 
 ```bash
@@ -268,19 +282,19 @@ mkdir -p "$LATCHMOE_HOME/stack"
 git clone https://github.com/vLLM-HUST/vllm-hust.git \
   "$LATCHMOE_HOME/stack/vllm-hust"
 git -C "$LATCHMOE_HOME/stack/vllm-hust" fetch origin \
-  ad7125a431e176d4161099480a66f0169609a690
+  762f85b311fbab0bcf8921dd216f5093cd58b9b8
 git -C "$LATCHMOE_HOME/stack/vllm-hust" fetch \
   https://github.com/vllm-project/vllm.git \
-  refs/tags/v0.21.0:refs/tags/v0.21.0
+  refs/tags/v0.28.1rc0:refs/tags/v0.28.1rc0
 git -C "$LATCHMOE_HOME/stack/vllm-hust" checkout \
-  ad7125a431e176d4161099480a66f0169609a690
+  762f85b311fbab0bcf8921dd216f5093cd58b9b8
 
 # 2. 固定唯一的 vLLM-Ascend hook seam
-git clone --branch feature/latchmoe-offload-seam-v1-v021 \
+git clone --branch feature/moe-offload-seam-v2-tp \
   https://github.com/vLLM-HUST/vllm-ascend-hust.git \
   "$LATCHMOE_HOME/stack/vllm-ascend-hust"
 git -C "$LATCHMOE_HOME/stack/vllm-ascend-hust" checkout \
-  4806367eeeb7d62b32078ae90cd929cc06d825fe
+  2c8c722107a54127999a64c4eb0ec86139df8c26
 
 # 3. 在同一解释器中安装两个宿主和 LatchMoE
 VLLM_TARGET_DEVICE=empty python -m pip install \
@@ -292,9 +306,8 @@ python -m pip install --no-deps --no-build-isolation \
   -e "$LATCHMOE_PLUGIN_ROOT"
 ```
 
-额外 fetch `v0.21.0` tag 是必要的：HUST 仓库当前没有公开这一 tag，但固定的
-commit 与上游 `v0.21.0` 完全相同；setuptools-scm 需要该 tag 才会生成正确的
-`0.21.0` 包版本。
+额外 fetch `v0.28.1rc0` tag 用于让 setuptools-scm 从固定 commit 生成
+`0.28.1rc1.dev319` 版本；不能用分支名或手写版本替代 commit 校验。
 
 `VLLM_TARGET_DEVICE=empty` 只关闭 vLLM-HUST 自身的 CUDA 构建；运行时 NPU
 platform 仍由 Ascend plugin 提供。`COMPILE_CUSTOM_KERNELS=0` 则避免安装 seam 时
@@ -302,7 +315,7 @@ platform 仍由 Ascend plugin 提供。`COMPILE_CUSTOM_KERNELS=0` 则避免安�
 模型应由基础 vLLM-Ascend 镜像单独提供，不能把它们的构建结果当作 LatchMoE
 安装是否成功的门禁。
 
-安装完成后无需复制源码、修改 `PYTHONPATH` 或手动调用 `register()`。vLLM 0.21.0
+安装完成后无需复制源码、修改 `PYTHONPATH` 或手动调用 `register()`。目标 vLLM
 会在 API、EngineCore 和 Worker 进程自动发现 `vllm.general_plugins`，并调用
 `vllm_moe_offload_ascend.register()`。该函数先把全部 LatchMoE 配置项注册到
 `vllm.envs` 和 `vllm_ascend.envs`，再安装 seam adapter。

@@ -234,7 +234,7 @@ def _detect_cann(environ: Mapping[str, str]) -> tuple[str | None, str | None]:
 
 
 def _validate_seam_abi(root: str, abi: str) -> tuple[str, ...]:
-    if abi != "1":
+    if abi not in {"1", "2"}:
         return (f"unsupported LatchMoE seam ABI: {abi}",)
     requirements = {
         "vllm_ascend/ops/fused_moe/fused_moe.py": (
@@ -257,6 +257,29 @@ def _validate_seam_abi(root: str, abi: str) -> tuple[str, ...]:
         ),
         "vllm_ascend/utils.py": ("def adapt_patch",),
     }
+    if abi == "2":
+        requirements = {
+            "vllm_ascend/ops/fused_moe/dataclass/fused_experts.py": (
+                "class MoEOffloadParams",
+                "physical_expert_count",
+                "offload: MoEOffloadParams",
+            ),
+            "vllm_ascend/ops/fused_moe/dataclass/router_input.py": (
+                "physical_expert_count",
+            ),
+            "vllm_ascend/ops/fused_moe/moe_comm_method.py": (
+                "def _maybe_apply_moe_offload_plan",
+                "before_gmm2_evt",
+                "swiglu_limit",
+            ),
+            "vllm_ascend/ops/fused_moe/routed_experts.py": (
+                "def get_moe_offload_runtime",
+                "offload_enabled=offload_enabled",
+            ),
+            "vllm_ascend/ops/fused_moe/token_dispatcher.py": (
+                "physical_expert_count",
+            ),
+        }
     errors: list[str] = []
     checkout = Path(root)
     for relative, required_tokens in requirements.items():
