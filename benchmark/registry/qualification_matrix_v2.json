@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-19T05:38:06.979220+00:00",
+  "generated_at": "2026-09-04T08:00:00+00:00",
   "registry_schema_version": "latchmoe-model-registry-v2",
   "rows": [
     {
@@ -48,6 +48,64 @@
         "zero_eager_fallback": "passed"
       },
       "id": "qwen3-30b-a3b",
+      "status": "passed"
+    },
+    {
+      "capability_config": {
+        "combine_owner": "native_runner",
+        "output_contract": "routed_tensor",
+        "overlap_mode": "none",
+        "parallel_mode": "tensor_parallel_4",
+        "routed_expert_count": 128,
+        "router_adapter": "builtin",
+        "router_owner": "native_runner",
+        "schema_version": "latchmoe-capability-v1",
+        "selection": {
+          "correction_bias": false,
+          "grouped_top_k": false,
+          "num_expert_group": null,
+          "renormalize": true,
+          "routed_scaling_factor": 1.0,
+          "scoring_function": "softmax",
+          "top_k": 8,
+          "topk_group": null
+        },
+        "shared_activation": "none",
+        "shared_expert_count": 0,
+        "shared_mode": "none",
+        "weight_lifecycle": "routed_cpu_first_offloaded_shared_resident",
+        "weight_mode": "bf16_unquantized"
+      },
+      "evidence": {
+        "qualification_record": "docs/evidence/sage-mate-20260904-tp4-graph.md",
+        "runtime_bundle": "results/sage-mate-mod-compat-20260904T053524Z/latchmoe-r001/candidate-r011/",
+        "runtime_bundle_anchor_sha256": "c7eb59b9640406f3848321e211e1da457cb600fbaaae6c8b84bd9801670f2e91"
+      },
+      "gates": {
+        "cancellation_recovery": "passed",
+        "concurrent_requests": "passed",
+        "device_host_swap": "passed",
+        "exception_recovery": "passed",
+        "multi_rank_expert_mapping": "passed",
+        "output_correctness": "passed",
+        "piecewise_capture": "passed",
+        "piecewise_replay": "passed",
+        "stable_graph_addresses": "passed",
+        "zero_eager_fallback": "passed"
+      },
+      "host_baseline": {
+        "vllm_ascend_hust_base_commit": "4e57439e",
+        "vllm_ascend_hust_seam_commit": "2c8c722107a54127999a64c4eb0ec86139df8c26",
+        "vllm_hust_commit": "762f85b311fbab0bcf8921dd216f5093cd58b9b8",
+        "vllm_version": "0.28.1rc1.dev319"
+      },
+      "id": "qwen3-30b-a3b-sage-mate-tp4-20260904",
+      "performance": {
+        "baseline_output_tokens_per_second_p50": 23.569,
+        "latchmoe_output_tokens_per_second_p50": 2.90686,
+        "verdict": "degraded"
+      },
+      "qualification_scope": "functional_compatibility_only",
       "status": "passed"
     },
     {

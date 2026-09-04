@@ -125,12 +125,16 @@ LatchMoE is **Not Applicable** for that model. This is not an incompatibility
 workaround and no dense-model speedup or compatibility claim is made.
 
 The separate adaptation target is unquantized `Qwen3-30B-A3B`, BF16, TP4,
-PP1, Ascend graph mode. Source support for a per-rank tensor-parallel expert
-shard and stable local slot mapping is implemented against vLLM-HUST
-`762f85b3` and vLLM-Ascend-HUST `4e57439e` plus MoE seam ABI 2. Independent
-TP4 graph qualification has not run, so this lane remains **unverified**, not
-compatible. The TP1 Issue #7 bundle below is historical mechanism evidence
-only and cannot qualify the new lane.
+PP1, Ascend PIECEWISE graph mode. It is functionally qualified against
+vLLM-HUST `762f85b3`, vLLM-Ascend-HUST `4e57439e`, and MoE seam ABI 2 with
+four concurrent sequences. All four ranks exercised routed expert mapping,
+graph capture/replay, device/host movement, cancellation, malformed-request
+recovery, and stable captured addresses. Its measured output throughput was
+about 2.91 tok/s versus about 23.57 tok/s without LatchMoE, so this is a
+**functional compatibility result with performance degradation**, not a
+speedup or deployment recommendation. See the
+[Sage Mate TP4 qualification record](docs/evidence/sage-mate-20260904-tp4-graph.md).
+The TP1 Issue #7 bundle remains historical mechanism evidence only.
 
 LatchMoE selects its graph seam from a serialized, model-name-independent
 capability descriptor. The descriptor fixes the output ABI, shared-expert
@@ -145,7 +149,7 @@ native/eager fallback can be presented as an enabled LatchMoE run.
 | Gated external shared expert with grouped/sigmoid/correction/routed-scale semantics | Implemented | Host guard and router-parity artifact tests; no NPU qualification claim yet |
 | Fused or mix-placement shared experts | Unsupported | Reserved for Issue #25 after a backend-qualified fixed shared lane |
 | Shared compute/H2D/MLP overlap | Unsupported | Reserved for Issue #26; current shared path is correctness-first no-overlap |
-| TP4 tensor-parallel, routed-only BF16 | Implemented | Host capability/mapping tests; independent NPU graph qualification pending |
+| TP4 tensor-parallel, routed-only BF16 | NPU-qualified (functional; performance degraded) | Qwen3-30B-A3B, four Ascend ranks, PIECEWISE graph capture/replay, max_num_seqs=4 |
 | Quantized weights, EP/DP/PCP multi-NPU | Unsupported | Rejected by the capability guard |
 
 `implemented` means the model-generic seam and host tests exist. It does not
@@ -211,9 +215,10 @@ tests/              host-side unit tests
 - Ascend 910B-class NPU with a working CANN / torch-npu environment
 - Python ≥ 3.10
 - The exact host stack in the compatibility table below
-- Adaptation configuration: Qwen3-30B-A3B (unquantized MoE), BF16, TP4,
-  graph mode, low-concurrency serving (`max_num_seqs=1`). This remains
-  unverified until the independent NPU gate passes.
+- Qualified configuration: Qwen3-30B-A3B (unquantized MoE), BF16, TP4,
+  PIECEWISE graph mode, `max_num_seqs=4`. Qualification proves functional
+  compatibility; measured performance is substantially below the no-plugin
+  baseline and must not be presented as a speedup.
 - Do **not** combine with vLLM's native weight-offload flags
   (`--cpu-offload-gb`, `--offload-backend prefetch`, `--offload-group-size`);
   the plugin manages expert offload through its own dataplane
@@ -363,8 +368,8 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 # Graph-compatible fixed-slot dataplane
 export VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1
 
-# Serving-shape hint for low-concurrency serving
-export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=1
+# Serving-shape hint used by the qualified four-request profile
+export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=4
 
 # Canonical: the active Python owns both plugin discovery and vLLM startup.
 python -m vllm_moe_offload_ascend serve \
@@ -426,7 +431,7 @@ All configuration is environment-variable based. The main knobs:
 |---|---|---|
 | `VLLM_ASCEND_MOE_OFFLOAD_GB` | unset (disabled) | Target offload size (GiB); setting it enables AutoConfig |
 | `VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE` | `0` | Enable the graph-compatible fixed-slot dataplane |
-| `VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT` | `0` | Serving-shape hint for the prefill-overflow handoff; set `1` for low-concurrency serving |
+| `VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT` | `0` | Serving-shape hint for the prefill-overflow handoff; the qualified TP4 profile uses `4` |
 | `VLLM_ASCEND_MOE_OFFLOAD_NUM_SLOTS` | auto | Expert override for the derived slot count |
 | `VLLM_ASCEND_MOE_OFFLOAD_RESIDENT_LAYER_IDS` | auto | Comma-separated layer IDs kept fully resident |
 | `VLLM_ASCEND_MOE_OFFLOAD_POLICY` | `deadline` | Staging policy (`deadline` / `lru`) |

@@ -57,14 +57,16 @@
     "environment": {
       "VLLM_ASCEND_MOE_OFFLOAD_GB": "14",
       "VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE": "1",
-      "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "1"
+      "VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT": "4"
     },
     "additional_config": {
       "_manager_runtime_qualification": {
         "accelerator": "ascend",
         "execution_mode": "graph",
         "model": "Qwen3-30B-A3B",
-        "tensor_parallel_size": 4
+        "tensor_parallel_size": 4,
+        "status": "compatible_functional_performance_degraded",
+        "evidence": "docs/evidence/sage-mate-20260904-tp4-graph.md"
       }
     }
   }

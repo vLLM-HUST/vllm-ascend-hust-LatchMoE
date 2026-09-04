@@ -1,6 +1,6 @@
 format=1
 runtime_abi=2
-runtime_min_commit=37ad4bcb7cc1d4e505284f1895ff77aa7b1562fe
+runtime_min_commit=63781f3dd0235f933735bfd8ce614d388093c0b5
 runtime_clean_paths=vllm_moe_offload_ascend,benchmark,tests,pyproject.toml,repro,README.md,docs
 seam_abi=2
 vllm_repo=https://github.com/vLLM-HUST/vllm-hust.git
@@ -10,4 +10,4 @@ seam_repo=https://github.com/vLLM-HUST/vllm-ascend-hust.git
 seam_branch=feature/moe-offload-seam-v2-tp
 seam_commit=2c8c722107a54127999a64c4eb0ec86139df8c26
 vllm_version=0.28.1rc1.dev319
-runtime_profile.sage_mate=2.13.0|2.13.0rc1|9.1.0|source_adapted_runtime_unverified
+runtime_profile.sage_mate=2.13.0|2.13.0rc1|9.1.0|qwen3_30b_a3b_bf16_tp4_piecewise_graph_functional_performance_degraded_20260904

@@ -216,19 +216,21 @@ PY
 ### AutoConfig（推荐）
 
 ```bash
-# 根据服务器实际空闲卡选择设备。
-export ASCEND_RT_VISIBLE_DEVICES=4
+# 根据服务器实际空闲卡选择四张设备；以下编号仅为示例。
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 
 # 目标 expert offload 容量，单位 GiB。
 export VLLM_ASCEND_MOE_OFFLOAD_GB=14
 export VLLM_ASCEND_MOE_OFFLOAD_SEW_DATAPLANE=1
-export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=1
+export VLLM_ASCEND_MOE_OFFLOAD_MAX_NUM_SEQS_HINT=4
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 python -m vllm_moe_offload_ascend serve \
   /path/to/Qwen3-30B-A3B \
   --trust-remote-code \
-  --max-num-seqs 1
+  --tensor-parallel-size 4 \
+  --max-num-seqs 4 \
+  --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4]}'
 ```
 
 `VLLM_ASCEND_MOE_OFFLOAD_GB=14` 表示生成约 14 GiB expert 的部分常驻规划，
