@@ -53,6 +53,42 @@ def test_routed_only_descriptor_is_serializable_and_implemented():
     assert json.loads(descriptor.fingerprint())["routed_expert_count"] == 64
 
 
+def test_current_runner_owned_router_supplies_selection_contract():
+    """Seam ABI 2 moved routing fields from the layer onto runner.router."""
+    layer = _layer()
+    for name in (
+        "top_k",
+        "use_grouped_topk",
+        "topk_group",
+        "num_expert_group",
+        "renormalize",
+        "scoring_func",
+        "e_score_correction_bias",
+        "routed_scaling_factor",
+    ):
+        delattr(layer, name)
+    router = SimpleNamespace(
+        top_k=8,
+        use_grouped_topk=True,
+        topk_group=2,
+        num_expert_group=8,
+        renormalize=True,
+        scoring_func="sigmoid",
+        e_score_correction_bias=object(),
+        routed_scaling_factor=1.25,
+        custom_routing_function=None,
+    )
+
+    descriptor = describe_layer_capability(layer, _runner(router=router))
+
+    assert descriptor.selection.top_k == 8
+    assert descriptor.selection.grouped_top_k is True
+    assert descriptor.selection.scoring_function == "sigmoid"
+    assert descriptor.selection.correction_bias is True
+    assert descriptor.selection.routed_scaling_factor == 1.25
+    assert evaluate_support(descriptor).state == "implemented"
+
+
 def test_external_shared_complex_router_descriptor_is_implemented():
     shared_gate = object()
     shared = SimpleNamespace(expert_gate=shared_gate)

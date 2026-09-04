@@ -140,7 +140,11 @@ def describe_layer_capability(layer: Any, runner: Any) -> MoeCapabilityDescripto
         "always_on" if shared_mode != "none" else "none"
     )
 
+    router = getattr(runner, "router", None)
+    selection_source = router if router is not None else layer
     custom_router = getattr(layer, "custom_routing_function", None)
+    if custom_router is None:
+        custom_router = getattr(selection_source, "custom_routing_function", None)
     named_adapter = getattr(layer, "latchmoe_router_adapter", None)
     if custom_router is not None:
         router_owner: RouterOwner = "registered_custom" if isinstance(named_adapter, str) else "unknown"
@@ -155,18 +159,24 @@ def describe_layer_capability(layer: Any, runner: Any) -> MoeCapabilityDescripto
         router_adapter = "builtin"
 
     selection = RouterSelection(
-        top_k=_positive_int(getattr(layer, "top_k", None), 0),
-        grouped_top_k=bool(getattr(layer, "use_grouped_topk", False)),
-        topk_group=_optional_int(getattr(layer, "topk_group", None)),
-        num_expert_group=_optional_int(getattr(layer, "num_expert_group", None)),
-        renormalize=bool(getattr(layer, "renormalize", False)),
-        scoring_function=str(getattr(layer, "scoring_func", "softmax") or "softmax"),
-        correction_bias=getattr(layer, "e_score_correction_bias", None) is not None,
+        top_k=_positive_int(getattr(selection_source, "top_k", None), 0),
+        grouped_top_k=bool(getattr(selection_source, "use_grouped_topk", False)),
+        topk_group=_optional_int(getattr(selection_source, "topk_group", None)),
+        num_expert_group=_optional_int(
+            getattr(selection_source, "num_expert_group", None)
+        ),
+        renormalize=bool(getattr(selection_source, "renormalize", False)),
+        scoring_function=str(
+            getattr(selection_source, "scoring_func", "softmax") or "softmax"
+        ),
+        correction_bias=(
+            getattr(selection_source, "e_score_correction_bias", None) is not None
+        ),
         routed_scaling_factor=float(
             getattr(
-                layer,
+                selection_source,
                 "_original_routed_scaling_factor",
-                getattr(layer, "routed_scaling_factor", 1.0),
+                getattr(selection_source, "routed_scaling_factor", 1.0),
             )
             or 1.0
         ),
