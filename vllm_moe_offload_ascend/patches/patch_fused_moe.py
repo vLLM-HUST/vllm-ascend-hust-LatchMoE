@@ -4966,7 +4966,18 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         if not runtime.config.offload_stage_seam:
             return original_select_forward(self)
         if self._seam_config_guards_pass():
-            return self._seam_forward_entry
+            decision = self._resolve_seam_per_layer_guards()
+            self._seam_active = decision
+            if decision:
+                return self._seam_forward_entry
+            support = getattr(self, "_seam_capability_support", None)
+            blockers = getattr(support, "blockers", ())
+            blocker_text = ",".join(str(blocker) for blocker in blockers)
+            raise RuntimeError(
+                "LatchMoE offload-stage seam rejected the materialized layer "
+                f"capability (blockers={blocker_text or 'unresolved'}); refusing "
+                "native/eager fallback"
+            )
         raise RuntimeError(
             "LatchMoE offload-stage seam was requested with an unsupported "
             "global configuration; refusing native/eager fallback"
