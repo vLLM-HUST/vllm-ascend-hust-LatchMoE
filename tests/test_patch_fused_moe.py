@@ -13,8 +13,6 @@ from vllm_moe_offload_ascend.patches.patch_fused_moe import (
     _install_runtime_patches_when_ready,
     _moe_offload_kv_backstop_active,
     _moe_offload_kv_backstop_hint,
-    _patch_moe_gating_top_k_cann_compat,
-    _patch_moe_init_routing_cann_compat,
     _patch_kv_cache_capacity_backstop,
     _unpack_mlp_apply_result,
 )
@@ -3121,6 +3119,10 @@ def test_moe_router_fake_appends_fused_shared_suffix_shape():
 
 def test_moe_router_indirect_uses_ascend_original_routed_scaling_factor(monkeypatch):
     """The seam must match AscendFusedMoE.apply after vLLM rewrites the layer field."""
+    pytest.importorskip(
+        "vllm_ascend.ops.fused_moe.experts_selector",
+        reason="legacy router relocation applies only to MoE seam ABI 1",
+    )
     import torch
 
     from vllm_moe_offload_ascend.ops.fused_moe import moe_router_op
@@ -3174,6 +3176,10 @@ def test_moe_router_indirect_uses_ascend_original_routed_scaling_factor(monkeypa
 
 
 def test_moe_router_indirect_forwards_fused_shared_suffix_arguments(monkeypatch):
+    pytest.importorskip(
+        "vllm_ascend.ops.fused_moe.experts_selector",
+        reason="legacy router relocation applies only to MoE seam ABI 1",
+    )
     import torch
 
     from vllm_moe_offload_ascend.ops.fused_moe import moe_router_op
@@ -3229,6 +3235,28 @@ def test_moe_router_indirect_forwards_fused_shared_suffix_arguments(monkeypatch)
     assert calls[0]["num_shared_experts"] == 2
 
 
+def test_seam_v2_unquantized_patch_does_not_require_legacy_selector():
+    """ABI 2 routes before apply; its weight/offload hook must install alone."""
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+
+    class SeamV2Method:
+        _ascend_moe_offload_runtime_patch = False
+
+        def process_weights_after_loading(self, layer):
+            return None
+
+        def apply(self, layer, *args, **kwargs):
+            return layer
+
+    module = SimpleNamespace(AscendUnquantizedFusedMoEMethod=SeamV2Method)
+    assert not hasattr(module, "select_experts")
+
+    patch_fused_moe._patch_unquantized_moe_method(module)
+
+    assert SeamV2Method._ascend_moe_offload_runtime_patch is True
+    assert not hasattr(module, "select_experts")
+
+
 # ---------------------------------------------------------------------------
 # L3: seam guard returns False when layer_id is missing
 # ---------------------------------------------------------------------------
@@ -3237,7 +3265,6 @@ def test_seam_guard_returns_false_when_layer_has_no_layer_id(monkeypatch):
     """L3: _resolve_seam_per_layer_guards must bail out (return False) when the
     layer object does not have a layer_id attribute, preventing collision on
     the shared -1 key in the injection/log2phy registries."""
-    import torch
     from vllm_moe_offload_ascend.patches import patch_fused_moe
 
     class FakeRunner:

@@ -4616,10 +4616,18 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
 
     original_process_weights = cls.process_weights_after_loading
     original_apply = cls.apply
-    original_select_experts = _fused_moe.select_experts
+    # Seam ABI 1 exposed routing as a module-level select_experts function.
+    # ABI 2 owns routing in AscendRoutedExperts.router and hands the selected
+    # top-k tensors to the quant method.  Do not make weight registration (or
+    # the comm-method offload seam) depend on the removed ABI-1 symbol.
+    original_select_experts = getattr(_fused_moe, "select_experts", None)
     layer_context = threading.local()
 
     def select_experts(*args, **kwargs):
+        if original_select_experts is None:
+            raise RuntimeError(
+                "the legacy select_experts adapter was invoked on MoE seam ABI 2"
+            )
         layer_id = getattr(layer_context, "layer_id", None)
         layer = getattr(layer_context, "layer", None)
         if layer_id is not None:
@@ -4778,7 +4786,8 @@ def _patch_unquantized_moe_method(_fused_moe: Any) -> None:
                 )
         return topk_weights, topk_ids
 
-    _fused_moe.select_experts = select_experts
+    if original_select_experts is not None:
+        _fused_moe.select_experts = select_experts
 
     def process_weights_after_loading(self, layer):
         layer_id = ensure_moe_layer_id(layer)

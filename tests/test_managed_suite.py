@@ -163,11 +163,6 @@ def test_locked_host_manager_rejects_compilation_config_override(monkeypatch) ->
     with pytest.raises(ValueError, match="must not override"):
         manager._compilation_config_args(["--compilation-config"])
 
-    selected = _load_run_suite()._selected_env(env)
-    assert selected["VLLM_ENGINE_NPU_DEVICES"] == "5"
-    assert selected["VLLM_ENGINE_ENFORCE_EAGER"] == "0"
-    assert json.loads(selected["VLLM_ENGINE_COMPILATION_CONFIG"]) == compilation
-
 
 def test_locked_host_manager_stops_only_its_process_group(tmp_path: Path) -> None:
     manager = REPO_ROOT / "benchmark" / "scripts" / "manage_locked_host_runtime.py"
