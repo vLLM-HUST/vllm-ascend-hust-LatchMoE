@@ -113,13 +113,22 @@ def _moe_mlp_impl(
         # Same delegation as _moe_forward (moe_runner.py:98). With the injection
         # set, the apply-path short-circuit consumes (topk_weights, topk_ids)
         # instead of recomputing select_experts.
-        result = layer.runner._forward_impl(
-            layer,
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-        )
+        runner = layer if callable(getattr(layer, "_forward_impl", None)) else None
+        if runner is not None:
+            result = runner._forward_impl(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+        else:
+            result = layer.runner._forward_impl(
+                layer,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
     finally:
         moe_seam_inject.clear_injected_topk(layer_id)
 
@@ -181,13 +190,22 @@ def _moe_mlp_shared_impl(
         )
     moe_seam_inject.set_injected_topk(layer_id, topk_weights, topk_ids)
     try:
-        result = layer.runner._forward_impl(
-            layer,
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-        )
+        runner = layer if callable(getattr(layer, "_forward_impl", None)) else None
+        if runner is not None:
+            result = runner._forward_impl(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+        else:
+            result = layer.runner._forward_impl(
+                layer,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
     finally:
         moe_seam_inject.clear_injected_topk(layer_id)
     if not isinstance(result, tuple) or len(result) != 2:

@@ -5002,6 +5002,28 @@ def _patch_ascend_moe_runner(_fused_moe: Any) -> None:
         decision = self._resolve_seam_per_layer_guards()
         self._seam_active = decision
         if decision:
+            router = getattr(self, "router", None)
+            select_experts = getattr(router, "select_experts", None)
+            if callable(select_experts) and not getattr(
+                select_experts,
+                "_latchmoe_injection_consumer",
+                False,
+            ):
+                layer_id = int(self._seam_layer_id)
+
+                def _select_experts_with_injection(*args, **kwargs):
+                    from vllm_moe_offload_ascend.ops.fused_moe import (
+                        moe_seam_inject,
+                    )
+
+                    injected = moe_seam_inject.peek_injected_topk(layer_id)
+                    if injected is not None:
+                        return injected
+                    return select_experts(*args, **kwargs)
+
+                _select_experts_with_injection._latchmoe_injection_consumer = True
+                _select_experts_with_injection.__wrapped__ = select_experts
+                router.select_experts = _select_experts_with_injection
             return
         support = getattr(self, "_seam_capability_support", None)
         blockers = getattr(support, "blockers", ())

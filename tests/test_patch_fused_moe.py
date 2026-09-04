@@ -3291,6 +3291,49 @@ def test_moe_router_indirect_delegates_to_seam_v2_router(monkeypatch):
     assert weights.shape == ids.shape == (4, 2)
 
 
+def test_moe_mlp_indirect_calls_seam_v2_runner(monkeypatch):
+    import torch
+
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_mlp_op, moe_seam_inject
+
+    hidden = torch.zeros((4, 16), dtype=torch.bfloat16)
+    logits = torch.zeros((4, 64), dtype=torch.float32)
+    weights = torch.ones((4, 2), dtype=torch.bfloat16)
+    ids = torch.zeros((4, 2), dtype=torch.int32)
+    calls = []
+
+    class Runner:
+        layer_id = 7
+
+        def _forward_impl(self, *args):
+            calls.append(args)
+            injected = moe_seam_inject.peek_injected_topk(7)
+            assert injected is not None
+            assert injected[0] is weights
+            assert injected[1] is ids
+            return hidden
+
+    runner = Runner()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.runner.moe_runner.get_layer_from_name",
+        lambda _name: runner,
+    )
+
+    result = moe_mlp_op._moe_mlp_impl(
+        hidden,
+        logits,
+        weights,
+        ids,
+        None,
+        None,
+        "fixture.layer.experts",
+    )
+
+    assert result is hidden
+    assert calls == [(hidden, logits, None, None)]
+    assert moe_seam_inject.peek_injected_topk(7) is None
+
+
 def test_seam_v2_unquantized_patch_does_not_require_legacy_selector():
     """ABI 2 routes before apply; its weight/offload hook must install alone."""
     from vllm_moe_offload_ascend.patches import patch_fused_moe
@@ -3351,6 +3394,52 @@ def test_seam_selection_finalizes_capability_before_graph_forward(monkeypatch):
 
     assert runner._seam_active is True
     assert resolve_calls == [True]
+
+
+def test_seam_v2_router_consumes_injected_topk(monkeypatch):
+    from vllm_moe_offload_ascend.ops.fused_moe import moe_seam_inject
+    from vllm_moe_offload_ascend.patches import patch_fused_moe
+    import vllm_moe_offload_ascend.moe_offload.runtime as runtime_mod
+
+    class FakeRunner:
+        _ascend_moe_offload_seam_patch = False
+
+        def _select_forward(self):
+            return object()
+
+    patch_fused_moe._patch_ascend_moe_runner(
+        SimpleNamespace(AscendMoERunner=FakeRunner)
+    )
+    monkeypatch.setattr(
+        runtime_mod,
+        "get_moe_offload_runtime",
+        lambda: SimpleNamespace(config=SimpleNamespace(offload_stage_seam=True)),
+    )
+    native = object()
+    calls = []
+    router = SimpleNamespace(
+        select_experts=lambda *args, **kwargs: calls.append((args, kwargs)) or native
+    )
+    runner = FakeRunner()
+    runner.router = router
+
+    def resolve():
+        runner._seam_layer_id = 3
+        return True
+
+    runner._resolve_seam_per_layer_guards = resolve
+    runner._finalize_seam_before_compile()
+
+    assert router.select_experts("hidden", "logits") is native
+    injected = (object(), object())
+    moe_seam_inject.set_injected_topk(3, *injected)
+    try:
+        selected = router.select_experts("hidden", "logits")
+        assert selected[0] is injected[0]
+        assert selected[1] is injected[1]
+    finally:
+        moe_seam_inject.clear_injected_topk(3)
+    assert len(calls) == 1
 
 # ---------------------------------------------------------------------------
 # L3: seam guard returns False when layer_id is missing
