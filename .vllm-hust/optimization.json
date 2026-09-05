@@ -26,7 +26,14 @@
         "model": "Qwen3-30B-A3B",
         "tensor_parallel_size": 4,
         "execution_mode": "graph",
-        "status": "compatible_functional_performance_degraded",
+        "status": "compatible",
+        "functional_compatibility": "passed",
+        "effectiveness_qualification": {
+          "status": "not-beneficial-in-tested-cell",
+          "scope": "Qwen3-30B-A3B / BF16 / TP4 PIECEWISE graph / qualified offload configuration",
+          "reason": "Functional gates passed, but measured throughput was lower than the no-plugin baseline in this exact cell"
+        },
+        "runtime_state_source": "live_instance_observation_only",
         "evidence": "docs/evidence/sage-mate-20260904-tp4-graph.md"
       },
       {

@@ -53,7 +53,8 @@ For ten requests, LatchMoE measured TTFT p50/p95 3.678/7.730 seconds,
 end-to-end latency p50/p95 25.941/31.808 seconds, and output throughput
 p50/p95 2.907/3.010 tok/s. The matched no-plugin baseline output throughput
 was about 23.57 tok/s. This lane is therefore labelled
-`compatible_functional_performance_degraded` and must not be advertised as a
+functionally `compatible`; effectiveness is `not-beneficial-in-tested-cell` for
+this exact measured configuration and must not be advertised as a
 speedup.
 
 ## Evidence custody
