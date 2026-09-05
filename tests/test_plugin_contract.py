@@ -73,6 +73,15 @@ def test_vllm_hust_optimization_manifest_matches_entry_point() -> None:
         "--tensor-parallel-size",
         "4",
     ]
+    moe, dense = manifest["compatibility"]["model_qualifications"]
+    assert moe["status"] == "compatible"
+    assert moe["functional_compatibility"] == "passed"
+    assert moe["effectiveness_qualification"]["status"] == (
+        "not-beneficial-in-tested-cell"
+    )
+    assert moe["runtime_state_source"] == "live_instance_observation_only"
+    assert dense["model"] == "Qwen3.8-27B"
+    assert dense["status"] == "not_applicable"
 
 
 def test_register_retries_idempotent_patch_path(monkeypatch) -> None:
